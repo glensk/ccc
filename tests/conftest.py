@@ -88,6 +88,12 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     tests that build ``Config(...)`` explicitly keep their own values (and the
     resolver-side guard in :mod:`command_center.config` fails loudly for any
     future leak vector this wrapper cannot see).
+
+    ``repo_root`` is blanked for the same reason: it outranks ``$GIT_BASE`` in
+    :func:`command_center.repos.repo_root`, so on a machine whose real config sets
+    it, every fixture that points ``$GIT_BASE`` at a fake tree (``test_repos``,
+    ``test_core``) would silently resolve against the developer's actual repo tree.
+    Blanking it makes the ``$GIT_BASE`` monkeypatch the effective knob under test.
     """
     from command_center import config as _config
 
@@ -103,6 +109,7 @@ def _isolate_vault_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         cfg.running_dir = str(vault / "01-llm-tasks" / "running")
         cfg.done_dir = str(vault / "01-llm-tasks" / "done")
         cfg.sessions_dir = str(vault / "01-llm-tasks" / "sessions")
+        cfg.repo_root = ""  # let each test's $GIT_BASE monkeypatch govern the repo tree
         return cfg
 
     monkeypatch.setattr(_config, "load_config", _tmp_vaulted)
