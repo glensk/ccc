@@ -185,7 +185,11 @@ sends as `Esc b`/`Esc f` → Textual `ctrl+←/→`) **jump three rows down / up
 around at the top/bottom). The single keys `a` `n` `D` `b` still edit a field directly,
 and **`e`** edits the fields **in place** — the `job details:` **layout does not change** (the
 divider reads `job details (e to edit):`, the `e` gilded gold); the editable lines simply gain a
-cursor (the focused line is tinted — no boxes, no popup). **`↑/↓`** move between the one-line fields
+cursor (the focused line is tinted — that tint shows immediately on `e`, scrolled into view — no
+boxes, no popup). While editing, `Tab` is **confined to the detail pane**: it cycles the fields
+plus the read-only **`Status:` head** as an extra stop (tinted too, scrolls the pane to its top),
+so the upper part — including a long *Prompt to run* — is always reachable; it never escapes into
+the session table. **`↑/↓`** move between the one-line fields
 (**`/next-step` · `/deadline` · `progress %` · `/block`**); the **AIM**, the **sub-goal checklist**
 and the future-job **prompt to run** are borderless **multi-line** fields that grow to fit
 (**`Tab`** leaves them). **`progress %`** sets a manual bar override (blank = auto from sub-goals;
@@ -403,7 +407,10 @@ column shows the bare 4-hex display hash, and the **`/next-step`** column double
 draft's **tags/notes column**: any typed `@tags` plus the free-text `start_when` note (e.g.
 `@home · tomorrow evening`, note in blue) — `ccc ls` shows the same as `next:` / `when:`
 detail lines. The draft's configured models stay a colour-coded `overseer ▸ executor`
-readout in the **model** column. All of it is editable inline in the job-details pane
+readout in the **model** column; in the job-details pane they render **on the `Status:` line
+itself** (`/overseer: … /executor: …`, plus `/account: …` in multi-account mode), and a draft
+with a fixed start date shows a blue **`Scheduled for: D.M.YY`** line directly under
+`Status:`. All of it is editable inline in the job-details pane
 (`e`); once the job has synced to its file, the 4-hex hash becomes a clickable link
 (`obsidian://open`) that opens it directly — same in `ccc ls`. That's a Rich/OSC 8 hyperlink, so clickability depends on the terminal
 (⌘-click under iTerm2); the guaranteed path is the **`oo`** chord (type `o` then `o` on the

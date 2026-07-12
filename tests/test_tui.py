@@ -1998,3 +1998,144 @@ def test_hoisted_draft_renders_without_future_separator(
             assert table.get_row_index("child") == table.get_row_index("parent") + 1
 
     asyncio.run(scenario())
+
+
+def test_draft_head_shows_scheduled_for_and_models_on_status_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scheduled draft's head: models on the Status line, blue Scheduled-for below it."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(
+        "sched-draft",
+        "/Users/x/repo",
+        "run the thing",
+        start_date="2099-01-02",
+        llm_overseer="fable-5",
+        llm_exec="opus-4.8",
+    )
+    store.ensure("plain", cwd="/Users/x/repo")
+    store.update_fields("plain", aim="other")
+    store.close()
+
+    from command_center.views.tui import CommandCenterApp, DetailHead
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            app._current = "sched-draft"
+            app.update_detail()
+            await pilot.pause()
+            head = app.query_one("#detail-head", DetailHead)
+            rendered = head.render()  # a textual Content (not rich Text) on Textual 8.x
+            lines = rendered.plain.splitlines()
+            # Status line carries the draft's model pair (account: single-account → hidden).
+            assert "/overseer: fable-5" in lines[0]
+            assert "/executor: opus-4.8" in lines[0]
+            # Scheduled for: directly under Status, above the FUTURE JOB banner, in blue.
+            assert lines[1].startswith("Scheduled for: 2.1.99")
+            future_line = next(i for i, line in enumerate(lines) if "FUTURE JOB" in line)
+            assert future_line > 1
+
+            from rich.color import Color as RichColor
+
+            from command_center.views.tui import _DRAFT_BLUE
+
+            blue = RichColor.parse(_DRAFT_BLUE).get_truecolor()
+
+            def _is_blue(style: object) -> bool:  # str style or textual Style
+                if isinstance(style, str):
+                    return _DRAFT_BLUE in style
+                fg = getattr(style, "foreground", None)
+                return fg is not None and tuple(fg)[:3] == tuple(blue)
+
+            sched_at = rendered.plain.index("Scheduled for:")
+            assert any(
+                span.start <= sched_at < span.end and _is_blue(span.style)
+                for span in rendered.spans
+            )
+            # The fields block no longer repeats the model rows.
+            fview = app.query_one("#detail-fields-view")
+            frendered = fview.render()
+            fplain = frendered.plain if hasattr(frendered, "plain") else str(frendered)
+            assert "/overseer" not in fplain
+
+            # A non-draft session shows neither models nor a Scheduled-for line.
+            app._current = "plain"
+            app.update_detail()
+            await pilot.pause()
+            rendered2 = head.render()
+            plain2 = rendered2.plain if hasattr(rendered2, "plain") else str(rendered2)
+            assert "/overseer" not in plain2
+            assert "Scheduled for" not in plain2
+
+    asyncio.run(scenario())
+
+
+def test_edit_mode_focuses_visibly_and_status_head_is_a_tab_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`e` lands focus on the AIM field scrolled into view; Tab cycles through the head.
+
+    The head is a read-only stop: stray letters are swallowed (no app action fires),
+    ↑/↓ move focus like the form rows, and Esc saves-and-exits. The session table and
+    the scroll container leave the focus cycle while editing and rejoin it after.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft("focus-draft", "/Users/x/repo", "run the thing", prompt="line\n" * 80)
+    store.close()
+
+    from textual.containers import VerticalScroll
+    from textual.widgets import TextArea
+
+    from command_center.views.tui import CommandCenterApp, DetailHead, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.cfg.aim_score_on_set = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index("focus-draft"))
+            table.focus()
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            # Focus lands on the AIM field AND the pane scrolled it into view (the
+            # long read-only prompt in the head pushes it below the fold otherwise).
+            focused = app.focused
+            assert isinstance(focused, TextArea) and focused.id == "edit-aim"
+            wrap = app.query_one("#detail-wrap", VerticalScroll)
+            assert wrap.scroll_y > 0
+            # Table + scroll container left the Tab cycle; the head joined it.
+            assert table.can_focus is False
+            assert wrap.can_focus is False
+            head = app.query_one("#detail-head", DetailHead)
+            assert head.can_focus is True
+
+            # Shift+Tab from the first field wraps back onto the Status head, which
+            # scrolls home so the top of the pane is visible.
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            assert app.focused is head
+            assert wrap.scroll_y == 0
+            # Read-only stop: a stray letter must not fire any app/table action.
+            await pilot.press("r")
+            await pilot.pause()
+            assert app._editing is True
+            # ↓ moves on to the first editable field, like the form's own rows.
+            await pilot.press("down")
+            await pilot.pause()
+            assert getattr(app.focused, "id", "") == "edit-aim"
+            # Esc on the head saves and leaves edit mode; focus fences are restored.
+            await pilot.press("shift+tab")
+            await pilot.pause()
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._editing is False
+            assert table.can_focus is True and wrap.can_focus is True
+            assert head.can_focus is False
+
+    asyncio.run(scenario())

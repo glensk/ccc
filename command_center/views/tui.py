@@ -1628,6 +1628,35 @@ class SessionTable(DataTable):
             self.refresh(layout=True)
 
 
+class DetailHead(Static):
+    """The read-only Status head of the detail pane; a Tab stop while editing.
+
+    Outside edit mode this is a plain Static. ``action_edit_session`` flips
+    ``can_focus`` on so Tab / ↑↓ can land here too — the focus tint marks it — giving
+    the top of the pane (Status, Scheduled for, the full ``Prompt to run``) a
+    reachable stop even when a long prompt pushes the edit fields below the fold.
+    It stays read-only: every key except Tab/Shift+Tab is swallowed (↑/↓ move focus
+    like the form's fields, Esc saves-and-exits) so a stray letter pressed on it can
+    never fire a table or app action mid-edit.
+    """
+
+    can_focus = False  # flipped on only while inline edit mode is active
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key in ("tab", "shift+tab"):
+            return  # Screen's focus_next / focus_previous take these
+        event.prevent_default()
+        event.stop()
+        if event.key == "escape":
+            exit_edit = getattr(self.app, "action_exit_edit", None)
+            if callable(exit_edit):
+                exit_edit()
+        elif event.key == "up":
+            self.screen.focus_previous()
+        elif event.key == "down":
+            self.screen.focus_next()
+
+
 def _build_bindings() -> list[Binding | tuple[str, str] | tuple[str, str, str]]:
     """Textual key bindings, generated from the command registry.
 
@@ -1654,6 +1683,8 @@ class CommandCenterApp(App[None]):
     #detail-top { height: auto; }
     #detail-left { width: 1fr; height: auto; }
     #detail-head { width: 1fr; height: auto; }
+    /* Edit mode makes the head focusable (a read-only Tab stop on the Status line). */
+    #detail-head:focus { background: $accent 20%; }
     #detail-fields-view { width: 1fr; height: auto; }
     #detail-bottom { width: 1fr; height: auto; }
     /* Inline editor: swaps in place of #detail-fields-view, rendering the SAME lines so
@@ -1671,7 +1702,7 @@ class CommandCenterApp(App[None]):
     #detail-edit TextArea {
         border: none; background: transparent; height: auto; padding: 0; width: 1fr;
     }
-    #detail-edit TextArea:focus { background: $accent 20%; }
+    #detail-edit TextArea:focus { background: $accent 30%; }
     #detail-edit Button {
         border: none; background: transparent; height: 1; min-width: 0; padding: 0;
     }
@@ -1748,7 +1779,7 @@ class CommandCenterApp(App[None]):
                 # mode, swapped IN PLACE for the inline editor (#detail-edit). The
                 # context above never moves, so `e` edits the lines where they sit.
                 with Vertical(id="detail-left"):
-                    yield Static("", id="detail-head")
+                    yield DetailHead("", id="detail-head")
                     yield Static("", id="detail-fields-view")
                     yield EditForm(id="detail-edit")
                     # Todos / summary / flags and the sub-goal checklist sit at the
@@ -2356,6 +2387,18 @@ class CommandCenterApp(App[None]):
                 f"   closed {approx}{iso_datetime(closed) or '—'} ({humanize_age(closed)} ago)",
                 style="grey62",
             )
+        if session.draft:
+            # A draft's model pair + billing account live on the Status line (they used
+            # to be /overseer /executor /account rows in the fields block below).
+            over = session.llm_overseer or ""
+            ex = session.llm_exec or ""
+            text.append("   /overseer: ", style="bold")
+            text.append(over or "—", style=_LLM_STYLE.get(over, "white"))
+            text.append("  /executor: ", style="bold")
+            text.append(ex or "—", style=_LLM_STYLE.get(ex, "white"))
+            if len(config.claude_config_dirs()) > 1:
+                text.append("  /account: ", style="bold")
+                text.append(accounts.account_label(session.config_dir or ""), style="white")
         # Manual override (set via `e` or Enter on the progress column) wins over the
         # sub-goal ratio and is labelled so its origin is never ambiguous.
         head_frac = effective_progress(session.manual_progress, checked, len(subs))
@@ -2367,6 +2410,14 @@ class CommandCenterApp(App[None]):
             )
             text.append(f"   {progress_bar(head_frac, 12)} {count}", "cyan")
         text.append("\n")
+        if (when := scheduled_date(session)) is not None:
+            # The date the job is supposed to run (the SCHEDULED column's date), right
+            # under Status: — same compact D.M.YY form and blue as the table rows.
+            text.append("Scheduled for: ", style=f"bold {_DRAFT_BLUE}")
+            text.append(short_date_label(when), style=_DRAFT_BLUE)
+            if (early := days_until_start(session)) is not None:
+                text.append(f"  (in {early}d — launching earlier asks first)", style="grey62")
+            text.append("\n")
         if session.aim_met and not session.done and not session.draft:
             # The impartial per-turn checker judged the AIM fulfilled (the red DONE in the bar).
             text.append("model self-assessment: ", style="bold")
@@ -2381,12 +2432,6 @@ class CommandCenterApp(App[None]):
             text.append(f"Done: {iso_date(session.done_at)}\n", style="green3")
         if session.draft:
             text.append("\n✎ FUTURE JOB — not started yet\n", style=f"bold {_DRAFT_BLUE}")
-            if session.start_date:
-                text.append("Fixed start date: ", style="bold")
-                text.append(f"{session.start_date}", style=_DRAFT_BLUE)
-                if (early := days_until_start(session)) is not None:
-                    text.append(f"  (in {early}d — launching earlier asks first)", style="grey62")
-                text.append("\n")
             if session.start_when:
                 text.append("Intend to start: ", style="bold")
                 text.append(f"{session.start_when}\n", style=_DRAFT_BLUE)
@@ -2471,23 +2516,8 @@ class CommandCenterApp(App[None]):
             _with_tags(_first_line(getattr(session, "next_step", None)) or "—", "white")
         )
         text.append(f"\n/deadline: {getattr(session, 'deadline', None) or '—'}", style="white")
-        if getattr(session, "draft", False):
-            # Which models a future job runs on (overseer runs the session; executor
-            # implements). Only meaningful — and only editable — for a not-yet-started draft.
-            text.append("\n/overseer: ", style="white")
-            over = getattr(session, "llm_overseer", "")
-            text.append(over, style=_LLM_STYLE.get(over, "white"))
-            text.append("\n/executor: ", style="white")
-            ex = getattr(session, "llm_exec", "")
-            text.append(ex, style=_LLM_STYLE.get(ex, "white"))
-            # The launch (billing) account — shown only when >1 account is configured,
-            # mirroring the edit form's /account row so entering edit mode never reflows.
-            if len(config.claude_config_dirs()) > 1:
-                text.append("\n/account: ", style="white")
-                text.append(
-                    accounts.account_label(getattr(session, "config_dir", "") or ""),
-                    style="white",
-                )
+        # A draft's /overseer /executor /account readouts render on the Status line in
+        # the head (update_detail), not here — edit mode still shows them as Select rows.
         text.append("\n/block: ", style="white")
         text.append_text(_with_tags(getattr(session, "blocked_on", None) or "—", "white"))
         dep = getattr(session, "depends_on", None)
@@ -3517,6 +3547,12 @@ class CommandCenterApp(App[None]):
         self.query_one("#detail-fields-view").styles.display = "none"
         self.query_one("#detail-edit").styles.display = "block"
         self._editing = True
+        # Confine the Tab cycle to the detail pane: the read-only Status head joins it
+        # (a focusable stop) while the table and the scroll container drop out, so
+        # Tab wraps head → fields → head instead of escaping into the session list.
+        self.query_one("#detail-head", DetailHead).can_focus = True
+        self.query_one("#sessions", SessionTable).can_focus = False
+        self.query_one("#detail-wrap", VerticalScroll).can_focus = False
         # Land on the caller's field, else the field the table's column cursor was on
         # (else the AIM line). A click on the models cell passes focus_id="edit-overseer".
         if focus_id is None:
@@ -3527,7 +3563,38 @@ class CommandCenterApp(App[None]):
                     focus_id = "edit-next"
                 elif table.cursor_column == _PROGRESS_COL:
                     focus_id = "edit-progress"
-        self.query_one(f"#{focus_id}").focus()
+        # Focus only after the display swap has painted: focusing while #detail-edit is
+        # still hidden skips the scroll-into-view, leaving the tinted field below the
+        # fold — no visible cursor until the first Tab.
+        self.call_after_refresh(self.query_one(f"#{focus_id}").focus)
+
+    def on_descendant_focus(self, event: events.DescendantFocus) -> None:
+        """Keep the focused edit field's whole row — its label included — in view.
+
+        The default focus scroll only reveals the focused widget itself; a taller-
+        than-the-pane TextArea (a long ``prompt:``) would leave its label and all
+        context above off-screen. Scrolling the row with ``top=True`` pins the row's
+        first line (where the label sits) when the row cannot fit; the Status-head
+        stop scrolls home so Tab alone reaches the very top of the pane.
+        """
+        if not self._editing:
+            return
+        widget = event.widget
+        if isinstance(widget, DetailHead):
+            self.query_one("#detail-wrap", VerticalScroll).scroll_home(animate=False)
+            return
+        form = self.query_one("#detail-edit", EditForm)
+        row = widget
+        while row.parent is not None and row.parent is not form:
+            parent = row.parent
+            if not isinstance(parent, Vertical | Horizontal | EditForm):
+                return  # focus moved outside the inline editor (e.g. a modal)
+            row = parent
+        if row.parent is not form:
+            return
+        wrap = self.query_one("#detail-wrap", VerticalScroll)
+        oversized = row.outer_size.height >= wrap.scrollable_content_region.height
+        row.scroll_visible(animate=False, top=oversized)
 
     def action_exit_edit(self) -> None:
         """Save changed inline-edit fields and return to the session table.
@@ -3670,6 +3737,11 @@ class CommandCenterApp(App[None]):
         self._edit_depends_pending = None
         self.query_one("#detail-fields-view").styles.display = "block"
         self.query_one("#detail-edit").styles.display = "none"
+        # Undo the edit-mode focus fences: head back to read-only, table + scroll
+        # container focusable again (action_edit_session flipped all three).
+        self.query_one("#detail-head", DetailHead).can_focus = False
+        self.query_one("#sessions", SessionTable).can_focus = True
+        self.query_one("#detail-wrap", VerticalScroll).can_focus = True
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """Open the folder / dependency picker from the inline edit form."""
