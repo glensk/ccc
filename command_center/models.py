@@ -318,6 +318,10 @@ class Session:
     iterm_session_id: str | None = None  # $ITERM_SESSION_ID, to focus the live tab
     prompt_count: int = 0  # user prompts seen (for nag throttling)
     last_response_at: int = 0  # epoch ms
+    # Epoch ms reconcile first saw the process gone after being alive (0 = alive, or
+    # closed before this field existed — display falls back to last_response_at then).
+    # Cleared back to 0 the moment the session is observed live again (resume/reopen).
+    closed_at: int = 0
     last_seen_pid: int | None = None
     keep: bool = False  # exempt from the idle reaper
     auto_closed: bool = False
@@ -483,6 +487,14 @@ def iso_date(epoch_ms: int) -> str:
         return ""
 
     return datetime.fromtimestamp(epoch_ms / 1000).strftime("%Y-%m-%d")
+
+
+def iso_datetime(epoch_ms: int) -> str:
+    """Render an epoch-ms timestamp as a local ``YYYY-MM-DD HH:MM`` (empty if 0)."""
+    if not epoch_ms:
+        return ""
+
+    return datetime.fromtimestamp(epoch_ms / 1000).strftime("%Y-%m-%d %H:%M")
 
 
 def importance_marks(level: int) -> str:

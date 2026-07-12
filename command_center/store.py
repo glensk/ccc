@@ -77,6 +77,7 @@ _SESSION_COLUMNS = (
     "iterm_session_id",
     "prompt_count",
     "last_response_at",
+    "closed_at",
     "last_seen_pid",
     "keep",
     "auto_closed",
@@ -158,6 +159,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     iterm_session_id  TEXT,
     prompt_count      INTEGER NOT NULL DEFAULT 0,
     last_response_at  INTEGER NOT NULL DEFAULT 0,
+    closed_at         INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
     auto_closed       INTEGER NOT NULL DEFAULT 0,
@@ -311,6 +313,8 @@ class Store:  # pylint: disable=too-many-public-methods
         "drift_reason": "TEXT",
         "drift_at": "INTEGER NOT NULL DEFAULT 0",
         "drift_ack_at": "INTEGER NOT NULL DEFAULT 0",
+        # When reconcile first saw the process gone (0 = alive / closed pre-feature).
+        "closed_at": "INTEGER NOT NULL DEFAULT 0",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {

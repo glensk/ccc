@@ -252,6 +252,31 @@ def test_reconcile_heals_done_session_stamped_parked(tmp_path: Path) -> None:
     store.close()
 
 
+def test_reconcile_stamps_closed_at_on_park_and_clears_on_reopen(tmp_path: Path) -> None:
+    """closed_at records WHEN the process went away: stamped once on the live→gone
+    transition, left untouched while the row stays parked, and cleared back to 0
+    the moment the session is observed live again (resume/reopen)."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+    store.ensure("s1")
+    store.update_fields("s1", cwd="/x", status=Status.IDLE.value)
+    before = now_ms()
+    reconcile(store, _StubAdapter())  # process gone: idle → parked, stamp the close
+    session = store.get("s1")
+    assert session is not None
+    assert session.status == Status.PARKED.value
+    assert session.closed_at >= before
+    stamp = session.closed_at
+    reconcile(store, _StubAdapter())  # already parked: the stamp is not re-written
+    session = store.get("s1")
+    assert session is not None and session.closed_at == stamp
+    reconcile(store, _LiveAdapter("s1", "/x"))  # reopened: the stamp is cleared
+    session = store.get("s1")
+    assert session is not None and session.closed_at == 0
+    store.close()
+
+
 def test_reconcile_stamps_claude_version(tmp_path: Path) -> None:
     """reconcile() records the live session's Claude Code version, but a read miss
     (None) never clobbers a previously-stored value."""

@@ -222,6 +222,9 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
             "last_response_at": adapter.last_activity_ms(live),
             "last_seen_pid": live.pid,
         }
+        # Alive again — a stale close stamp no longer applies (resume/reopen).
+        if stored is not None and stored.closed_at:
+            fields["closed_at"] = 0
         # Persist the last-observed live account (D3) — only on change, and NEVER on a
         # D9 conflict (discover leaves config_dir "" then, so this is a no-op and the
         # stored value is left untouched rather than mis-attributed).
@@ -273,6 +276,11 @@ def reconcile(  # pylint: disable=too-many-locals,too-many-branches
                 updates["status"] = Status.DONE.value
         elif session.status != Status.PARKED.value:
             updates["status"] = Status.PARKED.value
+            # The live→gone transition: this pass is the first to see the process gone,
+            # so stamp WHEN the session closed. Rows already PARKED (or closed before
+            # this field existed) are never stamped — display falls back to
+            # last_response_at as the approximate close time.
+            updates["closed_at"] = now_ms()
         if updates:
             store.update_fields(session.session_id, **updates)
 

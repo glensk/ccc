@@ -92,6 +92,7 @@ from ..models import (
     humanize_age,
     importance_marks,
     iso_date,
+    iso_datetime,
     loads_todos,
     low_aim_score,
     model_effort_cell,
@@ -2346,6 +2347,15 @@ class CommandCenterApp(App[None]):
         text.append("Status: ", style="bold")
         text.append(f"{status.value}", style=_STATUS_STYLE.get(status, "white"))
         text.append(f"   {humanize_age(session.last_response_at)} ago", style="grey62")
+        if status is Status.PARKED:
+            # WHEN the session was closed, absolute + relative. A row parked before
+            # closed_at existed has no stamp — approximate with last activity (~).
+            closed = session.closed_at or session.last_response_at
+            approx = "" if session.closed_at else "~"
+            text.append(
+                f"   closed {approx}{iso_datetime(closed) or '—'} ({humanize_age(closed)} ago)",
+                style="grey62",
+            )
         # Manual override (set via `e` or Enter on the progress column) wins over the
         # sub-goal ratio and is labelled so its origin is never ambiguous.
         head_frac = effective_progress(session.manual_progress, checked, len(subs))

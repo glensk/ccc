@@ -100,6 +100,9 @@ def _is_volatile(rel: str) -> bool:
     base = rel.rsplit("/", 1)[-1]
     if base in _VOLATILE_NAMES or base.startswith("state.db") or base.startswith("."):
         return True
+    # Per-account usage caches (usage.account_usage_path): usage-<label>-<hash8>.json.
+    if base.startswith("usage-") and base.endswith(".json"):
+        return True
     return any(base.endswith(suf) for suf in _VOLATILE_SUFFIXES)
 
 
