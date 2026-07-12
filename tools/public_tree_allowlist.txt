@@ -1,0 +1,18 @@
+# public_tree_allowlist.txt — allowlist for tools/check_public_tree.py
+#
+# One entry per line, in the form:
+#
+#     <relative-path>:<pattern>
+#
+# Each entry whitelists exactly that forbidden <pattern> inside that one
+# <relative-path> (relative to the repo root, forward slashes). Lines starting
+# with '#' and blank lines are ignored. This file itself is never scanned.
+#
+# Forbidden patterns (case-sensitive) enforced by the checker:
+#   /Users/albert  com.albert  EPFL  pixel9a  42-Git  mydotfiles
+#   .claude-code-sessions  CSCS  albert.glensk
+#
+# Entries are added deliberately during de-personalization when a hit is a
+# legitimate, unavoidable reference (e.g. a documented example path). Until a
+# pattern is genuinely resolved or allowlisted, the checker exits non-zero.
+.gitignore:.claude-code-sessions

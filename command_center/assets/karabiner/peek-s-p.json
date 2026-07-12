@@ -1,0 +1,25 @@
+{
+  "description": "iTerm2: s+p (hold s, tap p) → show my last prompt (ccc peek)",
+  "manipulators": [
+    {
+      "type": "basic",
+      "from": {
+        "modifiers": { "optional": ["any"] },
+        "simultaneous": [{ "key_code": "s" }, { "key_code": "p" }],
+        "simultaneous_options": { "key_down_order": "strict" }
+      },
+      "to": [
+        {
+          "shell_command": "REPLACE_WITH_ABS_CCC_PATH peek >/dev/null 2>&1 &"
+        }
+      ],
+      "parameters": { "basic.simultaneous_threshold_milliseconds": 500 },
+      "conditions": [
+        {
+          "type": "frontmost_application_if",
+          "bundle_identifiers": ["^com\\.googlecode\\.iterm2$"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,85 @@
+{
+  "_comment": "Pinned Obsidian community-plugin releases that `ccc obsidian-setup --install-plugins` downloads, verifies (sha256) and writes into <vault>/.obsidian/plugins/<id>/. Hashes were computed from the real GitHub release assets. Regenerate by re-downloading the pinned tags.",
+  "schema": 1,
+  "plugins": [
+    {
+      "id": "obsidian-meta-bind-plugin",
+      "version": "1.4.1",
+      "repo": "mProjectsCode/obsidian-meta-bind-plugin",
+      "reason": "Renders the job-file button row + Controls dropdowns (button schema; see future_files.py).",
+      "note": "Pinned to 1.4.1 (minAppVersion 1.4.0) rather than 1.5.1 because 1.5.1 requires Obsidian >= 1.13.1 while the current release line is 1.12.x — installing 1.5.1 there never registers and buttons render as raw code. Repin to 1.5.1 once Obsidian 1.13+ is widespread.",
+      "files": [
+        {
+          "name": "main.js",
+          "url": "https://github.com/mProjectsCode/obsidian-meta-bind-plugin/releases/download/1.4.1/main.js",
+          "sha256": "a8fdbaf18db614746cef86cf8c6db61d85161a8f0df19cdaeb8d0d5afff002ab",
+          "bytes": 1116118
+        },
+        {
+          "name": "manifest.json",
+          "url": "https://github.com/mProjectsCode/obsidian-meta-bind-plugin/releases/download/1.4.1/manifest.json",
+          "sha256": "92b7a76086e688897e970ab979cfb5963a158d31ecbbdf4a5bc452179f434caa",
+          "bytes": 444
+        },
+        {
+          "name": "styles.css",
+          "url": "https://github.com/mProjectsCode/obsidian-meta-bind-plugin/releases/download/1.4.1/styles.css",
+          "sha256": "1112ffebf30b720bc992e1ed9a3e4858a12dc9147450a74ec1e7e40a24137b7a",
+          "bytes": 17051
+        }
+      ]
+    },
+    {
+      "id": "obsidian-shellcommands",
+      "version": "0.23.0",
+      "repo": "Taitava/obsidian-shellcommands",
+      "reason": "Latest stable at pin time; runs the in-note start/done/delete/restore buttons. Executes arbitrary shell.",
+      "files": [
+        {
+          "name": "main.js",
+          "url": "https://github.com/Taitava/obsidian-shellcommands/releases/download/0.23.0/main.js",
+          "sha256": "0c5e247a91c96c0af5f3e333ba43be4285469566c819d59b7de129ad33d14d8a",
+          "bytes": 3211185
+        },
+        {
+          "name": "manifest.json",
+          "url": "https://github.com/Taitava/obsidian-shellcommands/releases/download/0.23.0/manifest.json",
+          "sha256": "20ae8ccfa8972027d35b4457d21b6ab86aebc8e3b1dee5eba34dad19e46a2462",
+          "bytes": 517
+        },
+        {
+          "name": "styles.css",
+          "url": "https://github.com/Taitava/obsidian-shellcommands/releases/download/0.23.0/styles.css",
+          "sha256": "3bd8380e5aa53fc447ea6a4c14ddfb94198f1a6d003e6e5f994b459cf9684c53",
+          "bytes": 10326
+        }
+      ]
+    },
+    {
+      "id": "dataview",
+      "version": "0.5.70",
+      "repo": "blacksmithgu/obsidian-dataview",
+      "reason": "Latest stable at pin time; powers the dataviewjs dashboards.",
+      "files": [
+        {
+          "name": "main.js",
+          "url": "https://github.com/blacksmithgu/obsidian-dataview/releases/download/0.5.70/main.js",
+          "sha256": "6bb1cf7010afad830e73575fca0e2bfbd3279c562e3d9d24f2d2f45161eb7d00",
+          "bytes": 2377634
+        },
+        {
+          "name": "manifest.json",
+          "url": "https://github.com/blacksmithgu/obsidian-dataview/releases/download/0.5.70/manifest.json",
+          "sha256": "9235db47112da81b85591c79ecb9ae2574e5e72207056e976472f90616286185",
+          "bytes": 357
+        },
+        {
+          "name": "styles.css",
+          "url": "https://github.com/blacksmithgu/obsidian-dataview/releases/download/0.5.70/styles.css",
+          "sha256": "3306dd9032e00f989ba7233a37fd255bc4d3f4340cee661762e952f3f6aa1de9",
+          "bytes": 2965
+        }
+      ]
+    }
+  ]
+}

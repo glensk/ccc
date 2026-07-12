@@ -1,0 +1,14 @@
+[
+  {"aim": "all tests in tests/ pass", "vague": false},
+  {"aim": "ccc daemon exits 0", "vague": false},
+  {"aim": "PR #42 merged to main", "vague": false},
+  {"aim": "coverage reaches 90%", "vague": false},
+  {"aim": "test_parser passes and build succeeds", "vague": false},
+  {"aim": "add src/auth.py with login endpoint", "vague": false},
+  {"aim": "improve the progress bar", "vague": true},
+  {"aim": "restructure and rename ccc", "vague": true},
+  {"aim": "make it better", "vague": true},
+  {"aim": "refactor things", "vague": true},
+  {"aim": "clean up the code", "vague": true},
+  {"aim": "handle edge cases", "vague": true}
+]

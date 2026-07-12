@@ -1,0 +1,20 @@
+# xremap sample: Super+p  ->  ccc peek --print   (the peek chord idea, on Linux)
+#
+# xremap — https://github.com/xremap/xremap — is a user-space key remapper (X11 and
+# Wayland). Unlike keyd it has no per-key tap-vs-hold overload, so it cannot turn a
+# LETTER key like `s` into a "hold to activate" modifier without hijacking `s` for
+# typing. This sample therefore uses a real modifier chord — Super+p — as the
+# practical xremap equivalent of the macOS `s`+`p` peek chord. (If you want the exact
+# hold-`s` chord, use keyd instead — see keyd-peek-s-p.conf.)
+#
+# Run it with, e.g.:  xremap xremap-peek.yml   (see the xremap README for autostart).
+
+keymap:
+  - name: ccc peek (Super+p)
+    remap:
+      # Super (the "meta"/Windows key) + p -> run `ccc peek --print`.
+      Super-p:
+        launch:
+          - sh
+          - -c
+          - 'out=$(ccc peek --print 2>&1); if command -v notify-send >/dev/null 2>&1; then notify-send "ccc peek" "$out"; else printf "%s\n" "$out" > "$HOME/.cache/ccc-peek.txt"; fi'

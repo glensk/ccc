@@ -1,0 +1,1007 @@
+"""SQLite-backed store — the single source of truth for session cards.
+
+WAL mode so the hooks, the daemon, the TUI and the browser can all read/write
+concurrently. User-authored fields (aim, next_step, blocked_on, deadline, …)
+are never clobbered by the automatic reconcile from the live registry.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+from . import config
+from .aimscore import score_aim_lexical
+from .models import (
+    DEFAULT_LLM,
+    JOB_TYPES,
+    LLM_CHOICES,
+    AimRevision,
+    FileLock,
+    FileLockWaiter,
+    LiveSession,
+    Session,
+    Status,
+    Subgoal,
+    SubgoalRevision,
+    now_ms,
+)
+
+_JOB_TYPES = frozenset(JOB_TYPES)
+_LLM_CHOICES = frozenset(LLM_CHOICES)
+
+
+def _llm_or_default(value: str | None) -> str:
+    """A valid future-job model choice, falling back to :data:`DEFAULT_LLM`."""
+    return value if value in _LLM_CHOICES else DEFAULT_LLM
+
+
+# Normalize a sub-goal's text for tick-carryover matching (case/space/punctuation-insensitive).
+_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _norm(text: str) -> str:
+    return _NORM_RE.sub(" ", text.lower()).strip()
+
+
+_SESSION_COLUMNS = (
+    "session_id",
+    "cwd",
+    "agent",
+    "config_dir",
+    "version",
+    "name",
+    "aim",
+    "short_aim",
+    "aim_score",
+    "aim_score_reason",
+    "aim_prev",
+    "aim_changed_at",
+    "aim_met",
+    "aim_assessed_at",
+    "aim_met_reason",
+    "status",
+    "done",
+    "done_at",
+    "next_step",
+    "next_step_source",
+    "summary",
+    "blocked_on",
+    "deadline",
+    "done_check_cmd",
+    "importance",
+    "iterm_session_id",
+    "prompt_count",
+    "last_response_at",
+    "last_seen_pid",
+    "keep",
+    "auto_closed",
+    "needs_summary",
+    "context_offset",
+    "last_progress_at",
+    "subgoals_adaptive",
+    "subgoals_aim_rev",
+    "manual_progress",
+    "drift_severity",
+    "drift_reason",
+    "drift_at",
+    "drift_ack_at",
+    "todos",
+    "todos_updated_at",
+    "draft",
+    "prompt",
+    "start_when",
+    "start_date",
+    "depends_on",
+    "job_type",
+    "llm_overseer",
+    "llm_exec",
+    "model",
+    "effort",
+    "future_file",
+    "future_sync_hash",
+    "future_synced_at",
+    "future_missing_since",
+    "archived",
+    "created_at",
+    "updated_at",
+)
+_BOOL_COLUMNS = frozenset(
+    {
+        "done",
+        "keep",
+        "auto_closed",
+        "needs_summary",
+        "archived",
+        "subgoals_adaptive",
+        "draft",
+        "aim_met",
+    }
+)
+# Columns the automatic reconcile is allowed to touch (never user-authored fields).
+# ``config_dir`` is the last-observed live account, stamped by core.reconcile.
+_RECONCILE_COLUMNS = frozenset(
+    {"cwd", "agent", "config_dir", "name", "status", "last_response_at", "last_seen_pid"}
+)
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id        TEXT PRIMARY KEY,
+    cwd               TEXT    NOT NULL DEFAULT '',
+    agent             TEXT    NOT NULL DEFAULT 'claude',
+    config_dir        TEXT    NOT NULL DEFAULT '',
+    version           TEXT,
+    name              TEXT,
+    aim               TEXT,
+    short_aim         TEXT,
+    aim_score         INTEGER NOT NULL DEFAULT -1,
+    aim_score_reason  TEXT,
+    aim_prev          TEXT,
+    aim_changed_at    INTEGER NOT NULL DEFAULT 0,
+    aim_met           INTEGER NOT NULL DEFAULT 0,
+    aim_assessed_at   INTEGER NOT NULL DEFAULT 0,
+    aim_met_reason    TEXT,
+    status            TEXT    NOT NULL DEFAULT 'idle',
+    done              INTEGER NOT NULL DEFAULT 0,
+    done_at           INTEGER NOT NULL DEFAULT 0,
+    next_step         TEXT,
+    next_step_source  TEXT    NOT NULL DEFAULT 'auto',
+    summary           TEXT,
+    blocked_on        TEXT,
+    deadline          TEXT,
+    done_check_cmd    TEXT,
+    importance        INTEGER NOT NULL DEFAULT 0,
+    iterm_session_id  TEXT,
+    prompt_count      INTEGER NOT NULL DEFAULT 0,
+    last_response_at  INTEGER NOT NULL DEFAULT 0,
+    last_seen_pid     INTEGER,
+    keep              INTEGER NOT NULL DEFAULT 0,
+    auto_closed       INTEGER NOT NULL DEFAULT 0,
+    needs_summary     INTEGER NOT NULL DEFAULT 0,
+    context_offset    INTEGER NOT NULL DEFAULT 0,
+    last_progress_at  INTEGER NOT NULL DEFAULT 0,
+    subgoals_adaptive INTEGER NOT NULL DEFAULT 0,
+    subgoals_aim_rev  INTEGER NOT NULL DEFAULT 0,
+    manual_progress   INTEGER,
+    drift_severity    TEXT    NOT NULL DEFAULT '',
+    drift_reason      TEXT,
+    drift_at          INTEGER NOT NULL DEFAULT 0,
+    drift_ack_at      INTEGER NOT NULL DEFAULT 0,
+    todos             TEXT,
+    todos_updated_at  INTEGER NOT NULL DEFAULT 0,
+    draft             INTEGER NOT NULL DEFAULT 0,
+    prompt            TEXT,
+    start_when        TEXT,
+    start_date        TEXT,
+    depends_on        TEXT,
+    job_type          TEXT    NOT NULL DEFAULT 'claude',
+    llm_overseer      TEXT    NOT NULL DEFAULT 'fable-5',
+    llm_exec          TEXT    NOT NULL DEFAULT 'fable-5',
+    model             TEXT    NOT NULL DEFAULT '',
+    effort            TEXT    NOT NULL DEFAULT '',
+    future_file          TEXT,
+    future_sync_hash     TEXT,
+    future_synced_at     INTEGER NOT NULL DEFAULT 0,
+    future_missing_since INTEGER NOT NULL DEFAULT 0,
+    archived          INTEGER NOT NULL DEFAULT 0,
+    created_at        INTEGER NOT NULL DEFAULT 0,
+    updated_at        INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS subgoals (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id      TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    position        INTEGER NOT NULL DEFAULT 0,
+    text            TEXT    NOT NULL,
+    checked         INTEGER NOT NULL DEFAULT 0,
+    source          TEXT    NOT NULL DEFAULT 'user',
+    weight          INTEGER NOT NULL DEFAULT 1,
+    check_cmd       TEXT,
+    model           TEXT,
+    derived_aim_rev INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_subgoals_session ON subgoals(session_id);
+CREATE TABLE IF NOT EXISTS aim_history (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    aim         TEXT    NOT NULL,
+    score       INTEGER NOT NULL DEFAULT -1,
+    short_aim   TEXT,
+    created_at  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_aim_history_session ON aim_history(session_id);
+CREATE TABLE IF NOT EXISTS subgoal_history (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id     TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    created_at     INTEGER NOT NULL DEFAULT 0,
+    items_json     TEXT    NOT NULL DEFAULT '[]',
+    aim            TEXT,
+    aim_rev        INTEGER NOT NULL DEFAULT 0,
+    trigger        TEXT    NOT NULL DEFAULT '',
+    model          TEXT,
+    drift_severity TEXT    NOT NULL DEFAULT '',
+    drift_reason   TEXT,
+    drift_json     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_subgoal_history_session ON subgoal_history(session_id);
+CREATE TABLE IF NOT EXISTS file_locks (
+    file_path    TEXT    PRIMARY KEY,
+    session_id   TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    acquired_at  INTEGER NOT NULL DEFAULT 0,
+    refreshed_at INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_file_locks_session ON file_locks(session_id);
+CREATE TABLE IF NOT EXISTS file_lock_waiters (
+    file_path   TEXT    NOT NULL,
+    session_id  TEXT    NOT NULL REFERENCES sessions(session_id) ON DELETE CASCADE,
+    since       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (file_path, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_file_lock_waiters_session ON file_lock_waiters(session_id);
+"""
+
+
+def _row_to_session(row: sqlite3.Row) -> Session:
+    data = {key: row[key] for key in row.keys()}
+    for col in _BOOL_COLUMNS:
+        data[col] = bool(data[col])
+    return Session(**data)
+
+
+class Store:  # pylint: disable=too-many-public-methods
+    """Thin wrapper over the SQLite database."""
+
+    def __init__(self, path: Path | None = None, *, check_same_thread: bool = True) -> None:
+        self.path = Path(path) if path is not None else config.db_path()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(self.path, check_same_thread=check_same_thread)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        # Concurrent sessions/daemon/TUI all write; wait out a peer's write lock
+        # instead of erroring (matters for the atomic BEGIN IMMEDIATE in acquire_file_lock).
+        self.conn.execute("PRAGMA busy_timeout=3000")
+        self.conn.executescript(_SCHEMA)
+        self.conn.commit()
+        self._ensure_columns()
+
+    # Columns added after the initial schema; ALTER existing DBs in place.
+    _ADDED_COLUMNS = {
+        "config_dir": "TEXT NOT NULL DEFAULT ''",
+        "version": "TEXT",
+        "short_aim": "TEXT",
+        "importance": "INTEGER NOT NULL DEFAULT 0",
+        "iterm_session_id": "TEXT",
+        "prompt_count": "INTEGER NOT NULL DEFAULT 0",
+        "context_offset": "INTEGER NOT NULL DEFAULT 0",
+        "done_at": "INTEGER NOT NULL DEFAULT 0",
+        "todos": "TEXT",
+        "todos_updated_at": "INTEGER NOT NULL DEFAULT 0",
+        "draft": "INTEGER NOT NULL DEFAULT 0",
+        "prompt": "TEXT",
+        "start_when": "TEXT",
+        "start_date": "TEXT",
+        "depends_on": "TEXT",
+        "job_type": "TEXT NOT NULL DEFAULT 'claude'",
+        "llm_overseer": "TEXT NOT NULL DEFAULT 'fable-5'",
+        "llm_exec": "TEXT NOT NULL DEFAULT 'fable-5'",
+        # OBSERVED runtime values (distinct from the llm_overseer/llm_exec job config):
+        # the model the session actually ran on + its --effort reasoning level.
+        "model": "TEXT NOT NULL DEFAULT ''",
+        "effort": "TEXT NOT NULL DEFAULT ''",
+        "future_file": "TEXT",
+        "future_sync_hash": "TEXT",
+        "future_synced_at": "INTEGER NOT NULL DEFAULT 0",
+        "future_missing_since": "INTEGER NOT NULL DEFAULT 0",
+        "aim_score": "INTEGER NOT NULL DEFAULT -1",
+        "aim_score_reason": "TEXT",
+        "aim_prev": "TEXT",
+        "aim_changed_at": "INTEGER NOT NULL DEFAULT 0",
+        "aim_met": "INTEGER NOT NULL DEFAULT 0",
+        "aim_assessed_at": "INTEGER NOT NULL DEFAULT 0",
+        "aim_met_reason": "TEXT",
+        "last_progress_at": "INTEGER NOT NULL DEFAULT 0",
+        "subgoals_adaptive": "INTEGER NOT NULL DEFAULT 0",
+        "subgoals_aim_rev": "INTEGER NOT NULL DEFAULT 0",
+        "manual_progress": "INTEGER",
+        "drift_severity": "TEXT NOT NULL DEFAULT ''",
+        "drift_reason": "TEXT",
+        "drift_at": "INTEGER NOT NULL DEFAULT 0",
+        "drift_ack_at": "INTEGER NOT NULL DEFAULT 0",
+    }
+    # Same, for the subgoals table (auto-progress marks its rows source='auto').
+    _ADDED_SUBGOAL_COLUMNS = {
+        "source": "TEXT NOT NULL DEFAULT 'user'",
+        "weight": "INTEGER NOT NULL DEFAULT 1",
+        "check_cmd": "TEXT",
+        "model": "TEXT",
+        "derived_aim_rev": "INTEGER NOT NULL DEFAULT 0",
+    }
+    # Same, for the aim_history table (the per-revision short label, added with this feature).
+    _ADDED_AIM_HISTORY_COLUMNS = {
+        "short_aim": "TEXT",
+    }
+
+    def _ensure_columns(self) -> None:
+        existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        for column, decl in self._ADDED_COLUMNS.items():
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {decl}")
+                if column == "config_dir":
+                    self._backfill_config_dir()
+        sg_existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(subgoals)")}
+        for column, decl in self._ADDED_SUBGOAL_COLUMNS.items():
+            if column not in sg_existing:
+                self.conn.execute(f"ALTER TABLE subgoals ADD COLUMN {column} {decl}")
+        ah_existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(aim_history)")}
+        for column, decl in self._ADDED_AIM_HISTORY_COLUMNS.items():
+            if column not in ah_existing:
+                self.conn.execute(f"ALTER TABLE aim_history ADD COLUMN {column} {decl}")
+        self.conn.commit()
+
+    def _backfill_config_dir(self) -> None:
+        """One-shot: stamp every pre-existing row with the default account (D3).
+
+        Runs exactly once — the tick the ``config_dir`` column is first ALTERed in.
+        Before multi-account, every tracked session ran under the single default
+        account (``claude_home()``), so backfill them to it; thereafter an empty
+        ``config_dir`` means UNKNOWN (a freshly-created, not-yet-observed row), which
+        refuses resume/start in multi-account mode rather than defaulting to private.
+        """
+        self.conn.execute(
+            "UPDATE sessions SET config_dir = ? WHERE config_dir = ''",
+            (str(config.claude_home()),),
+        )
+
+    def close(self) -> None:
+        self.conn.close()
+
+    def __enter__(self) -> Store:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    # ---- sessions -------------------------------------------------------
+    def get(self, session_id: str) -> Session | None:
+        cur = self.conn.execute("SELECT * FROM sessions WHERE session_id = ?", (session_id,))
+        row = cur.fetchone()
+        return _row_to_session(row) if row else None
+
+    def list_sessions(self, include_archived: bool = False) -> list[Session]:
+        sql = "SELECT * FROM sessions"
+        if not include_archived:
+            sql += " WHERE archived = 0"
+        return [_row_to_session(r) for r in self.conn.execute(sql).fetchall()]
+
+    def delete(self, session_id: str) -> None:
+        """Remove a session and its sub-goals (FK cascade)."""
+        self.conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+        self.conn.commit()
+
+    def delete_many(self, session_ids: Iterable[str]) -> int:
+        """Remove several sessions (and their sub-goals); return the count deleted."""
+        ids = [(sid,) for sid in session_ids]
+        if not ids:
+            return 0
+        self.conn.executemany("DELETE FROM sessions WHERE session_id = ?", ids)
+        self.conn.commit()
+        return len(ids)
+
+    def prunable_sessions(
+        self, protect_ids: Iterable[str] = (), headless_ids: Iterable[str] = ()
+    ) -> list[Session]:
+        """Sessions that look like leftover headless/SDK junk.
+
+        Two kinds qualify, and neither is ever live (id in *protect_ids*), done, or
+        kept (a user deliberately marked those):
+
+        * **Contentless** — no signal of its own at all: no aim, prompts,
+          summary/next-step, sub-goals, importance, or blocked/deadline tag. That is
+          the shape of a ``claude -p`` row that leaked in at cwd ``/`` before the
+          adapter skipped ``entrypoint=sdk-cli``; a genuine user session trips at
+          least one guard, so this never deletes real work.
+        * **Headless one-shot** (*headless_ids*) — a row whose transcript is a
+          ``claude -p`` one-shot (e.g. ``ai.py``'s commit-message generation). These
+          carry an env-inherited aim / auto next-step / ``prompt_count=1`` from the
+          launching session, so they slip past the contentless guards; we prune them
+          regardless of that spurious content. The caller supplies the set (it owns
+          transcript classification — see ``ClaudeAdapter.is_oneshot_headless``).
+
+        Transcripts persist either way — a pruned id is still resumable.
+        """
+        protect = set(protect_ids)
+        headless = set(headless_ids)
+        out: list[Session] = []
+        for session in self.list_sessions(include_archived=True):
+            if session.session_id in protect or session.done or session.keep:
+                continue
+            if session.session_id in headless:
+                out.append(session)
+                continue
+            if session.aim or session.summary:
+                continue
+            if session.next_step or session.blocked_on or session.deadline:
+                continue
+            if session.importance or session.prompt_count:
+                continue
+            if self.progress(session.session_id)[1]:  # has sub-goals
+                continue
+            out.append(session)
+        return out
+
+    def ensure(self, session_id: str, cwd: str = "", agent: str = "claude") -> Session:
+        """Create the row if missing; return the current Session."""
+        existing = self.get(session_id)
+        if existing is not None:
+            return existing
+        ts = now_ms()
+        self.conn.execute(
+            "INSERT INTO sessions (session_id, cwd, agent, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, cwd, agent, ts, ts),
+        )
+        self.conn.commit()
+        got = self.get(session_id)
+        assert got is not None
+        return got
+
+    def create_draft(
+        self,
+        session_id: str,
+        cwd: str,
+        aim: str,
+        prompt: str | None = None,
+        deadline: str | None = None,
+        start_when: str | None = None,
+        start_date: str | None = None,
+        depends_on: str | None = None,
+        job_type: str = "claude",
+        llm_overseer: str = DEFAULT_LLM,
+        llm_exec: str = DEFAULT_LLM,
+        config_dir: str = "",
+    ) -> Session:
+        """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
+
+        *session_id* is a freshly-generated UUID so that, when the job is later started
+        via ``claude --session-id <id>``, the real session reuses this id and the AIM
+        stored here carries over unchanged. A blank prompt stays ``NULL`` — the launcher
+        (``cmd_start_job``) falls back to the AIM, so ``NULL`` means "defaults to the AIM
+        at launch" and the mirrored job file's empty ``# Prompt`` section round-trips to it.
+        *start_when* is free-text shown in the next-step (tags/notes) column
+        (e.g. "during holidays");
+        *start_date* is the FIXED start date (ISO YYYY-MM-DD — SCHEDULED bucket +
+        premature-launch guard). *config_dir* pins the Claude account the job will
+        launch under (absolute path; "" ⇒ the default account, stamped explicitly so
+        ``start-job`` never hits the multi-account "unknown ⇒ refuse" guard).
+        *depends_on* is the full session UUID of another job this one must wait for
+        (NULL when blank — see :mod:`command_center.deps`). Routing the AIM through
+        :meth:`set_aim` records its history + lexical score.
+        """
+        self.ensure(session_id, cwd=cwd)
+        self.update_fields(
+            session_id,
+            draft=True,
+            config_dir=(config_dir.strip() or str(config.claude_home())),
+            prompt=(prompt.strip() if prompt and prompt.strip() else None),
+            deadline=deadline or None,
+            start_when=(start_when.strip() if start_when and start_when.strip() else None),
+            start_date=(start_date.strip() if start_date and start_date.strip() else None),
+            depends_on=(depends_on.strip() if depends_on and depends_on.strip() else None),
+            job_type=(job_type if job_type in _JOB_TYPES else "claude"),
+            llm_overseer=_llm_or_default(llm_overseer),
+            llm_exec=_llm_or_default(llm_exec),
+            status=Status.PARKED.value,
+        )
+        self.set_aim(session_id, aim)
+        got = self.get(session_id)
+        assert got is not None
+        return got
+
+    def clear_draft(self, session_id: str) -> None:
+        """Promote a draft to a real session: drop the draft flag as it launches."""
+        self.update_fields(session_id, draft=False, status=Status.IDLE.value)
+
+    def update_fields(self, session_id: str, **fields: Any) -> None:
+        """Update an explicit whitelist of columns on one session."""
+        cols = [c for c in fields if c in _SESSION_COLUMNS and c != "session_id"]
+        if not cols:
+            return
+        values: list[Any] = []
+        for col in cols:
+            val = fields[col]
+            values.append(int(val) if col in _BOOL_COLUMNS and isinstance(val, bool) else val)
+        assignments = ", ".join(f"{c} = ?" for c in cols)
+        values.extend([now_ms(), session_id])
+        self.conn.execute(
+            f"UPDATE sessions SET {assignments}, updated_at = ? WHERE session_id = ?", values
+        )
+        self.conn.commit()
+
+    def upsert_from_live(self, live: LiveSession) -> None:
+        """Reconcile a live registry entry, preserving user-authored fields."""
+        self.ensure(live.session_id, cwd=live.cwd, agent=live.agent)
+        patch: dict[str, Any] = {"cwd": live.cwd, "agent": live.agent, "last_seen_pid": live.pid}
+        if live.name:
+            patch["name"] = live.name
+        self.update_fields(
+            live.session_id, **{k: v for k, v in patch.items() if k in _RECONCILE_COLUMNS}
+        )
+
+    # ---- subgoals -------------------------------------------------------
+    def list_subgoals(self, session_id: str) -> list[Subgoal]:
+        rows = self.conn.execute(
+            "SELECT * FROM subgoals WHERE session_id = ? ORDER BY position, id", (session_id,)
+        ).fetchall()
+        return [
+            Subgoal(
+                r["id"],
+                r["session_id"],
+                r["position"],
+                r["text"],
+                bool(r["checked"]),
+                r["source"] if "source" in r.keys() else "user",
+                r["weight"] if "weight" in r.keys() else 1,
+                r["check_cmd"] if "check_cmd" in r.keys() else None,
+                r["model"] if "model" in r.keys() else None,
+                r["derived_aim_rev"] if "derived_aim_rev" in r.keys() else 0,
+            )
+            for r in rows
+        ]
+
+    def set_subgoals(  # pylint: disable=too-many-arguments,too-many-locals
+        self,
+        session_id: str,
+        items: list[str],
+        source: str = "user",
+        weights: list[int] | None = None,
+        *,
+        model: str | None = None,
+        aim_rev: int | None = None,
+        trigger: str | None = None,
+        adaptive: bool | None = None,
+        merge: bool = False,
+        drift_severity: str = "",
+    ) -> bool:
+        """Replace a session's checklist with *items*; return whether it changed.
+
+        *source* is ``"user"`` (manual), ``"auto"`` (cheap-model derive) or ``"agent"``
+        (the in-session agent). *weights* (parallel, default 1) set per-item importance.
+
+        Provenance: *model* records who authored the list (shown in the header);
+        *aim_rev* (default: the current AIM revision) ties the checklist to an AIM
+        version; *trigger* (default derived from *source*) labels the history entry.
+        *adaptive* (default: ``source != 'user'``) marks the list to re-derive on AIM
+        change. With *merge*, ticks carry over to any new item whose normalized text
+        matches a previously-checked one (smart-merge preserving progress).
+
+        On a real change (membership/text/weight differs) this snapshots a
+        ``subgoal_history`` entry; identical content is a no-op and returns ``False``.
+        """
+        old = self.list_subgoals(session_id)
+        new_weights = [(weights[i] if weights else 1) for i in range(len(items))]
+        changed = [(s.text, s.weight) for s in old] != list(zip(items, new_weights, strict=False))
+        checked_norms = {_norm(s.text) for s in old if s.checked} if merge else set()
+        session = self.get(session_id)
+        if aim_rev is None:
+            aim_rev = self.count_aim_history(session_id) or (1 if session and session.aim else 0)
+        if trigger is None:
+            trigger = {"auto": "auto-derive", "agent": "agent-merge"}.get(source, "user-edit")
+        if adaptive is None:
+            adaptive = source != "user"
+        checks = [int(_norm(text) in checked_norms) for text in items]
+        self.conn.execute("DELETE FROM subgoals WHERE session_id = ?", (session_id,))
+        self.conn.executemany(
+            "INSERT INTO subgoals "
+            "(session_id, position, text, checked, source, weight, model, derived_aim_rev) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (session_id, pos, text, checks[pos], source, new_weights[pos], model, aim_rev)
+                for pos, text in enumerate(items)
+            ],
+        )
+        self.conn.execute(
+            "UPDATE sessions SET subgoals_adaptive = ?, subgoals_aim_rev = ? WHERE session_id = ?",
+            (int(adaptive), aim_rev, session_id),
+        )
+        self.conn.commit()
+        if changed and items:
+            # First-ever checklist has nothing to drift from; later versions await the checker.
+            severity = drift_severity or ("none" if not old else "")
+            self._record_subgoal_history(
+                session_id,
+                list(zip(items, [bool(c) for c in checks], strict=False)),
+                aim=session.aim if session else None,
+                aim_rev=aim_rev,
+                trigger=trigger,
+                model=model,
+                drift_severity=severity,
+            )
+        return changed
+
+    def clear_auto_subgoals(self, session_id: str) -> None:
+        """Delete only the auto-derived checklist (leave user-authored goals intact)."""
+        self.conn.execute(
+            "DELETE FROM subgoals WHERE session_id = ? AND source = 'auto'", (session_id,)
+        )
+        self.conn.commit()
+
+    # ---- subgoal history + drift verdict --------------------------------
+    def _record_subgoal_history(  # pylint: disable=too-many-arguments
+        self,
+        session_id: str,
+        items_checked: list[tuple[str, bool]],
+        *,
+        aim: str | None,
+        aim_rev: int,
+        trigger: str,
+        model: str | None,
+        drift_severity: str = "",
+    ) -> None:
+        """Append a snapshot of the checklist (with checked state) to the history."""
+        payload = json.dumps([[text, bool(checked)] for text, checked in items_checked])
+        self.conn.execute(
+            "INSERT INTO subgoal_history "
+            "(session_id, created_at, items_json, aim, aim_rev, trigger, model, drift_severity) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (session_id, now_ms(), payload, aim, int(aim_rev), trigger, model, drift_severity),
+        )
+        self.conn.commit()
+
+    def list_subgoal_history(self, session_id: str) -> list[SubgoalRevision]:
+        """The session's sub-goal evolution, oldest first (the last is current)."""
+        rows = self.conn.execute(
+            "SELECT * FROM subgoal_history WHERE session_id = ? ORDER BY created_at, id",
+            (session_id,),
+        ).fetchall()
+        out: list[SubgoalRevision] = []
+        for r in rows:
+            try:
+                raw = json.loads(r["items_json"]) or []
+            except (ValueError, TypeError):
+                raw = []
+            items = [(str(x[0]), bool(x[1])) for x in raw if isinstance(x, list) and x]
+            out.append(
+                SubgoalRevision(
+                    items,
+                    r["aim"],
+                    int(r["aim_rev"]),
+                    r["trigger"],
+                    r["model"],
+                    r["drift_severity"],
+                    r["drift_reason"],
+                    int(r["created_at"]),
+                )
+            )
+        return out
+
+    def latest_subgoal_history_id(self, session_id: str) -> int | None:
+        """Row id of the most recent sub-goal version (the one the checker grades)."""
+        row = self.conn.execute(
+            "SELECT id FROM subgoal_history WHERE session_id = ? ORDER BY created_at DESC, id DESC "
+            "LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        return int(row["id"]) if row else None
+
+    def set_subgoal_history_drift(
+        self, history_id: int, severity: str, reason: str | None, verdict_json: str | None = None
+    ) -> None:
+        """Write the impartial checker's verdict onto a sub-goal history row."""
+        self.conn.execute(
+            "UPDATE subgoal_history SET drift_severity = ?, drift_reason = ?, drift_json = ? "
+            "WHERE id = ?",
+            (severity, reason, verdict_json, history_id),
+        )
+        self.conn.commit()
+
+    def set_drift(self, session_id: str, severity: str, reason: str | None) -> None:
+        """Record the session-level drift verdict; non-flagging severities clear the marker."""
+        flagged = severity in ("low", "medium", "high")
+        # A new verdict always resets the ack so a fresh flag reads as unresolved; a
+        # clean check additionally drops the severity so the dot clears.
+        self.update_fields(
+            session_id,
+            drift_severity=severity,
+            drift_reason=reason or None,
+            drift_at=now_ms() if flagged else 0,
+            drift_ack_at=0,
+        )
+
+    def ack_drift(self, session_id: str) -> None:
+        """Acknowledge (resolve) a flagged drift so the blue dot clears."""
+        self.update_fields(session_id, drift_ack_at=now_ms())
+
+    def subgoals_stale(self, session_id: str) -> bool:
+        """True if an adaptive checklist was built for an older AIM than the current one.
+
+        Drives the "re-align your sub-goals" nudge: an adaptive list whose
+        ``subgoals_aim_rev`` lags the AIM revision count needs regenerating.
+        """
+        session = self.get(session_id)
+        if session is None or not session.subgoals_adaptive:
+            return False
+        return session.subgoals_aim_rev < self.count_aim_history(session_id)
+
+    def set_aim(self, session_id: str, aim: str | None) -> bool:
+        """Set the AIM through the single chokepoint; return whether it changed.
+
+        On a real change this also (a) drops the auto-derived checklist and resets
+        ``context_offset`` so a fresh, AIM-aligned checklist re-derives, (b) sets an
+        instant lexical ``aim_score`` (clearing the stale reason) so the UI is never
+        blank — an async LLM refine can overwrite the score later, and (c) clears the
+        stale ``short_aim`` label so the column shows the new full AIM until the cheap
+        codex generator (spawned by ``cmd_set_aim``) backfills a fresh short label.
+        """
+        current = self.get(session_id)
+        old = current.aim if current else None
+        new = aim if (aim and aim.strip()) else None
+        if (new or None) == (old or None):
+            return False
+        self.update_fields(
+            session_id,
+            aim=new,
+            short_aim=None,
+            aim_score=score_aim_lexical(new) if new else -1,
+            aim_score_reason=None,
+            # A new AIM invalidates any prior "is it done?" verdict — clear it so a
+            # stale DONE can never linger against a changed goal (also closes the O2
+            # race: a detached assessor mid-flight is discarded on write).
+            aim_met=False,
+            aim_assessed_at=0,
+            aim_met_reason=None,
+            context_offset=0,
+            # Remember where we came from so the status line can show old ====> new this turn
+            # (only a real prior AIM — the initial set, old=None, shows no transition).
+            aim_prev=old,
+            aim_changed_at=now_ms() if old else 0,
+        )
+        self.clear_auto_subgoals(session_id)
+        if new is not None:
+            self._record_aim_history(session_id, old, current, new)
+        return True
+
+    def set_aim_met(self, session_id: str, met: bool, reason: str | None, assessed_at: int) -> None:
+        """Record the impartial "is the AIM fulfilled?" verdict (latest wins).
+
+        Written out-of-band by ``ccc assess-aim`` (never the session agent). ``assessed_at``
+        stamps when the verdict was formed and drives the new-turn gate (re-assess only once
+        ``last_response_at`` has advanced past it). Not monotonic — a later turn can flip
+        ``met`` back to False.
+        """
+        self.update_fields(
+            session_id,
+            aim_met=met,
+            aim_met_reason=reason or None,
+            aim_assessed_at=assessed_at,
+        )
+
+    def _record_aim_history(
+        self, session_id: str, old: str | None, current: Session | None, new: str
+    ) -> None:
+        """Append *new* to the AIM history (the full first→current progression).
+
+        Seeds the pre-existing original once, so a session whose AIM predates this
+        table still shows where it started rather than only its post-upgrade life.
+        """
+        empty = (
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM aim_history WHERE session_id = ?", (session_id,)
+            ).fetchone()["n"]
+            == 0
+        )
+        if empty and old and current is not None:
+            seeded_at = current.aim_changed_at or current.created_at or 0
+            # Carry the prior short label onto the seeded original row (set_aim already
+            # cleared it off the session) so the original's short-aim shows in history.
+            self._insert_aim_history(
+                session_id, old, current.aim_score, seeded_at, current.short_aim
+            )
+        self._insert_aim_history(session_id, new, score_aim_lexical(new), now_ms())
+        self.conn.commit()
+
+    def _insert_aim_history(
+        self, session_id: str, aim: str, score: int, created_at: int, short_aim: str | None = None
+    ) -> None:
+        self.conn.execute(
+            "INSERT INTO aim_history (session_id, aim, score, short_aim, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (session_id, aim, int(score), short_aim, int(created_at)),
+        )
+
+    def set_short_aim(self, session_id: str, short_aim: str | None) -> None:
+        """Store the cheap-model short label on the session AND its latest AIM revision.
+
+        Written by the detached ``ccc short-aim`` generator (and the daemon backfill).
+        Mirroring onto the most recent ``aim_history`` row is what makes the short label
+        appear per-revision in ``ccc aim-history``. A blank label clears back to ``NULL``.
+        """
+        label = (short_aim or "").strip() or None
+        self.update_fields(session_id, short_aim=label)
+        self.conn.execute(
+            "UPDATE aim_history SET short_aim = ? WHERE id = ("
+            "  SELECT id FROM aim_history WHERE session_id = ? ORDER BY created_at DESC, id DESC "
+            "  LIMIT 1)",
+            (label, session_id),
+        )
+        self.conn.commit()
+
+    def list_aim_history(self, session_id: str) -> list[AimRevision]:
+        """The session's AIM progression, oldest first (the last is the current AIM)."""
+        rows = self.conn.execute(
+            "SELECT aim, score, short_aim, created_at FROM aim_history WHERE session_id = ? "
+            "ORDER BY created_at, id",
+            (session_id,),
+        ).fetchall()
+        return [
+            AimRevision(r["aim"], int(r["score"]), int(r["created_at"]), r["short_aim"])
+            for r in rows
+        ]
+
+    def count_aim_history(self, session_id: str) -> int:
+        """Number of recorded AIM revisions (the current AIM's 1-based running index).
+
+        Cheaper than :meth:`list_aim_history` for the once-per-second status line, which
+        only needs the count to label the current AIM ``/aim (N)``. Returns 0 when the AIM
+        predates history tracking (no rows yet) — callers treat a set-but-unrecorded AIM as 1.
+        """
+        return int(
+            self.conn.execute(
+                "SELECT COUNT(*) AS n FROM aim_history WHERE session_id = ?", (session_id,)
+            ).fetchone()["n"]
+        )
+
+    # ---- cross-session file locks --------------------------------------
+    def acquire_file_lock(
+        self, session_id: str, file_path: str, now: int, live_ids: set[str], ttl_ms: int
+    ) -> str | None:
+        """Try to acquire (or refresh) the lock on *file_path* for *session_id*.
+
+        Returns ``None`` when the caller now holds it — freshly taken, reclaimed from an
+        invalid holder, or already held by the caller (TTL refreshed). Otherwise returns the
+        **live** holder's session id (contention; the caller must queue/wait).
+
+        A held lock is honoured only when its holder is in *live_ids* AND fresh
+        (``now - refreshed_at < ttl_ms``); a stale or dead-holder row is reclaimed. The
+        check-then-write runs inside ``BEGIN IMMEDIATE`` so concurrent acquirers from other
+        processes serialise (one wins, the rest see contention) rather than both "winning".
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                "SELECT session_id, refreshed_at FROM file_locks WHERE file_path = ?",
+                (file_path,),
+            ).fetchone()
+            if row is not None and row["session_id"] != session_id:
+                holder = str(row["session_id"])
+                fresh = (now - int(row["refreshed_at"])) < ttl_ms
+                if holder in live_ids and fresh:
+                    self.conn.commit()
+                    return holder
+            # Free, mine, or reclaimable: upsert me as holder (keep acquired_at if already mine).
+            self.conn.execute(
+                "INSERT INTO file_locks (file_path, session_id, acquired_at, refreshed_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(file_path) DO UPDATE SET session_id = excluded.session_id, "
+                "refreshed_at = excluded.refreshed_at, acquired_at = CASE "
+                "WHEN file_locks.session_id = excluded.session_id "
+                "THEN file_locks.acquired_at ELSE excluded.acquired_at END",
+                (file_path, session_id, now, now),
+            )
+            self.conn.execute(
+                "DELETE FROM file_lock_waiters WHERE file_path = ? AND session_id = ?",
+                (file_path, session_id),
+            )
+            self.conn.commit()
+            return None
+        except sqlite3.Error:
+            self.conn.rollback()
+            raise
+
+    def release_file_lock(self, session_id: str, file_path: str) -> bool:
+        """Drop *session_id*'s lock on *file_path*; return whether a row was removed."""
+        cur = self.conn.execute(
+            "DELETE FROM file_locks WHERE file_path = ? AND session_id = ?",
+            (file_path, session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def release_all_file_locks(self, session_id: str) -> int:
+        """Drop every lock held by *session_id* and clear its own pending waits.
+
+        Waiters parked on the files it *held* are deliberately left in place so they can
+        re-acquire on their next attempt. Returns the number of locks released.
+        """
+        cur = self.conn.execute("DELETE FROM file_locks WHERE session_id = ?", (session_id,))
+        self.conn.execute("DELETE FROM file_lock_waiters WHERE session_id = ?", (session_id,))
+        self.conn.commit()
+        return cur.rowcount
+
+    def add_waiter(self, session_id: str, file_path: str, now: int) -> None:
+        """Record that *session_id* is waiting to edit *file_path* (idempotent)."""
+        self.conn.execute(
+            "INSERT INTO file_lock_waiters (file_path, session_id, since) VALUES (?, ?, ?) "
+            "ON CONFLICT(file_path, session_id) DO NOTHING",
+            (file_path, session_id, now),
+        )
+        self.conn.commit()
+
+    def waiters_on_my_locks(self, session_id: str) -> list[FileLockWaiter]:
+        """Sessions waiting on files *session_id* currently holds (drives the handoff nudge)."""
+        rows = self.conn.execute(
+            "SELECT w.file_path, w.session_id, w.since FROM file_lock_waiters w "
+            "JOIN file_locks l ON l.file_path = w.file_path "
+            "WHERE l.session_id = ? AND w.session_id != ? ORDER BY w.since",
+            (session_id, session_id),
+        ).fetchall()
+        return [FileLockWaiter(r["file_path"], str(r["session_id"]), int(r["since"])) for r in rows]
+
+    def list_file_locks(self, live_ids: set[str], ttl_ms: int, now: int) -> list[FileLock]:
+        """Every currently-valid lock (held by a live session, not past its TTL)."""
+        rows = self.conn.execute(
+            "SELECT file_path, session_id, acquired_at, refreshed_at FROM file_locks "
+            "ORDER BY refreshed_at"
+        ).fetchall()
+        return [
+            FileLock(
+                r["file_path"], str(r["session_id"]), int(r["acquired_at"]), int(r["refreshed_at"])
+            )
+            for r in rows
+            if str(r["session_id"]) in live_ids and (now - int(r["refreshed_at"])) < ttl_ms
+        ]
+
+    def set_subgoal_checked(self, subgoal_id: int, checked: bool) -> None:
+        self.conn.execute(
+            "UPDATE subgoals SET checked = ? WHERE id = ?", (int(checked), subgoal_id)
+        )
+        self.conn.commit()
+
+    def check_all_subgoals(self, session_id: str) -> int:
+        """Tick every still-unchecked sub-goal of a session; return how many flipped.
+
+        Used when a session is marked done: the human's done verdict is authoritative,
+        so the checklist is reconciled to 100% rather than left stranded mid-way. A
+        manual progress-bar override is cleared for the same reason — a done session
+        must never read e.g. 40%.
+        """
+        cur = self.conn.execute(
+            "UPDATE subgoals SET checked = 1 WHERE session_id = ? AND checked = 0",
+            (session_id,),
+        )
+        self.conn.execute(
+            "UPDATE sessions SET manual_progress = NULL WHERE session_id = ?", (session_id,)
+        )
+        self.conn.commit()
+        return cur.rowcount
+
+    def set_subgoal_check(self, subgoal_id: int, command: str | None) -> None:
+        """Attach (or clear, when ``None``/empty) a shell predicate to one sub-goal."""
+        self.conn.execute(
+            "UPDATE subgoals SET check_cmd = ? WHERE id = ?", (command or None, subgoal_id)
+        )
+        self.conn.commit()
+
+    def progress(self, session_id: str) -> tuple[int, int]:
+        """Return ``(checked, total)`` checklist counts for a session."""
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(checked), 0) AS done, COUNT(*) AS total "
+            "FROM subgoals WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return (int(row["done"]), int(row["total"]))
+
+    def progress_weighted(self, session_id: str) -> tuple[int, int]:
+        """Return weighted ``(done, total)`` = ``(SUM(checked*weight), SUM(weight))``.
+
+        Degenerates to :meth:`progress` when every item has the default weight 1.
+        """
+        row = self.conn.execute(
+            "SELECT COALESCE(SUM(checked * weight), 0) AS done, COALESCE(SUM(weight), 0) AS total "
+            "FROM subgoals WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return (int(row["done"]), int(row["total"]))

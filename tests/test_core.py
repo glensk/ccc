@@ -1,0 +1,679 @@
+"""Tests for core.build_rows (done-age filtering)."""
+
+from __future__ import annotations
+
+import time
+from pathlib import Path
+
+import pytest
+
+from command_center import usage
+from command_center.core import Row, build_rows
+from command_center.models import LiveSession, Status, now_ms
+from command_center.store import Store
+
+_DAY = 86_400_000
+
+# Generic repo-tree root for the category-grouping fixtures (no personal anchors).
+_BASE = "/repo-root"
+
+
+@pytest.fixture(autouse=True)
+def _repo_tree(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point category grouping at the generic ``_BASE`` tree via ``$GIT_BASE``."""
+    monkeypatch.setenv("GIT_BASE", _BASE)
+
+
+class _StubAdapter:
+    name = "claude"
+
+    def discover(self) -> list[LiveSession]:
+        return []
+
+    def last_activity_ms(self, live: LiveSession) -> int:
+        return 0
+
+    def is_oneshot_headless(self, cwd: str, session_id: str) -> bool:
+        return False
+
+    def is_halted(self, cwd: str, session_id: str) -> bool:
+        return False
+
+    def claude_version(self, cwd: str, session_id: str) -> str | None:
+        return None
+
+    def probe(self) -> bool:
+        return True
+
+
+class _BgAdapter(_StubAdapter):
+    """Reports one idle live session that has a running background task."""
+
+    def __init__(self, session_id: str, cwd: str) -> None:
+        self._live = LiveSession(
+            pid=4321, session_id=session_id, cwd=cwd, raw_status="idle", alive=True
+        )
+
+    def discover(self) -> list[LiveSession]:
+        return [self._live]
+
+    def has_background_task(self, pid: int) -> bool:
+        return True
+
+
+class _LiveAdapter(_StubAdapter):
+    def __init__(
+        self,
+        session_id: str,
+        cwd: str = "/repo",
+        *,
+        raw_status: str = "idle",
+        uses_codex: bool = False,
+        halted: bool = False,
+        background: bool = False,
+    ) -> None:
+        self._live = LiveSession(
+            pid=4321,
+            session_id=session_id,
+            cwd=cwd,
+            raw_status=raw_status,
+            alive=True,
+        )
+        self._uses_codex = uses_codex
+        self._halted = halted
+        self._background = background
+
+    def discover(self) -> list[LiveSession]:
+        return [self._live]
+
+    def is_halted(self, cwd: str, session_id: str) -> bool:
+        return self._halted
+
+    def has_background_task(self, pid: int) -> bool:
+        return self._background
+
+    def uses_codex_workflow(self, cwd: str, session_id: str) -> bool:
+        return self._uses_codex
+
+
+def _codex_usage(pct: float, reset_delta: int = 3600) -> usage.Usage:
+    now = int(time.time())
+    return usage.Usage(now, usage.Window(pct, now + reset_delta), None)
+
+
+def test_reconcile_marks_snoozed_when_background_task_live(tmp_path: Path) -> None:
+    from command_center.core import reconcile
+
+    store = Store(tmp_path / "s.db")
+    store.ensure("bg")
+    store.update_fields("bg", cwd="/x", status=Status.IDLE.value)
+    reconcile(store, _BgAdapter("bg", "/x"))
+    session = store.get("bg")
+    assert session is not None
+    assert session.status == Status.SNOOZED.value  # idle + live bg task → 💤
+    store.close()
+
+
+def test_build_rows_exposes_codex_workflow_from_job_type_and_adapter(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.db")
+    store.ensure("draft-launched", cwd="/repo")
+    store.update_fields("draft-launched", job_type="codex")
+    store.ensure("manual", cwd="/repo")
+    store.ensure("plain", cwd="/repo")
+
+    class _WorkflowAdapter(_StubAdapter):
+        def uses_codex_workflow(self, cwd: str, session_id: str) -> bool:
+            return session_id == "manual"
+
+    rows = {r.session.session_id: r for r in build_rows(store, _WorkflowAdapter())}
+    assert rows["draft-launched"].uses_codex_workflow is True
+    assert rows["manual"].uses_codex_workflow is True
+    assert rows["plain"].uses_codex_workflow is False
+    store.close()
+
+
+def test_reconcile_marks_waiting_codex_when_idle_workflow_and_usage_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.core import reconcile
+
+    monkeypatch.setattr(usage, "read_codex_usage", lambda: _codex_usage(100.0))
+    store = Store(tmp_path / "s.db")
+    store.ensure("codex", cwd="/repo")
+    reconcile(store, _LiveAdapter("codex", uses_codex=True))
+    session = store.get("codex")
+    assert session is not None
+    assert session.status == Status.WAITING_CODEX.value
+    store.close()
+
+
+def test_reconcile_waiting_codex_guards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from command_center.core import reconcile
+
+    def status_for(
+        sid: str,
+        *,
+        pct: float = 100.0,
+        uses_codex: bool = True,
+        raw_status: str = "idle",
+        halted: bool = False,
+        background: bool = False,
+    ) -> Status:
+        monkeypatch.setattr(usage, "read_codex_usage", lambda: _codex_usage(pct))
+        store = Store(tmp_path / f"{sid}.db")
+        store.ensure(sid, cwd="/repo")
+        reconcile(
+            store,
+            _LiveAdapter(
+                sid,
+                uses_codex=uses_codex,
+                raw_status=raw_status,
+                halted=halted,
+                background=background,
+            ),
+        )
+        got = store.get(sid)
+        store.close()
+        assert got is not None
+        return Status(got.status)
+
+    assert status_for("healthy", pct=20.0) is Status.IDLE
+    assert status_for("plain", uses_codex=False) is Status.IDLE
+    assert status_for("working", raw_status="busy") is Status.WORKING
+    assert status_for("waiting", raw_status="waiting") is Status.WAITING_INPUT
+    assert status_for("halted", halted=True) is Status.HALTED
+    assert status_for("bg", background=True) is Status.SNOOZED
+
+
+def test_done_age_filter(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.db")
+    store.ensure("recent")
+    store.update_fields("recent", done=True, status=Status.DONE.value, done_at=now_ms() - _DAY)
+    store.ensure("old")
+    store.update_fields("old", done=True, status=Status.DONE.value, done_at=now_ms() - 10 * _DAY)
+    store.ensure("active")
+    store.update_fields("active", status=Status.IDLE.value)
+
+    adapter = _StubAdapter()
+    all_ids = {r.session.session_id for r in build_rows(store, adapter, done_max_age_days=0)}
+    assert {"recent", "old", "active"} <= all_ids  # 0 = show every done session
+
+    recent_ids = {r.session.session_id for r in build_rows(store, adapter, done_max_age_days=3)}
+    assert "recent" in recent_ids
+    assert "active" in recent_ids
+    assert "old" not in recent_ids  # finished > 3 days ago is hidden
+    store.close()
+
+
+def test_done_open_session_stays_active_only_closed_is_finished(tmp_path: Path) -> None:
+    """A done session that is still open stays in the active list (not FINISHED) and is
+    never hidden by the finished filter; only a done session whose process is gone is
+    treated as finished."""
+    repo = f"{_BASE}/sdsc"
+    store = Store(tmp_path / "s.db")
+    store.ensure("done-open", cwd=f"{repo}/repo-x")
+    store.update_fields("done-open", done=True, status=Status.DONE.value, done_at=now_ms())
+    store.ensure("done-closed", cwd=f"{repo}/repo-y")
+    store.update_fields("done-closed", done=True, status=Status.DONE.value, done_at=now_ms())
+
+    class _OneLiveAdapter(_StubAdapter):
+        def discover(self) -> list[LiveSession]:
+            # done-open is still registered & alive; done-closed is not.
+            return [LiveSession(pid=1, session_id="done-open", cwd=f"{repo}/repo-x", alive=True)]
+
+    adapter = _OneLiveAdapter()
+    # Finished hidden (TUI default): the open done session survives, the closed one is gone.
+    hidden = {r.session.session_id: r for r in build_rows(store, adapter, include_done=False)}
+    assert "done-open" in hidden
+    assert hidden["done-open"].is_open is True
+    assert hidden["done-open"].is_finished is False  # stays in place, shown with a ✓
+    assert "done-closed" not in hidden  # only the closed one is filtered out
+
+    # Finished shown: the closed one returns and is the only one classified finished.
+    shown = {r.session.session_id: r for r in build_rows(store, adapter, include_done=True)}
+    assert shown["done-closed"].is_finished is True
+    assert shown["done-open"].is_finished is False
+    store.close()
+
+
+def test_reconcile_heals_done_session_stamped_parked(tmp_path: Path) -> None:
+    """A done session that a later close stamped PARKED is healed back to DONE by
+    reconcile, so it classifies as finished (sinks to the FINISHED section) instead
+    of lingering in the active list as a parked row."""
+    store = Store(tmp_path / "s.db")
+    store.ensure("done-parked")
+    store.update_fields("done-parked", done=True, status=Status.PARKED.value, done_at=now_ms())
+
+    rows = {r.session.session_id: r for r in build_rows(store, _StubAdapter())}
+    got = store.get("done-parked")
+    assert got is not None and got.status == Status.DONE.value  # healed by reconcile
+    assert rows["done-parked"].status is Status.DONE
+    assert rows["done-parked"].is_finished is True  # FINISHED bucket, not active
+    store.close()
+
+
+def test_reconcile_stamps_claude_version(tmp_path: Path) -> None:
+    """reconcile() records the live session's Claude Code version, but a read miss
+    (None) never clobbers a previously-stored value."""
+    from command_center.core import reconcile  # pylint: disable=import-outside-toplevel
+
+    store = Store(tmp_path / "s.db")
+
+    class _VersionAdapter(_StubAdapter):
+        def __init__(self, version: str | None) -> None:
+            self._version = version
+
+        def discover(self) -> list[LiveSession]:
+            return [LiveSession(pid=1, session_id="s1", cwd="/repo", alive=True)]
+
+        def claude_version(self, cwd: str, session_id: str) -> str | None:
+            return self._version
+
+    reconcile(store, _VersionAdapter("2.1.193"))
+    assert store.get("s1").version == "2.1.193"  # type: ignore[union-attr]
+
+    # A later pass that fails to read the version must keep the stored one.
+    reconcile(store, _VersionAdapter(None))
+    assert store.get("s1").version == "2.1.193"  # type: ignore[union-attr]
+    store.close()
+
+
+class _ModelEffortAdapter(_StubAdapter):
+    """One live idle session that reports an OBSERVED model + an optional --effort flag."""
+
+    def __init__(
+        self, sid: str, cwd: str = "/repo", *, model: str | None = None, effort: str | None = None
+    ) -> None:
+        self._live = LiveSession(pid=4321, session_id=sid, cwd=cwd, raw_status="idle", alive=True)
+        self._model = model
+        self._effort = effort
+
+    def discover(self) -> list[LiveSession]:
+        return [self._live]
+
+    def observed_model(self, cwd: str, session_id: str) -> str | None:
+        return self._model
+
+    def session_effort(self, pid: int) -> str | None:
+        return self._effort
+
+
+def test_reconcile_persists_observed_model_and_effort(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.core import reconcile
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("CLAUDE_HOME", str(home))
+
+    # (a) an explicit --effort flag is authoritative; the model is reverse-mapped to its
+    # ccc choice label.
+    store = Store(tmp_path / "a.db")
+    store.ensure("a", cwd="/repo")
+    reconcile(store, _ModelEffortAdapter("a", model="claude-fable-5", effort="xhigh"))
+    got = store.get("a")
+    assert got is not None and got.model == "fable-5" and got.effort == "xhigh"
+    store.close()
+
+    # (b) no flag + a settings.json effortLevel → fill the empty effort ONCE from that default.
+    (home / "settings.json").write_text('{"effortLevel": "high"}', encoding="utf-8")
+    store = Store(tmp_path / "b.db")
+    store.ensure("b", cwd="/repo")
+    reconcile(store, _ModelEffortAdapter("b", model="claude-opus-4-8", effort=None))
+    got = store.get("b")
+    assert got is not None and got.model == "opus-4.8" and got.effort == "high"
+    store.close()
+
+    # (c) no flag but effort already set → the settings default must NOT backfill a stored value.
+    store = Store(tmp_path / "c.db")
+    store.ensure("c", cwd="/repo")
+    store.update_fields("c", effort="low")
+    reconcile(store, _ModelEffortAdapter("c", model="claude-fable-5", effort=None))
+    got = store.get("c")
+    assert got is not None and got.effort == "low"  # preserved, never overwritten
+    store.close()
+
+
+def test_reconcile_persists_observed_model_for_parked_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parked (non-live) session's model still updates from its transcript; effort is not
+    touched, and an unchanged pass writes nothing (byte-stable)."""
+    from command_center.core import reconcile
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+
+    class _ParkedModelAdapter(_StubAdapter):
+        # No live sessions (discover → []); reports an observed model for the parked row.
+        def observed_model(self, cwd: str, session_id: str) -> str | None:
+            return "claude-fable-5"
+
+    store = Store(tmp_path / "s.db")
+    store.ensure("p", cwd="/repo")
+    store.update_fields("p", status=Status.PARKED.value)
+    reconcile(store, _ParkedModelAdapter())
+    got = store.get("p")
+    assert got is not None and got.model == "fable-5"  # captured from the transcript
+    assert got.effort == ""  # never captured for a non-live session
+
+    # A second, unchanged pass must not write (model already stored, status already parked).
+    calls: list[str] = []
+    orig = store.update_fields
+
+    def _spy(session_id: str, **fields: object) -> None:
+        calls.append(session_id)
+        orig(session_id, **fields)
+
+    monkeypatch.setattr(store, "update_fields", _spy)
+    reconcile(store, _ParkedModelAdapter())
+    assert calls == []  # byte-stable: nothing changed → no store write
+    store.close()
+
+
+def test_category_rank() -> None:
+    from command_center.core import _category_rank  # pylint: disable=import-outside-toplevel
+
+    order = ("home", "infra", "llms", "sdsc")
+    base = _BASE
+    assert _category_rank(f"{base}/home/repo", order, base) == 0
+    assert _category_rank(f"{base}/infra/repo", order, base) == 1
+    assert _category_rank(f"{base}/sdsc/repo/sub", order, base) == 3
+    assert _category_rank(f"{base}/unknowncat/repo", order, base) == 4  # unknown category → last
+    assert _category_rank("/tmp/elsewhere", order, base) == 4  # outside the tree → last
+    assert _category_rank("", order, base) == 4
+    assert _category_rank(f"{base}/home/repo", order, "") == 4  # no configured tree → last
+
+
+def _park_with_progress(store: Store, sid: str, cwd: str, done: int, total: int) -> None:
+    store.ensure(sid, cwd=cwd)
+    store.update_fields(sid, status=Status.PARKED.value)
+    if total:
+        store.set_subgoals(sid, [f"g{i}" for i in range(total)])
+        for sub in store.list_subgoals(sid)[:done]:
+            store.set_subgoal_checked(sub.id, True)
+
+
+def test_parked_sort_by_folder_then_progress(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    _park_with_progress(store, "home-lo", f"{base}/home/p", 1, 4)  # home, 25%
+    _park_with_progress(store, "home-hi", f"{base}/home/q", 3, 4)  # home, 75%
+    _park_with_progress(store, "infra-mid", f"{base}/infra/r", 1, 2)  # infra, 50%
+    _park_with_progress(store, "sdsc-full", f"{base}/sdsc/s", 2, 2)  # sdsc, 100%
+    _park_with_progress(store, "outside", "/tmp/elsewhere", 5, 5)  # not under the tree → last
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    # home first; within home most-progress first; infra and sdsc next; outside-tree last.
+    assert order == ["home-hi", "home-lo", "infra-mid", "sdsc-full", "outside"]
+    store.close()
+
+
+def test_category_is_primary_aim_only_breaks_ties_within_it(tmp_path: Path) -> None:
+    # Category is the PRIMARY key: a no-aim session in an earlier repo category
+    # outranks an aim-defined session in a later one. AIM-first applies only WITHIN
+    # a category, so a category never splits across an AIM / no-AIM divide.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("sdsc-aim", cwd=f"{base}/sdsc/s")  # last category, but HAS an aim
+    store.update_fields("sdsc-aim", status=Status.PARKED.value, aim="ship it")
+    store.ensure("infra-noaim", cwd=f"{base}/infra/r")  # first category, NO aim
+    store.update_fields("infra-noaim", status=Status.PARKED.value)
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    assert order == ["infra-noaim", "sdsc-aim"]  # earlier category wins over aim
+    store.close()
+
+
+def test_category_stays_contiguous_aim_first_within(tmp_path: Path) -> None:
+    # Each category is one contiguous block (infra then sdsc), and within a block
+    # the aim-defined session sorts first — so neither category appears twice.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("sdsc-aim", cwd=f"{base}/sdsc/s")
+    store.update_fields("sdsc-aim", status=Status.PARKED.value, aim="a")
+    store.ensure("infra-aim", cwd=f"{base}/infra/r")
+    store.update_fields("infra-aim", status=Status.PARKED.value, aim="b")
+    store.ensure("sdsc-noaim", cwd=f"{base}/sdsc/t")
+    store.update_fields("sdsc-noaim", status=Status.PARKED.value)
+    store.ensure("infra-noaim", cwd=f"{base}/infra/u")
+    store.update_fields("infra-noaim", status=Status.PARKED.value)
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    # infra block (aim-first), then sdsc block (aim-first) — categories never split.
+    assert order == ["infra-aim", "infra-noaim", "sdsc-aim", "sdsc-noaim"]
+    store.close()
+
+
+def test_finished_sinks_to_bottom(tmp_path: Path) -> None:
+    # A DONE session lands last even though it has an aim and a top-category folder.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("done-infra", cwd=f"{base}/infra/r")
+    store.update_fields("done-infra", status=Status.DONE.value, done=True, aim="x")
+    store.ensure("active-noaim", cwd=f"{base}/sdsc/s")
+    store.update_fields("active-noaim", status=Status.PARKED.value)
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    assert order == ["active-noaim", "done-infra"]  # FINISHED bucket is always last
+    store.close()
+
+
+def test_draft_jobs_bucket_between_active_and_finished(tmp_path: Path) -> None:
+    # A future job (draft) sorts below active sessions and above FINISHED ones, and
+    # is never flipped to PARKED by reconcile (it owns its own status until launched).
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("active", cwd=f"{base}/infra/r")
+    store.update_fields("active", status=Status.PARKED.value)
+    store.ensure("done", cwd=f"{base}/infra/r")
+    store.update_fields("done", status=Status.DONE.value, done=True)
+    store.create_draft("future", f"{base}/sdsc/zoho", "Migrate Zendesk tickets to Zoho")
+
+    rows = {r.session.session_id: r for r in build_rows(store, _StubAdapter())}
+    assert rows["future"].is_draft is True
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    assert order == ["active", "future", "done"]  # active → FUTURE → FINISHED
+    # reconcile must not have parked the draft (it has no live process).
+    assert store.get("future").draft is True  # type: ignore[union-attr]
+    store.close()
+
+
+def test_build_rows_dedupes_session_id(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defensive guard: even if the store ever yielded the same id twice, build_rows
+    must emit it once — no session id shown twice."""
+    store = Store(tmp_path / "s.db")
+    store.ensure("dup")
+    store.update_fields("dup", status=Status.PARKED.value)
+    dup = store.get("dup")
+    monkeypatch.setattr(store, "list_sessions", lambda include_archived=False: [dup, dup])
+
+    rows = build_rows(store, _StubAdapter())
+    assert [r.session.session_id for r in rows] == ["dup"]
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# dependency hoisting (deps.py + core._hoist_dependents)
+# ---------------------------------------------------------------------------
+def _rows_by_id(store: Store) -> dict[str, Row]:
+    return {r.session.session_id: r for r in build_rows(store, _StubAdapter())}
+
+
+def test_hoist_active_parent_draft_child(tmp_path: Path) -> None:
+    # A draft child depending on an UNMET (parked) parent hoists directly under it.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", status=Status.PARKED.value, aim="build parent")
+    store.create_draft("child", f"{base}/infra/r", "needs parent", depends_on="parent")
+
+    rows = build_rows(store, _StubAdapter())
+    order = [r.session.session_id for r in rows]
+    assert order.index("child") == order.index("parent") + 1  # directly under the parent
+    by_id = {r.session.session_id: r for r in rows}
+    assert by_id["child"].dep_depth == 1
+    assert by_id["child"].dep_state == "unmet"
+    assert by_id["parent"].dep_depth == 0
+    store.close()
+
+
+def test_hoist_chain_nests_recursively(tmp_path: Path) -> None:
+    # C (active) ← B (draft, depends C) ← A (draft, depends B): nested depths 0/1/2.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("c", cwd=f"{base}/infra/r")
+    store.update_fields("c", status=Status.PARKED.value, aim="root job")
+    store.create_draft("b", f"{base}/infra/r", "middle", depends_on="c")
+    store.create_draft("a", f"{base}/infra/r", "leaf", depends_on="b")
+
+    rows = build_rows(store, _StubAdapter())
+    order = [r.session.session_id for r in rows]
+    assert order == ["c", "b", "a"]
+    by_id = {r.session.session_id: r for r in rows}
+    assert (by_id["c"].dep_depth, by_id["b"].dep_depth, by_id["a"].dep_depth) == (0, 1, 2)
+    store.close()
+
+
+def test_hoist_children_keep_relative_order(tmp_path: Path) -> None:
+    # Two draft children of one parent keep their sort order (newest-created first) under it.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", status=Status.PARKED.value, aim="parent")
+    store.create_draft("older", f"{base}/infra/r", "older child", depends_on="parent")
+    store.update_fields("older", created_at=1000)
+    store.create_draft("newer", f"{base}/infra/r", "newer child", depends_on="parent")
+    store.update_fields("newer", created_at=2000)
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    assert order == ["parent", "newer", "older"]  # future bucket sorts newest-first
+    store.close()
+
+
+def test_two_cycle_degrades_to_permutation(tmp_path: Path) -> None:
+    # a↔b mutual dependency: neither hoists (cycle), output is a permutation, both marked.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.create_draft("a", f"{base}/infra/r", "job a")
+    store.create_draft("b", f"{base}/infra/r", "job b")
+    store.update_fields("a", depends_on="b")
+    store.update_fields("b", depends_on="a")
+
+    rows = build_rows(store, _StubAdapter())
+    order = [r.session.session_id for r in rows]
+    assert sorted(order) == ["a", "b"]  # permutation: every row exactly once
+    by_id = {r.session.session_id: r for r in rows}
+    assert by_id["a"].dep_depth == 0 and by_id["b"].dep_depth == 0  # not hoisted
+    assert by_id["a"].dep_state == "unmet" and by_id["b"].dep_state == "unmet"
+    store.close()
+
+
+def test_self_dependency_degrades(tmp_path: Path) -> None:
+    # A job depending on itself: no hoist, still marked, present exactly once.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.create_draft("a", f"{base}/infra/r", "job a")
+    store.update_fields("a", depends_on="a")
+
+    rows = build_rows(store, _StubAdapter())
+    assert [r.session.session_id for r in rows] == ["a"]
+    assert rows[0].dep_depth == 0 and rows[0].dep_state == "unmet"
+    store.close()
+
+
+def test_parent_done_no_hoist_state_satisfied(tmp_path: Path) -> None:
+    # A satisfied (done) parent: child is not hoisted and its marker state is satisfied.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", status=Status.DONE.value, done=True, aim="done")
+    store.create_draft("child", f"{base}/infra/r", "needs parent", depends_on="parent")
+
+    by_id = _rows_by_id(store)
+    assert "child" in by_id
+    child = by_id["child"]
+    assert child.dep_depth == 0  # not hoisted (parent satisfied)
+    assert child.dep_state == "satisfied"
+    store.close()
+
+
+def test_parent_cancelled_marker_no_hoist(tmp_path: Path) -> None:
+    # An archived (cancelled) parent isn't visible; child shows the cancelled marker, no hoist.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", archived=True)
+    store.create_draft("child", f"{base}/infra/r", "needs parent", depends_on="parent")
+
+    by_id = _rows_by_id(store)
+    child = by_id["child"]
+    assert child.dep_depth == 0
+    assert child.dep_state == "cancelled"
+    store.close()
+
+
+def test_parent_missing_marker_no_hoist(tmp_path: Path) -> None:
+    # A dangling dependency (no such row) → missing marker, no hoist.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.create_draft("child", f"{base}/infra/r", "needs ghost", depends_on="ghost-uuid")
+
+    by_id = _rows_by_id(store)
+    child = by_id["child"]
+    assert child.dep_depth == 0
+    assert child.dep_state == "missing"
+    store.close()
+
+
+def test_done_child_never_hoists(tmp_path: Path) -> None:
+    # A DONE child no longer waits on anything: even with an unmet parent it stays in its
+    # own (FINISHED) position — dep_state is still computed for the detail/ls notes.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", status=Status.PARKED.value, aim="parent")
+    store.ensure("child", cwd=f"{base}/infra/r")
+    store.update_fields(
+        "child", status=Status.DONE.value, done=True, aim="was waiting", depends_on="parent"
+    )
+
+    rows = build_rows(store, _StubAdapter())
+    order = [r.session.session_id for r in rows]
+    assert order == ["parent", "child"]  # child sank to FINISHED, not glued to the parent
+    by_id = {r.session.session_id: r for r in rows}
+    assert by_id["child"].dep_depth == 0
+    assert by_id["child"].dep_state == "unmet"  # state still reported, marker/hoist gated off
+    store.close()
+
+
+def test_include_future_false_hides_hoisted_draft(tmp_path: Path) -> None:
+    # With future jobs hidden, a hoisted draft child is excluded entirely.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("parent", cwd=f"{base}/infra/r")
+    store.update_fields("parent", status=Status.PARKED.value, aim="parent")
+    store.create_draft("child", f"{base}/infra/r", "needs parent", depends_on="parent")
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter(), include_future=False)]
+    assert order == ["parent"]  # the draft child is hidden
+    store.close()
+
+
+def test_scheduled_drafts_sink_below_finished_soonest_first(tmp_path: Path) -> None:
+    # A draft with a FIXED start_date leaves the FUTURE bucket and sinks to the very
+    # bottom (below FINISHED), ordered soonest-date-first; undated drafts stay in FUTURE.
+    store = Store(tmp_path / "s.db")
+    base = _BASE
+    store.ensure("active", cwd=f"{base}/infra/r")
+    store.update_fields("active", status=Status.PARKED.value)
+    store.ensure("done", cwd=f"{base}/infra/r")
+    store.update_fields("done", status=Status.DONE.value, done=True)
+    store.create_draft("future", f"{base}/sdsc/zoho", "Migrate Zendesk tickets to Zoho")
+    store.create_draft("sched-late", f"{base}/home/a", "Revert mac", start_date="2036-09-01")
+    store.create_draft("sched-soon", f"{base}/home/b", "FileVault", start_date="2036-08-11")
+
+    order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
+    assert order == ["active", "future", "done", "sched-soon", "sched-late"]
+    store.close()
