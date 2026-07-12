@@ -685,16 +685,19 @@ class DependencyPickerScreen(ModalScreen[str | None]):
 class EditForm(Vertical):
     """Inline editor mounted in the job details pane — no boxes, no layout change.
 
-    Renders the SAME field lines as the read-only ``#detail-fields-view`` so pressing
-    ``e`` does not reflow the pane: the editable lines are borderless, transparent
-    inputs you type into directly, navigated with ``↑/↓`` or ``Tab`` (the focused line
-    is tinted — that tint IS the cursor). The first AIM and the importance line are
-    read-only ``Static`` lines the focus cursor skips. AIM / prompt / sub-goals are
-    borderless, grow-to-fit ``TextArea`` s (multi-line, no border). Two edit-only rows
-    have no read-only twin (their values render elsewhere outside edit mode):
-    ``progress %`` (a manual bar override, blank = auto from sub-goals; shows in the
-    head bar) and ``sub-goals`` (one item per line — add/delete lines, ticks carry
-    over by text; the checklist itself sits at the pane bottom).
+    The editable lines are borderless, transparent inputs you type into directly,
+    navigated with ``↑/↓`` or ``Tab`` (the focused line is tinted — that tint IS the
+    cursor). The draft-only rows (``/overseer`` ``/executor`` ``/account``
+    ``Scheduled for``) come FIRST, mirroring the read-only head where the models sit
+    on the ``Status:`` line and the scheduled date right under it — while editing,
+    the head drops those readouts so every option renders exactly once. The first
+    AIM and the importance line are read-only ``Static`` lines the focus cursor
+    skips. AIM / prompt / sub-goals are borderless, grow-to-fit ``TextArea`` s
+    (multi-line, no border). Two edit-only rows have no read-only twin (their values
+    render elsewhere outside edit mode): ``progress %`` (a manual bar override,
+    blank = auto from sub-goals; shows in the head bar) and ``sub-goals`` (one item
+    per line — add/delete lines, ticks carry over by text; the checklist itself sits
+    at the pane bottom).
     """
 
     BINDINGS = [
@@ -705,20 +708,10 @@ class EditForm(Vertical):
 
     def compose(self) -> ComposeResult:
         """Compose borderless, in-place field lines that mirror the read-only view."""
-        yield Static("", id="edit-aim1")  # read-only first AIM (shown only when ≥2 revisions)
-        with Horizontal(classes="fieldrow"):
-            yield Label("/aim: ", id="edit-aim-label", classes="fieldlabel")
-            yield TextArea("", id="edit-aim", tab_behavior="focus", soft_wrap=True)
-        with Horizontal(classes="fieldrow"):
-            yield Label("/next-step: ", classes="fieldlabel")
-            yield Input(id="edit-next", suggester=TagSuggester())
-        with Horizontal(classes="fieldrow"):
-            yield Label("/deadline: ", classes="fieldlabel")
-            yield Input(id="edit-deadline")
-        with Horizontal(classes="fieldrow"):
-            yield Label("progress %: ", classes="fieldlabel")
-            yield Input(id="edit-progress", placeholder="auto (from sub-goals)")
-        # Draft-only model pair (shown/hidden like the prompt & folder rows below).
+        # Draft-only rows FIRST (shown/hidden like the prompt & folder rows below), in
+        # the read-only head's own order — the models/account sit on the Status: line
+        # and Scheduled-for right under it, so their edit rows are reachable at the
+        # very top of the form rather than buried below the AIM.
         # Clickable dropdowns: pick from LLM_CHOICES with the mouse or arrow keys — invalid
         # input is impossible, and the Selects stay in the Tab/↑↓ focus chain.
         model_opts = [(choice, choice) for choice in LLM_CHOICES]
@@ -738,6 +731,23 @@ class EditForm(Vertical):
             yield Select(
                 account_opts, value=account_opts[0][0], allow_blank=False, id="edit-account"
             )
+        # Draft-only fixed start date (the SCHEDULED bucket / the head's blue line).
+        with Horizontal(id="edit-scheduled-row", classes="fieldrow"):
+            yield Label("Scheduled for: ", classes="fieldlabel")
+            yield Input(id="edit-scheduled", placeholder="YYYY-MM-DD — sinks to SCHEDULED")
+        yield Static("", id="edit-aim1")  # read-only first AIM (shown only when ≥2 revisions)
+        with Horizontal(classes="fieldrow"):
+            yield Label("/aim: ", id="edit-aim-label", classes="fieldlabel")
+            yield TextArea("", id="edit-aim", tab_behavior="focus", soft_wrap=True)
+        with Horizontal(classes="fieldrow"):
+            yield Label("/next-step: ", classes="fieldlabel")
+            yield Input(id="edit-next", suggester=TagSuggester())
+        with Horizontal(classes="fieldrow"):
+            yield Label("/deadline: ", classes="fieldlabel")
+            yield Input(id="edit-deadline")
+        with Horizontal(classes="fieldrow"):
+            yield Label("progress %: ", classes="fieldlabel")
+            yield Input(id="edit-progress", placeholder="auto (from sub-goals)")
         with Horizontal(classes="fieldrow"):
             yield Label("/block: ", classes="fieldlabel")
             yield Input(id="edit-block", suggester=TagSuggester())
@@ -2351,6 +2361,88 @@ class CommandCenterApp(App[None]):
             pass
         jumpstate.clear_request()
 
+    def _head_text(
+        self, session: Session, status: Status, checked: int, total_subs: int, *, editing: bool
+    ) -> Text:
+        """The detail pane's head block (the ``Status:`` line and its context lines).
+
+        With ``editing=True`` the head is compacted to what the inline editor does NOT
+        already show as an editable row — the models/account readout, the Scheduled-for
+        line, the ``Prompt to run`` body and the launch hint all drop out so every
+        option renders exactly once in the pane while editing.
+        """
+        # --- line 1: Status + age, with the progress bar trailing on the same line ---
+        text = Text()
+        text.append("Status: ", style="bold")
+        text.append(f"{status.value}", style=_STATUS_STYLE.get(status, "white"))
+        text.append(f"   {humanize_age(session.last_response_at)} ago", style="grey62")
+        if status is Status.PARKED:
+            # WHEN the session was closed, absolute + relative. A row parked before
+            # closed_at existed has no stamp — approximate with last activity (~).
+            closed = session.closed_at or session.last_response_at
+            approx = "" if session.closed_at else "~"
+            text.append(
+                f"   closed {approx}{iso_datetime(closed) or '—'} ({humanize_age(closed)} ago)",
+                style="grey62",
+            )
+        if session.draft and not editing:
+            # A draft's model pair + billing account live on the Status line (their
+            # editable twins are the top rows of the `e` form).
+            over = session.llm_overseer or ""
+            ex = session.llm_exec or ""
+            text.append("   /overseer: ", style="bold")
+            text.append(over or "—", style=_LLM_STYLE.get(over, "white"))
+            text.append("  /executor: ", style="bold")
+            text.append(ex or "—", style=_LLM_STYLE.get(ex, "white"))
+            if len(config.claude_config_dirs()) > 1:
+                text.append("  /account: ", style="bold")
+                text.append(accounts.account_label(session.config_dir or ""), style="white")
+        # Manual override (set via `e` or Enter on the progress column) wins over the
+        # sub-goal ratio and is labelled so its origin is never ambiguous.
+        head_frac = effective_progress(session.manual_progress, checked, total_subs)
+        if head_frac is not None:
+            count = (
+                f"{int(round(head_frac * 100))}% (manual)"
+                if session.manual_progress is not None
+                else f"{checked}/{total_subs}"
+            )
+            text.append(f"   {progress_bar(head_frac, 12)} {count}", "cyan")
+        text.append("\n")
+        if session.draft and not editing:
+            # The date the job is supposed to run (the SCHEDULED column's date), right
+            # under Status: — same compact D.M.YY form and blue as the table rows. An
+            # unscheduled draft shows a grey — so the field is discoverable (set it via e).
+            text.append("Scheduled for: ", style=f"bold {_DRAFT_BLUE}")
+            if (when := scheduled_date(session)) is not None:
+                text.append(short_date_label(when), style=_DRAFT_BLUE)
+                if (early := days_until_start(session)) is not None:
+                    text.append(f"  (in {early}d — launching earlier asks first)", style="grey62")
+            else:
+                text.append("—  (none — set it via e)", style="grey62")
+            text.append("\n")
+        if session.aim_met and not session.done and not session.draft:
+            # The impartial per-turn checker judged the AIM fulfilled (the red DONE in the bar).
+            text.append("model self-assessment: ", style="bold")
+            text.append("DONE", style="bold red")
+            text.append(
+                f" — {session.aim_met_reason or 'the AIM looks fulfilled'}\n", style="grey62"
+            )
+        row = self._rows.get(session.session_id)
+        if status is Status.WAITING_CODEX and row and row.codex_reset_hint:
+            text.append(row.codex_reset_hint + "\n", style=_STATUS_STYLE[Status.WAITING_CODEX])
+        if session.done and session.done_at:
+            text.append(f"Done: {iso_date(session.done_at)}\n", style="green3")
+        if session.draft:
+            text.append("\n✎ FUTURE JOB — not started yet\n", style=f"bold {_DRAFT_BLUE}")
+            if session.start_when:
+                text.append("Intend to start: ", style="bold")
+                text.append(f"{session.start_when}\n", style=_DRAFT_BLUE)
+            if not editing:  # the form's `prompt:` TextArea shows (and edits) it instead
+                text.append("Prompt to run: ", style="bold")
+                text.append(f"{session.prompt or session.aim or '—'}\n", style="grey70")
+                text.append("Press r (resume) or Enter to launch it in its repo.\n", style="grey50")
+        return text
+
     def update_detail(self) -> None:
         if getattr(self, "_editing", False):
             return
@@ -2372,73 +2464,7 @@ class CommandCenterApp(App[None]):
         status = Status(session.status)
         subs = self.store.list_subgoals(self._current)
         checked = sum(1 for s in subs if s.checked)
-
-        # --- head (line 1): Status + age, with the progress bar trailing on the same line ---
-        text = Text()
-        text.append("Status: ", style="bold")
-        text.append(f"{status.value}", style=_STATUS_STYLE.get(status, "white"))
-        text.append(f"   {humanize_age(session.last_response_at)} ago", style="grey62")
-        if status is Status.PARKED:
-            # WHEN the session was closed, absolute + relative. A row parked before
-            # closed_at existed has no stamp — approximate with last activity (~).
-            closed = session.closed_at or session.last_response_at
-            approx = "" if session.closed_at else "~"
-            text.append(
-                f"   closed {approx}{iso_datetime(closed) or '—'} ({humanize_age(closed)} ago)",
-                style="grey62",
-            )
-        if session.draft:
-            # A draft's model pair + billing account live on the Status line (they used
-            # to be /overseer /executor /account rows in the fields block below).
-            over = session.llm_overseer or ""
-            ex = session.llm_exec or ""
-            text.append("   /overseer: ", style="bold")
-            text.append(over or "—", style=_LLM_STYLE.get(over, "white"))
-            text.append("  /executor: ", style="bold")
-            text.append(ex or "—", style=_LLM_STYLE.get(ex, "white"))
-            if len(config.claude_config_dirs()) > 1:
-                text.append("  /account: ", style="bold")
-                text.append(accounts.account_label(session.config_dir or ""), style="white")
-        # Manual override (set via `e` or Enter on the progress column) wins over the
-        # sub-goal ratio and is labelled so its origin is never ambiguous.
-        head_frac = effective_progress(session.manual_progress, checked, len(subs))
-        if head_frac is not None:
-            count = (
-                f"{int(round(head_frac * 100))}% (manual)"
-                if session.manual_progress is not None
-                else f"{checked}/{len(subs)}"
-            )
-            text.append(f"   {progress_bar(head_frac, 12)} {count}", "cyan")
-        text.append("\n")
-        if (when := scheduled_date(session)) is not None:
-            # The date the job is supposed to run (the SCHEDULED column's date), right
-            # under Status: — same compact D.M.YY form and blue as the table rows.
-            text.append("Scheduled for: ", style=f"bold {_DRAFT_BLUE}")
-            text.append(short_date_label(when), style=_DRAFT_BLUE)
-            if (early := days_until_start(session)) is not None:
-                text.append(f"  (in {early}d — launching earlier asks first)", style="grey62")
-            text.append("\n")
-        if session.aim_met and not session.done and not session.draft:
-            # The impartial per-turn checker judged the AIM fulfilled (the red DONE in the bar).
-            text.append("model self-assessment: ", style="bold")
-            text.append("DONE", style="bold red")
-            text.append(
-                f" — {session.aim_met_reason or 'the AIM looks fulfilled'}\n", style="grey62"
-            )
-        row = self._rows.get(self._current)
-        if status is Status.WAITING_CODEX and row and row.codex_reset_hint:
-            text.append(row.codex_reset_hint + "\n", style=_STATUS_STYLE[Status.WAITING_CODEX])
-        if session.done and session.done_at:
-            text.append(f"Done: {iso_date(session.done_at)}\n", style="green3")
-        if session.draft:
-            text.append("\n✎ FUTURE JOB — not started yet\n", style=f"bold {_DRAFT_BLUE}")
-            if session.start_when:
-                text.append("Intend to start: ", style="bold")
-                text.append(f"{session.start_when}\n", style=_DRAFT_BLUE)
-            text.append("Prompt to run: ", style="bold")
-            text.append(f"{session.prompt or session.aim or '—'}\n", style="grey70")
-            text.append("Press r (resume) or Enter to launch it in its repo.\n", style="grey50")
-        head.update(text)
+        head.update(self._head_text(session, status, checked, len(subs), editing=False))
 
         # --- fields (editable lines): aim(1), aim(N), next-step, deadline, block, important.
         # Their own static so edit mode can swap just them for the inline editor in place. ---
@@ -3489,6 +3515,7 @@ class CommandCenterApp(App[None]):
             "overseer": overseer,
             "executor": executor,
             "account": account,
+            "scheduled": session.start_date or "",
             "depends": session.depends_on or "",
             "subgoals": "\n".join(s.text for s in store.list_subgoals(sid)),
         }
@@ -3520,6 +3547,7 @@ class CommandCenterApp(App[None]):
         self.query_one("#edit-overseer", Select).value = self._edit_original["overseer"]
         self.query_one("#edit-executor", Select).value = self._edit_original["executor"]
         self.query_one("#edit-account", Select).value = self._edit_original["account"]
+        self.query_one("#edit-scheduled", Input).value = self._edit_original["scheduled"]
         self.query_one("#edit-subgoals", TextArea).text = self._edit_original["subgoals"]
         marks = importance_marks(session.importance) or "—"
         self.query_one("#edit-important", Static).update(f"! important: {marks}")
@@ -3541,12 +3569,24 @@ class CommandCenterApp(App[None]):
         self.query_one("#edit-account-row", Horizontal).styles.display = (
             "block" if session.draft and len(config.claude_config_dirs()) > 1 else "none"
         )
+        # Fixed start date (draft-only, like the model rows above it).
+        self.query_one("#edit-scheduled-row", Horizontal).styles.display = (
+            "block" if session.draft else "none"
+        )
 
         # Swap ONLY the read-only field lines for the inline editor (same lines, now
         # editable); the Status/progress above and the sub-goal checklist below stay put.
         self.query_one("#detail-fields-view").styles.display = "none"
         self.query_one("#detail-edit").styles.display = "block"
         self._editing = True
+        # Compact the head while editing: the models/account readout, the Scheduled-for
+        # line and the Prompt-to-run body all have editable rows in the form now — the
+        # head keeps only what the form doesn't show, so each option renders once.
+        subs = store.list_subgoals(sid)
+        checked = sum(1 for s in subs if s.checked)
+        self.query_one("#detail-head", DetailHead).update(
+            self._head_text(session, Status(session.status), checked, len(subs), editing=True)
+        )
         # Confine the Tab cycle to the detail pane: the read-only Status head joins it
         # (a focusable stop) while the table and the scroll container drop out, so
         # Tab wraps head → fields → head instead of escaping into the session list.
@@ -3677,6 +3717,18 @@ class CommandCenterApp(App[None]):
                 account_dir = accounts.account_config_dir(account)
                 if account_dir:
                     store.update_fields(sid, config_dir=account_dir)
+            # Fixed start date: an ISO date sinks the job into SCHEDULED, blank clears
+            # it back to plain FUTURE; anything unparseable is rejected, not saved.
+            scheduled = self.query_one("#edit-scheduled", Input).value.strip()
+            if scheduled != original.get("scheduled", ""):
+                if scheduled and parse_iso_date(scheduled) is None:
+                    self.notify(
+                        f"Invalid scheduled date {scheduled!r} — expected YYYY-MM-DD "
+                        "(kept unchanged).",
+                        severity="warning",
+                    )
+                else:
+                    store.update_fields(sid, start_date=scheduled or None)
         # Dependency (every session): commit the picker's pending value if it changed.
         # Belt-and-suspenders re-check the cycle guard (the picker already pre-filters).
         pending = self._edit_depends_pending

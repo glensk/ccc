@@ -2103,39 +2103,123 @@ def test_edit_mode_focuses_visibly_and_status_head_is_a_tab_stop(
             await pilot.pause()
             await pilot.press("e")
             await pilot.pause()
-            # Focus lands on the AIM field AND the pane scrolled it into view (the
-            # long read-only prompt in the head pushes it below the fold otherwise).
+            # Focus lands on the AIM field AND it is actually visible in the pane
+            # (the compact edit head keeps the form near the top now; before the fix
+            # the tinted field could sit below the fold with no scroll at all).
             focused = app.focused
             assert isinstance(focused, TextArea) and focused.id == "edit-aim"
             wrap = app.query_one("#detail-wrap", VerticalScroll)
-            assert wrap.scroll_y > 0
+            assert focused.region.height >= 1
+            assert wrap.region.contains_region(focused.region)
             # Table + scroll container left the Tab cycle; the head joined it.
             assert table.can_focus is False
             assert wrap.can_focus is False
             head = app.query_one("#detail-head", DetailHead)
             assert head.can_focus is True
 
-            # Shift+Tab from the first field wraps back onto the Status head, which
+            # Shift+Tab walks back through the draft rows that now sit on top of the
+            # form (scheduled → executor → overseer) onto the Status head, which
             # scrolls home so the top of the pane is visible.
-            await pilot.press("shift+tab")
-            await pilot.pause()
-            assert app.focused is head
+            back_order = []
+            for _ in range(6):
+                await pilot.press("shift+tab")
+                await pilot.pause()
+                back_order.append(getattr(app.focused, "id", ""))
+                if app.focused is head:
+                    break
+            assert back_order == [
+                "edit-scheduled",
+                "edit-executor",
+                "edit-overseer",
+                "detail-head",
+            ]
             assert wrap.scroll_y == 0
             # Read-only stop: a stray letter must not fire any app/table action.
             await pilot.press("r")
             await pilot.pause()
             assert app._editing is True
-            # ↓ moves on to the first editable field, like the form's own rows.
+            # ↓ moves on to the first editable field — the /overseer dropdown.
             await pilot.press("down")
             await pilot.pause()
-            assert getattr(app.focused, "id", "") == "edit-aim"
+            assert getattr(app.focused, "id", "") == "edit-overseer"
             # Esc on the head saves and leaves edit mode; focus fences are restored.
+            # (shift+tab, not ↑: a focused Select consumes arrow keys itself.)
             await pilot.press("shift+tab")
             await pilot.pause()
+            assert app.focused is head
             await pilot.press("escape")
             await pilot.pause()
             assert app._editing is False
             assert table.can_focus is True and wrap.can_focus is True
             assert head.can_focus is False
+
+    asyncio.run(scenario())
+
+
+def test_scheduled_for_edit_field_and_deduped_edit_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `e` form edits the fixed start date; while editing, no option shows twice.
+
+    An unscheduled draft's head shows a discoverable `Scheduled for: —` placeholder;
+    in edit mode the head drops the models/account readout, the Scheduled-for line and
+    the Prompt-to-run body (their editable rows are the form's top rows). A valid date
+    commits `start_date`, an invalid one is rejected with the value kept, blank clears.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft("sched-edit", "/Users/x/repo", "run the thing", prompt="do the work")
+    store.close()
+
+    from textual.widgets import Input
+
+    from command_center.views.tui import CommandCenterApp, DetailHead, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.cfg.aim_score_on_set = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index("sched-edit"))
+            table.focus()
+            await pilot.pause()
+            head = app.query_one("#detail-head", DetailHead)
+            assert "Scheduled for: —" in head.render().plain  # unscheduled → placeholder
+
+            await pilot.press("e")
+            await pilot.pause()
+            # Deduped head while editing: each of these renders ONLY as a form row now.
+            eplain = head.render().plain
+            assert "/overseer" not in eplain
+            assert "Scheduled for" not in eplain
+            assert "Prompt to run" not in eplain
+            assert app.query_one("#edit-scheduled-row").styles.display == "block"
+            app.query_one("#edit-scheduled", Input).value = "2026-07-20"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app.store is not None
+            saved = app.store.get("sched-edit")
+            assert saved is not None and saved.start_date == "2026-07-20"
+            # Full head is back after the edit — the date line and the readout, once.
+            rplain = head.render().plain
+            assert "Scheduled for: 20.7.26" in rplain
+            assert rplain.count("/overseer") == 1
+
+            # Invalid date → rejected, value kept; blank → cleared.
+            await pilot.press("e")
+            await pilot.pause()
+            app.query_one("#edit-scheduled", Input).value = "not-a-date"
+            await pilot.press("escape")
+            await pilot.pause()
+            saved = app.store.get("sched-edit")
+            assert saved is not None and saved.start_date == "2026-07-20"
+            await pilot.press("e")
+            await pilot.pause()
+            app.query_one("#edit-scheduled", Input).value = ""
+            await pilot.press("escape")
+            await pilot.pause()
+            saved = app.store.get("sched-edit")
+            assert saved is not None and saved.start_date is None
 
     asyncio.run(scenario())

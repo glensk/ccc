@@ -188,8 +188,10 @@ divider reads `job details (e to edit):`, the `e` gilded gold); the editable lin
 cursor (the focused line is tinted — that tint shows immediately on `e`, scrolled into view — no
 boxes, no popup). While editing, `Tab` is **confined to the detail pane**: it cycles the fields
 plus the read-only **`Status:` head** as an extra stop (tinted too, scrolls the pane to its top),
-so the upper part — including a long *Prompt to run* — is always reachable; it never escapes into
-the session table. **`↑/↓`** move between the one-line fields
+so the top of the pane is always reachable; it never escapes into the session table. The head
+also **compacts** while editing — its models/account readout, `Scheduled for:` line and
+*Prompt to run* body drop out, since those are exactly the form's editable rows (every option
+shows once). **`↑/↓`** move between the one-line fields
 (**`/next-step` · `/deadline` · `progress %` · `/block`**); the **AIM**, the **sub-goal checklist**
 and the future-job **prompt to run** are borderless **multi-line** fields that grow to fit
 (**`Tab`** leaves them). **`progress %`** sets a manual bar override (blank = auto from sub-goals;
@@ -290,8 +292,9 @@ is also scriptable: `ccc new-job -a "…" [-p "…"] [-c REPO] [-w "during holid
 inert until launched — the daemon never reaps, grades, or alerts on them.
 
 **SCHEDULED — future jobs with a fixed start date.** A future job can carry a machine-readable
-`start_date` (`-s/--start-date YYYY-MM-DD`, the dialog's *Fixed start date* field, or the
-`start_date` frontmatter key of its job file) in addition to the free-text `start_when` note.
+`start_date` (`-s/--start-date YYYY-MM-DD`, the dialog's *Fixed start date* field, the `e`
+form's **`Scheduled for:`** row, or the `start_date` frontmatter key of its job file) in
+addition to the free-text `start_when` note.
 A dated job leaves the FUTURE block and sinks into its own blue **`SCHEDULED`** section at the
 **very bottom** of the table (below FINISHED), ordered soonest-date-first; the date is shown in
 blue as a compact `D.M.YY` label (`2026-08-11` → `11.8.26`) **spanning** the `!!!` (importance)
@@ -408,9 +411,11 @@ draft's **tags/notes column**: any typed `@tags` plus the free-text `start_when`
 `@home · tomorrow evening`, note in blue) — `ccc ls` shows the same as `next:` / `when:`
 detail lines. The draft's configured models stay a colour-coded `overseer ▸ executor`
 readout in the **model** column; in the job-details pane they render **on the `Status:` line
-itself** (`/overseer: … /executor: …`, plus `/account: …` in multi-account mode), and a draft
-with a fixed start date shows a blue **`Scheduled for: D.M.YY`** line directly under
-`Status:`. All of it is editable inline in the job-details pane
+itself** (`/overseer: … /executor: …`, plus `/account: …` in multi-account mode), and every
+draft shows a **`Scheduled for:`** line directly under `Status:` — the blue `D.M.YY` date when
+set, a grey `—` when not. While editing (`e`) those readouts drop out of the head (their
+editable rows — `/overseer` `/executor` `/account` `Scheduled for` — are the **top rows of the
+form**, so each option renders exactly once). All of it is editable inline in the job-details pane
 (`e`); once the job has synced to its file, the 4-hex hash becomes a clickable link
 (`obsidian://open`) that opens it directly — same in `ccc ls`. That's a Rich/OSC 8 hyperlink, so clickability depends on the terminal
 (⌘-click under iTerm2); the guaranteed path is the **`oo`** chord (type `o` then `o` on the
