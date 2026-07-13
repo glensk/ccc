@@ -257,3 +257,24 @@ def test_cmd_job_account_smoke(
     out = capsys.readouterr().out
     assert "← pick" in out
     assert 'policy: job_account = "auto" -> new jobs bill to: work' in out
+
+
+def test_cmd_job_account_pick_prints_label_only(
+    accounts_env: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``ccc job-account --pick`` emits just the routed label — the shell-wrapper form."""
+    from command_center import cli
+
+    now = int(time.time())
+    _patch_usage(
+        monkeypatch,
+        {
+            "private": _snap(now, used=74.0, hours=121),
+            "work": _snap(now, used=30.0, hours=56),
+        },
+    )
+    _patch_policy(monkeypatch, "auto")
+    assert cli.cmd_job_account(argparse.Namespace(pick=True)) == 0
+    assert capsys.readouterr().out == "work\n"

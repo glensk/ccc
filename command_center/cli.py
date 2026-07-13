@@ -1606,12 +1606,19 @@ def cmd_job_account(args: argparse.Namespace) -> int:
     marker on the row :func:`routing.pick_job_account` currently selects. A trailing line
     spells out the active ``job_account`` policy and the account it resolves to. Read-only;
     always exits 0.
+
+    ``-p/--pick`` prints ONLY the picked account label (one word, no report) — the
+    machine-readable form shell wrappers dispatch on (the ``c()`` launcher resolves its
+    account per invocation this way, so a long-lived shell never goes stale).
     """
     import time
 
     from . import accounts, routing, usage
 
     now = int(time.time())
+    if getattr(args, "pick", False):
+        print(routing.pick_job_account(now)[0])
+        return 0
     scores = routing.score_accounts(now)
     _pick_label, pick_dir = routing.pick_job_account(now)
     print(f"  {'account':<10} {'used':>5}  {'reset':<16} {'urgency':>9}  note")
@@ -2899,10 +2906,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("jobs", help="list registered future jobs (drafts)").set_defaults(func=cmd_jobs)
 
-    sub.add_parser(
+    p_jobacct = sub.add_parser(
         "job-account",
         help="Show per-account usage urgency and which account new jobs will bill to",
-    ).set_defaults(func=cmd_job_account)
+    )
+    p_jobacct.add_argument(
+        "-p",
+        "--pick",
+        action="store_true",
+        help="print only the picked account label (for shell wrappers)",
+    )
+    p_jobacct.set_defaults(func=cmd_job_account)
 
     p_rm = sub.add_parser("rm", help="remove a tracked session from the command center")
     p_rm.add_argument("session_id")
