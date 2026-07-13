@@ -1904,20 +1904,24 @@ class CommandCenterApp(App[None]):
         )
 
     def _refresh_worker(self) -> None:
-        # Worker thread. self.store is safe here: check_same_thread=False and the
-        # sqlite3 module is compiled serialized (threadsafety 3); busy_timeout covers
-        # cross-process writers.
-        if (store := self.store) is None:
-            return
-        rows = build_rows(
-            store,
-            self.adapter,
-            include_done=self._show_finished,
-            done_max_age_days=self.cfg.done_max_age_days,
-            folder_order=tuple(self.cfg.folder_order),
-            include_future=self._show_future,
-        )
-        self._sync_tab_badges(rows)  # AppleScript spawn — belongs off-loop too
+        # Worker thread, with its OWN per-run Store (~14 ms): sharing the UI thread's
+        # connection across threads intermittently dies with InterfaceError('bad
+        # parameter or other API misuse') — pysqlite does not reliably serialize
+        # cross-thread use of ONE connection, whatever sqlite3.threadsafety claims.
+        # Concurrent *connections* are safe (WAL + busy_timeout), including against a
+        # superseded refresh worker that is still mid-build when the next one starts.
+        if self.store is None:
+            return  # not mounted yet / shutting down
+        with Store() as store:
+            rows = build_rows(
+                store,
+                self.adapter,
+                include_done=self._show_finished,
+                done_max_age_days=self.cfg.done_max_age_days,
+                folder_order=tuple(self.cfg.folder_order),
+                include_future=self._show_future,
+            )
+            self._sync_tab_badges(rows, store)  # AppleScript spawn — belongs off-loop too
         if get_current_worker().is_cancelled:
             return  # superseded by a newer refresh — let that one repaint
         self.call_from_thread(self._apply_rows, rows)
@@ -2009,7 +2013,7 @@ class CommandCenterApp(App[None]):
             # column render widths are settled (same deferral as fit_aim_column).
             table.call_after_refresh(self._fit_rule_separators)
 
-    def _sync_tab_badges(self, rows: list[Row]) -> None:
+    def _sync_tab_badges(self, rows: list[Row], store: Store) -> None:
         """Re-push each live tab's iTerm title so its badge matches the row we just drew.
 
         The folder column and the status line both read the badge straight from the
@@ -2020,8 +2024,11 @@ class CommandCenterApp(App[None]):
         the two in lock-step whenever the TUI is open (the surface where the user
         compares them), even with no daemon. Gated on a change signature so AppleScript
         is spawned only when the badge↔tab mapping actually moves, not every refresh.
+
+        Runs on the refresh worker thread — *store* is the worker's own per-run
+        connection (never ``self.store``, see :meth:`_refresh_worker`).
         """
-        if not self.cfg.sync_tab_titles or self.store is None:
+        if not self.cfg.sync_tab_titles:
             return
         sig = tuple(
             (r.session.iterm_session_id, tabsymbol.read(r.session.iterm_session_id))
@@ -2032,7 +2039,7 @@ class CommandCenterApp(App[None]):
             return
         self._last_badge_sig = sig
         try:
-            tabsymbol.sync_live(self.store)
+            tabsymbol.sync_live(store)
         except OSError:
             pass
 
