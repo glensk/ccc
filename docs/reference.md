@@ -1235,7 +1235,9 @@ filenames); malformed entries are skipped.
   while another is usable, is skipped so a routed job never trusts stale data or dies on
   the hard cap. The stamp is evaluated once, at **creation** (visible/editable in the TUI
   and the job file's account select), never re-routed on edit. `ccc job-account` prints
-  each account's used%, reset, urgency, and the account the policy currently resolves to.
+  each account's used%, reset, urgency, and the account the policy currently resolves to;
+  `ccc job-account -p/--pick` prints only the picked label — the machine-readable form a
+  shell launcher can dispatch on per invocation (so a long-lived shell never goes stale).
 - **Transcripts.** `transcript_path` searches the session's **owning account first**,
   then every other account, so a shared transcript tree is an optimisation — never a
   correctness precondition.
