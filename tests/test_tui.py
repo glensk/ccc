@@ -1636,13 +1636,17 @@ def test_tp_tw_switch_account_on_draft_and_guard_parked(
     store.update_fields("parked-acct", config_dir=str(tmp_path))  # ran under private, no work tx
     store.close()
 
-    from command_center.views.tui import CommandCenterApp
+    from command_center.views.tui import _MODEL_COL, CommandCenterApp, SessionTable
 
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
             await settle(pilot)
             app.cfg.aim_score_on_set = False
+            # The draft defaults to the private (cpriv) account → its model cell wears 🏠.
+            table = app.query_one("#sessions", SessionTable)
+            model_cell = table.get_row_at(table.get_row_index(draft_sid))[_MODEL_COL]
+            assert isinstance(model_cell, Text) and "🏠" in model_cell.plain
             app._current = draft_sid
             app.action_account_work()  # draft: never ran → flips freely
             await pilot.pause()

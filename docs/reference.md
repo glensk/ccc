@@ -255,8 +255,9 @@ Press **`?`** (or `h`) for the full key reference. The footer shows **`toggle`**
 leader); the **`td`** chord (type `t` then `d`) shows/hides DONE sessions, **`tf`** (`t`
 then `f`) shows/hides FUTURE jobs, and **`ti`** (`t` then `i`) mutes/unmutes Claude Code's
 idle "waiting for input" macOS popups (it flips the native `agentPushNotifEnabled` in
-`settings.json` — global, ON by default; also `ccc toggle-idle`). Pressing `t` alone briefly
-lists the available toggles. The bottom footer hint line — prefixed **`keys:`** — lists **the commands that opt
+`settings.json` — global, ON by default; also `ccc toggle-idle`). Two more `t…` chords act on
+the highlighted row: **`tp`** / **`tw`** set its Claude account to private / work (see
+*Home-icon marker* under Multi-account). Pressing `t` alone briefly lists the available chords. The bottom footer hint line — prefixed **`keys:`** — lists **the commands that opt
 in (any with a `footer_pos`), each with its key gilded gold** — single letters in place
 (`/`**a**`im`) and two-key chords with both letters gilded (**a**im-**h**istory = `ah`,
 **s**ubgoal-**h**istory = `sh`). A few keys are deliberately kept out of this line to keep
@@ -1210,6 +1211,19 @@ filenames); malformed entries are skipped.
   file's `account` frontmatter + control — all shown **only when more than one
   account is configured**, so single-account setups see nothing new. `ccc jobs` tags
   a non-default account `[<label>]`.
+- **Home-icon marker + the `tp`/`tw` quick switches.** In the **model** column (TUI and
+  `ccc ls`), every row billing to the **`private` (cpriv)** account is prefixed with a
+  little **🏠** — so you can see at a glance which sessions are personal vs work; every
+  other row gets an equal-width blank so the model text stays aligned. The marker only
+  shows in multi-account mode (with one account it would sit on every row and mean
+  nothing). To change a row's account fast, without opening the `e` form: highlight it
+  and press **`tp`** (type `t` then `p`) for **private** or **`tw`** for **work**. Both
+  are per-session `t…` chords, listed in the `t` leader menu. They flip a **FUTURE job**
+  (draft) freely (it never ran); on a **PARKED** session they re-stamp the account **only
+  when that session's transcript already lives under the target account** (else they warn
+  and leave it unchanged — resuming under an account with no transcript would find
+  nothing); a **LIVE** session cannot be switched (it already bills the account its
+  process runs under).
 - **Routing a NEW job (`job_account`).** When a job is created **without** an explicit
   account (no `-A`, no account select), the `job_account` config key decides which
   account it bills to: `""` (default) ⇒ the default account (today's behaviour); a
