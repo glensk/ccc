@@ -352,6 +352,43 @@ COMMANDS: list[Command] = [
         chord=("s", "p"),
         footer_pos=13.85,  # right after open-session (13.8), before quit (14)
     ),
+    Command(
+        key="tp",
+        word="private",
+        gloss="bill this job under the private (cpriv) account",
+        section=PER_SESSION,
+        explanation=(
+            "Set the highlighted row's Claude account to PRIVATE (cpriv) — the account it "
+            "launches / resumes under, and the one the home-icon marks in the model column. "
+            "Type t then p. Works on a FUTURE job (draft): it has not run yet, so the switch "
+            "is free. On a PARKED session it re-stamps the account only when that session's "
+            "transcript already lives under the private account (otherwise resume could not "
+            "find it) — else it warns and leaves the account unchanged. A LIVE session can "
+            "not be switched (it is already billing its running account). Only meaningful "
+            "with more than one Claude account configured."
+        ),
+        action="account_private",
+        chord=("t", "p"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti/tw.
+    ),
+    Command(
+        key="tw",
+        word="work",
+        gloss="bill this job under the work account",
+        section=PER_SESSION,
+        explanation=(
+            "Set the highlighted row's Claude account to WORK — the account it launches / "
+            "resumes under. Type t then w. Works on a FUTURE job (draft): it has not run "
+            "yet, so the switch is free. On a PARKED session it re-stamps the account only "
+            "when that session's transcript already lives under the work account (otherwise "
+            "resume could not find it) — else it warns and leaves the account unchanged. A "
+            "LIVE session can not be switched (it is already billing its running account). "
+            "Only meaningful with more than one Claude account configured."
+        ),
+        action="account_work",
+        chord=("t", "w"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti/tp.
+    ),
     # ---- Global ----
     Command(
         key="fn",

@@ -192,6 +192,7 @@ def _no_score_cfg() -> object:
     cfg = type("Cfg", (), {})()
     cfg.aim_score_on_set = False  # don't spawn a detached scorer in the test
     cfg.future_files = False  # nor a detached sync-future
+    cfg.job_account = ""  # route a new job to the default account (see routing.pick_job_account)
     return cfg
 
 

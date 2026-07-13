@@ -41,6 +41,7 @@ flags. Grouped by what they do:
 - `ccc new-job -a "AIM" [-p PROMPT] [-c REPO] [-s YYYY-MM-DD] [-d DEP] [-j codex] [-O overseer] [-E executor]` — park a future job (`-d` = another job it depends on).
 - `ccc new-prompt [-r cat/repo] [-o]` — a prefilled capture file for a future job.
 - `ccc jobs` — list registered future jobs (drafts).
+- `ccc job-account` — per-account usage urgency + which account a new job will bill to (the `job_account` policy).
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian).
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
 
@@ -150,11 +151,26 @@ So from a session you go to ccc-with-that-row-selected, and from ccc you go stra
 back — `f+j` · `f+j` round-trips. The TUI tab is located by the bare `ccc` process's
 controlling **tty** (`ps` → iTerm's `tty of session`) — title-independent, so
 renamed/badged tabs still match; it falls back to the `tab_title` (e.g. `!!!`).
-Coordination with the live TUI is two tiny files under
+
+**Fast path (a live TUI is running).** `ccc jump` hands the *whole* toggle to the
+resident TUI — the out-of-process chord run only writes a one-byte request verb and
+returns (~80 ms), skipping its own `ps` scan and the AppleScript window walk (~1 s over
+many tabs). The TUI does the toggle in-process over **iTerm2's Python API**: a warm,
+long-lived websocket makes focus-refresh, session-by-id lookup, and activation
+sub-millisecond, so the whole f+j lands in ~0.2 s. This path needs the bundled
+`iterm2` package **and** iTerm's *Settings → General → Magic → Enable Python API*
+turned on. When no TUI is running, the API is off/unavailable, or you pass
+`--no-toggle`, `ccc jump` falls back to the original AppleScript path described above —
+it must work with no TUI at all.
+
+Coordination with the live TUI is four tiny files under
 `$CLAUDE_HOME/command-center/` (`jumpstate`): the TUI publishes its cursor's session
-(`jump_selected`) and consumes a cursor-move request (`jump_request`, polled every
-0.4 s so the jump feels instant). The frontmost-app check uses `lsappinfo` (no
-Accessibility prompt).
+(`jump_selected`) and its own identity (`jump_tui`, `pid|iterm_session_id`, enabling the
+fast path), and consumes a cursor-move request (`jump_request`) or the whole-toggle verb
+(`jump_toggle`). Both are polled every **0.1 s**, so the jump feels instant — a ~0.1 ms
+file read at 10 Hz is free, and that cadence (not a slow osascript walk) now bounds the
+perceived f+j latency. The frontmost-app check uses `lsappinfo` (no Accessibility
+prompt).
 
 It is wired to a **global Karabiner** chord — **hold `f`, then tap `j` while `f` is
 still down** — mirroring the `s+p` peek idiom (`simultaneous [f, j]`, strict
@@ -1194,6 +1210,18 @@ filenames); malformed entries are skipped.
   file's `account` frontmatter + control — all shown **only when more than one
   account is configured**, so single-account setups see nothing new. `ccc jobs` tags
   a non-default account `[<label>]`.
+- **Routing a NEW job (`job_account`).** When a job is created **without** an explicit
+  account (no `-A`, no account select), the `job_account` config key decides which
+  account it bills to: `""` (default) ⇒ the default account (today's behaviour); a
+  configured label ⇒ that account (a hard pin); `"auto"` ⇒ the account with the highest
+  **required burn rate** `(100 − used%) ÷ hours-to-reset` over its Fable weekly window
+  (falling back to the plain 7-day window). Routing to the max saturates the allowance
+  that resets *soonest* first and self-balances as it fills (the leader's remaining%
+  falls until the other overtakes); a snapshot older than 6h, or an account ≥ 90% used
+  while another is usable, is skipped so a routed job never trusts stale data or dies on
+  the hard cap. The stamp is evaluated once, at **creation** (visible/editable in the TUI
+  and the job file's account select), never re-routed on edit. `ccc job-account` prints
+  each account's used%, reset, urgency, and the account the policy currently resolves to.
 - **Transcripts.** `transcript_path` searches the session's **owning account first**,
   then every other account, so a shared transcript tree is an optimisation — never a
   correctness precondition.

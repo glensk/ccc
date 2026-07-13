@@ -270,6 +270,35 @@ def test_transcript_path_falls_back_to_other_account(two_accounts: dict[str, Pat
 
 
 # ---------------------------------------------------------------------------
+# home-icon marker for the model column (private/cpriv rows get 🏠)
+# ---------------------------------------------------------------------------
+def test_is_private_account_matches_only_private(two_accounts: dict[str, Path]) -> None:
+    """Only the resolved `private` dir is private; work and the UNKNOWN sentinel are not."""
+    assert accounts.is_private_account(str(two_accounts["private"])) is True
+    assert accounts.is_private_account(str(two_accounts["work"])) is False
+    assert accounts.is_private_account("") is False  # multi-account UNKNOWN → never private
+
+
+def test_home_marker_multi_account_marks_private_only(two_accounts: dict[str, Path]) -> None:
+    """The private row gets the home glyph; every other row gets an equal-width blank."""
+    priv = accounts.home_marker(str(two_accounts["private"]))
+    assert priv == accounts._HOME_GLYPH
+    assert "🏠" in priv
+    # work + UNKNOWN get the SAME blank filler (so the model column stays aligned).
+    blank = accounts.home_marker(str(two_accounts["work"]))
+    assert accounts.home_marker("") == blank
+    assert blank == accounts._NO_HOME
+    assert set(blank) == {" "}  # blanks only, no glyph
+
+
+def test_home_marker_single_account_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With one account the mark would be on every row → it carries no signal, so drop it."""
+    monkeypatch.setattr(config, "claude_config_dirs", lambda: {"private": Path("/x/.claude")})
+    assert accounts.home_marker("/x/.claude") == ""
+    assert accounts.home_marker("") == ""
+
+
+# ---------------------------------------------------------------------------
 # launch_env
 # ---------------------------------------------------------------------------
 def test_launch_env_default_account_unsets_var(two_accounts: dict[str, Path]) -> None:

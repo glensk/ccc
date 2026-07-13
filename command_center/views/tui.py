@@ -18,6 +18,7 @@ sub-goals, live TodoWrite list, summary). Served to a browser by ``ccc serve``.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import signal
@@ -62,9 +63,11 @@ from .. import (
     future_files,
     gitstatus,
     idlenotify,
+    iterm_api,
     jumpstate,
     launchd,
     repos,
+    routing,
     tabsymbol,
     tags,
     terminal,
@@ -245,7 +248,16 @@ _AIM_MAX_CHARS = 200  # cap the stored /aim text; the fixed-width column crops t
 # configurable ``usage_refresh_sec`` (default 5.0): it drives the refresh timer. (Cheap
 # cache re-reads only — the *expensive* Copilot fetch has its own, separately adaptive,
 # throttle. See config.py. The cadence is no longer shown in a card title.)
-_JUMP_POLL_SEC = 0.4  # how often the TUI checks for an `ccc jump` cursor-move request
+# How often the TUI checks for `ccc jump` signals. peek is a ~0.1 ms file read, so 10 Hz
+# is free; the poll now also carries the whole-toggle verb (the f+j fast path), so its
+# cadence — not a slow osascript walk — bounds the perceived f+j latency.
+_JUMP_POLL_SEC = 0.1
+
+
+def _current_session_uuid_fallback() -> str | None:
+    """AppleScript fallback for the warm link's current-session lookup (uuid or None)."""
+    current = terminal.current_iterm_session()
+    return current[0] if current else None
 
 
 def _gold_mnemonic(word: str, key: str, base: str) -> Text:
@@ -1777,6 +1789,10 @@ class CommandCenterApp(App[None]):
         # Last pushed (iterm_session_id, badge) mapping, so _sync_tab_badges only
         # spawns AppleScript when the badge↔tab mapping actually moves (not every 5 s).
         self._last_badge_sig: tuple[tuple[str, str | None], ...] | None = None
+        # Warm iTerm2 API link backing the resident f+j toggle (see iterm_api). Created
+        # unconditionally so attribute access is always safe; only *pre-warmed* (a real
+        # websocket) under iTerm — on_mount gates the connect on $ITERM_SESSION_ID.
+        self._iterm_link = iterm_api.ItermLink()
 
     # ---- layout (top: table, bottom: detail) ----------------------------
     def compose(self) -> ComposeResult:
@@ -1836,9 +1852,28 @@ class CommandCenterApp(App[None]):
         self._apply_split()
         self.refresh_data()
         self.set_interval(self.cfg.usage_refresh_sec, self.refresh_data)
-        # Fast, cheap poll for `ccc jump` cursor-move requests (the f+j toggle), so a
-        # jump from a session tab lands on its row near-instantly, not after 5 s.
+        # Publish this TUI's identity so `ccc jump` hands us the whole f+j toggle (the
+        # fast path — see jump / iterm_api). Clear any stale toggle first: one left by a
+        # dead TUI must not fire on startup.
+        jumpstate.set_tui(os.getpid(), os.environ.get("ITERM_SESSION_ID", ""))
+        jumpstate.clear_toggle()
+        # Pre-warm the iTerm2 API websocket so the first f+j is already sub-ms — but only
+        # under iTerm (a real $ITERM_SESSION_ID). Headless tests / Linux / tmux must never
+        # open the socket, so the gate is the env var, not a try/except.
+        if os.environ.get("ITERM_SESSION_ID"):
+            self.run_worker(
+                self._iterm_link.ensure(), group="iterm-link", description="warm iTerm2 API link"
+            )
+        # Fast, cheap poll for `ccc jump` signals (the f+j toggle): the whole-toggle verb
+        # and the cursor-move request, so a jump lands near-instantly, not after 5 s.
         self.set_interval(_JUMP_POLL_SEC, self._poll_jump_request)
+
+    def on_unmount(self) -> None:
+        # Retract the identity so `ccc jump` stops handing this (now gone) TUI the toggle.
+        try:
+            jumpstate.clear_tui()
+        except OSError:
+            pass
 
     def _apply_split(self) -> None:
         top = max(5, min(95, round(self.cfg.split_ratio * 100)))
@@ -2372,13 +2407,18 @@ class CommandCenterApp(App[None]):
         self.update_detail()
 
     def _poll_jump_request(self) -> None:
-        """Honour a pending `ccc jump` cursor-move request (the toggle's other half).
+        """Honour pending `ccc jump` signals (the f+j toggle), polled fast (sub-second).
 
-        ``ccc jump`` fired from a session tab writes that session id; we move the
-        cursor onto its row and clear the request. Polled fast (sub-second) so the
-        jump feels instant rather than waiting on the 5 s data refresh. A request for
-        a session not (yet) in the table is left pending for a later tick.
+        First the *whole-toggle* verb: a live TUI owns the toggle (the fast path — see
+        jump / iterm_api), so ``ccc jump`` just writes it and we run the toggle here on
+        the UI loop. Then the cursor-move *request*: ``ccc jump`` fired from a session
+        tab (the slow no-TUI path) writes that session id; we move the cursor onto its
+        row and clear the request. A request for a session not (yet) in the table is
+        left pending for a later tick.
         """
+        if jumpstate.peek_toggle():
+            jumpstate.clear_toggle()
+            self.run_worker(self._handle_jump_toggle(), exclusive=True, group="jump-toggle")
         req = jumpstate.peek_request()
         if not req:
             return
@@ -2390,6 +2430,56 @@ class CommandCenterApp(App[None]):
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             pass
         jumpstate.clear_request()
+
+    def _session_for_uuid(self, uuid: str) -> str | None:
+        """The tracked session id whose iTerm tab UUID is *uuid*, or None (from the store)."""
+        if (store := self.store) is None:
+            return None
+        try:
+            for session in store.list_sessions():
+                isid = session.iterm_session_id
+                if isid and isid.split(":")[-1] == uuid:
+                    return session.session_id
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            return None
+        return None
+
+    async def _handle_jump_toggle(self) -> None:
+        """Run the whole f+j toggle in-process (the fast path — see jump / iterm_api).
+
+        Runs on the UI loop (async worker), so widget/state access is safe; the only
+        blocking calls (lsappinfo / any osascript fallback) are pushed to a thread. The
+        warm iTerm2 API link does the focus; :mod:`terminal`'s AppleScript helpers are
+        the fallback when the API is unavailable or the session can't be located.
+        """
+        front = await asyncio.to_thread(terminal.is_iterm_frontmost)  # lsappinfo, ~14 ms
+        own = (os.environ.get("ITERM_SESSION_ID", "").split(":")[-1]).strip()
+        cur = await self._iterm_link.current_session_uuid() if front else None
+        if cur is None and front:
+            cur = await asyncio.to_thread(_current_session_uuid_fallback)  # osascript fallback
+        if front and cur and own and cur == own:
+            # f+j in the ccc tab → same as pressing r on the selected row.
+            self.action_resume()
+            return
+        if front and cur:
+            # f+j in a session tab → land the cursor on that row before focusing ccc.
+            if (sid := self._session_for_uuid(cur)) is not None:
+                jumpstate.request_select(sid)
+                self._poll_jump_request()  # consume immediately when the row is present
+        # Bring the ccc tab forward (own session): warm link first, AppleScript fallback.
+        focused = False
+        if own:
+            focused = await self._iterm_link.focus_session(own)
+            if not focused:
+                focused = await asyncio.to_thread(
+                    terminal.focus_iterm_session, os.environ.get("ITERM_SESSION_ID", "")
+                )
+        if not focused and not own:
+            # No $ITERM_SESSION_ID (unusual for a live TUI) — fall back to the tab title,
+            # like jump._focus_ccc does.
+            title = (self.cfg.tab_title or "").strip()
+            if title:
+                await asyncio.to_thread(terminal.focus_session_name, title)
 
     def _head_text(
         self, session: Session, status: Status, checked: int, total_subs: int, *, editing: bool
@@ -2628,9 +2718,19 @@ class CommandCenterApp(App[None]):
         row = self._rows.get(sid)
         live = row.live if row else None
         if live is not None and live.alive:
-            if session.iterm_session_id and terminal.focus_iterm_session(session.iterm_session_id):
-                self.notify(f"Focused live tab: {colors.short_folder(session.cwd)}")
-            elif live.kind == "bg":
+            if session.iterm_session_id:
+                # Focus off-loop: the AppleScript window walk is the ~620 ms UI-freeze
+                # class we removed from d/close — the worker tries the warm iTerm2 link
+                # first, then that fallback (see _focus_session_task).
+                self.run_worker(
+                    self._focus_session_task(
+                        session.iterm_session_id, colors.short_folder(session.cwd)
+                    ),
+                    group="jump-toggle",
+                    description="focus session tab",
+                )
+                return
+            if live.kind == "bg":
                 self.notify(
                     "Live background agent — attach with `claude agents` (can't open a tab).",
                     severity="warning",
@@ -2655,6 +2755,24 @@ class CommandCenterApp(App[None]):
             self.notify(f"Resuming in a new tab: {colors.short_folder(session.cwd)}")
         else:
             self.notify(f"Run: c --resume {sid}", severity="warning", timeout=10)
+
+    async def _focus_session_task(self, iterm_session_id: str, label: str) -> None:
+        """Bring a live session's iTerm tab forward off the UI loop.
+
+        Warm iTerm2 link first (sub-ms), then the AppleScript walk as fallback (slow —
+        why it runs in a worker, not inline in action_resume).
+        """
+        focused = await self._iterm_link.focus_session(iterm_session_id)
+        if not focused:
+            focused = await asyncio.to_thread(terminal.focus_iterm_session, iterm_session_id)
+        if focused:
+            self.notify(f"Focused live tab: {label}")
+        else:
+            self.notify(
+                "Session is live but its tab can't be located — switch to it manually.",
+                severity="warning",
+                timeout=10,
+            )
 
     def _offer_archive_orphan(self, sid: str) -> None:
         """A parked session with no transcript can't be resumed — offer to archive it."""
@@ -2961,7 +3079,12 @@ class CommandCenterApp(App[None]):
         if (store := self.store) is None:
             return
         sid = str(uuid.uuid4())
-        config_dir = config.claude_config_dirs().get(account) if account else None
+        if account:
+            found = config.claude_config_dirs().get(account)
+            config_dir = str(found) if found else ""
+        else:
+            # No account chosen ⇒ route this NEW job per the job_account policy.
+            config_dir = routing.pick_job_account()[1]
         store.create_draft(
             sid,
             cwd,
@@ -2971,7 +3094,7 @@ class CommandCenterApp(App[None]):
             start_when=start_when or None,
             start_date=start_date or None,
             job_type=job_type,
-            config_dir=str(config_dir) if config_dir else "",
+            config_dir=config_dir,
         )
         from .. import spawn  # pylint: disable=import-outside-toplevel
 

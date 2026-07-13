@@ -64,11 +64,14 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
     toggle = next(c for c in footer if c.footer_word == "toggle")
     assert toggle.action == "toggle_finished"
     assert toggle.footer_key == "t"  # only the leader `t` is the footer mnemonic
-    # The leader's chord menu lists every `t…` toggle: the view toggles td/tf/ti and
-    # the four usage-card render gates t1…t4.
+    # The leader's chord menu lists every `t…` chord: the per-session account switches
+    # tp/tw (first, in registry order), then the view toggles td/tf/ti and the four
+    # usage-card render gates t1…t4.
     menu = commands.chords_for_leader("t")
-    assert [c.key for c in menu] == ["td", "tf", "ti", "t1", "t2", "t3", "t4"]
+    assert [c.key for c in menu] == ["tp", "tw", "td", "tf", "ti", "t1", "t2", "t3", "t4"]
     assert {c.word for c in menu} == {
+        "private",
+        "work",
         "done",
         "future",
         "idle-alerts",
@@ -148,6 +151,24 @@ def test_registry_invariants_hold_with_new_chords() -> None:
     aliases = {a for c in commands.COMMANDS for a in c.aliases}
     assert binds.isdisjoint({"1", "2", "3", "4"})
     assert aliases.isdisjoint({"1", "2", "3", "4"})
+
+
+def test_account_switch_chords_are_tp_and_tw() -> None:
+    """`tp`/`tw` set the highlighted row's Claude account; per-session, pure-menu chords."""
+    priv = commands.by_action("account_private")
+    work = commands.by_action("account_work")
+    assert priv.chord == ("t", "p") and priv.key == "tp"
+    assert work.chord == ("t", "w") and work.key == "tw"
+    for cmd in (priv, work):
+        assert cmd.key == "".join(cmd.chord)  # registry invariant
+        assert cmd.section == commands.PER_SESSION  # acts on the highlighted session
+        assert cmd.footer_pos is None  # shown only via the `t` leader menu, like ti/t1…t4
+        assert cmd.explanation  # a real explanation, not blank
+        assert cmd.bind is None  # a chord, never a plain binding
+    # They collide with no plain binding or alias.
+    binds = {c.bind for c in commands.COMMANDS if c.bind}
+    aliases = {a for c in commands.COMMANDS for a in c.aliases}
+    assert binds.isdisjoint({"tp", "tw"}) and aliases.isdisjoint({"tp", "tw"})
 
 
 def test_oo_chord_is_open_obsidian() -> None:

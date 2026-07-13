@@ -104,6 +104,9 @@ DEFAULTS: dict[str, object] = {
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
     # behaviour. Labels are validated ``^[a-z0-9][a-z0-9_-]*$``.
     "claude_accounts": [],
+    # Which account a NEW job (no explicit -A / account select) bills to: "" = default
+    # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
+    "job_account": "",
     "usage_card_private": True,  # render the Claude Code (private) usage card
     "usage_card_work": True,  # render the Claude Code (work) usage card
     "usage_card_codex": True,  # render the OpenAI Codex usage card
@@ -327,6 +330,7 @@ class Config:
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
+    job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True
     usage_card_codex: bool = True

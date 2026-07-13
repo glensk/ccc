@@ -730,6 +730,8 @@ def _register(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         return None
     session_id = job.session_id
     cwd = repo_to_cwd(job.repo, git_base)
+    from . import routing  # pylint: disable=import-outside-toplevel
+
     store.create_draft(
         session_id,
         str(cwd),
@@ -740,7 +742,8 @@ def _register(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         start_date=(job.start_date.strip() or None),
         depends_on=(job.depends_on.strip() or None),
         job_type=job.job_type,
-        config_dir=_account_config_dir(job.account),
+        # No `account:` in the file ⇒ route this NEW job per the job_account policy.
+        config_dir=_account_config_dir(job.account) or routing.pick_job_account()[1],
     )
     _spawn_aim_jobs(cfg, session_id)
     directory = future_root(cfg) / rel_dir_for(job.repo, git_base)
@@ -956,7 +959,10 @@ def _import_file_wins(  # pylint: disable=too-many-arguments,too-many-positional
     # Account (config_dir): the file's `account:` label wins. `validate` already ran, so
     # `job.account` is empty or a configured label; empty ⇒ the default account (same
     # `or claude_home()` idiom create_draft uses). same_config_dir absorbs any spelling
-    # difference so a no-op edit never churns.
+    # difference so a no-op edit never churns. Note: an empty account at EDIT deliberately
+    # stays the default account (NOT re-routed via routing.pick_job_account) — job_account
+    # routing is a creation-time decision, and re-evaluating it on every sync would churn
+    # the stamp of a job the user is merely editing.
     from . import accounts  # pylint: disable=import-outside-toplevel
 
     new_account_dir = _account_config_dir(job.account) or str(config.claude_home())

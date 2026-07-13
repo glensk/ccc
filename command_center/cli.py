@@ -964,13 +964,16 @@ def cmd_resume(args: argparse.Namespace) -> int:
 def _account_config_dir(label: str | None) -> tuple[str, str | None]:
     """Resolve an account *label* to its absolute config dir.
 
-    Returns ``(config_dir, error)``: an empty *label* ⇒ ``("", None)`` (the default
-    account, stamped by ``create_draft``); a known label ⇒ its resolved dir; an unknown
-    label ⇒ ``("", "error: …")`` listing the configured accounts.
+    Returns ``(config_dir, error)``: an omitted/empty *label* ⇒ the routed job account
+    (``routing.pick_job_account`` — the default account under the ``""`` policy, so
+    single-account setups are unchanged), see :mod:`.routing`; a known label ⇒ its resolved
+    dir; an unknown label ⇒ ``("", "error: …")`` listing the configured accounts.
     """
     label = (label or "").strip()
     if not label:
-        return "", None
+        from . import routing
+
+        return routing.pick_job_account()[1], None
     dirs = config.claude_config_dirs()
     path = dirs.get(label)
     if path is None:
@@ -1489,7 +1492,7 @@ def cmd_restore_job(args: argparse.Namespace) -> int:
             return 1
         from pathlib import Path
 
-        from . import accounts, future_files
+        from . import accounts, future_files, routing
 
         path = Path(os.path.abspath(os.path.expanduser(file_arg)))
         job = future_files.parse_job_file(path.read_text(encoding="utf-8"))
@@ -1511,7 +1514,10 @@ def cmd_restore_job(args: argparse.Namespace) -> int:
             job_type=job.job_type or "claude",
             llm_overseer=job.llm_overseer,
             llm_exec=job.llm_exec,
-            config_dir=accounts.account_config_dir(getattr(job, "account", "")),
+            config_dir=(
+                accounts.account_config_dir(getattr(job, "account", ""))
+                or routing.pick_job_account()[1]
+            ),
         )
         store.update_fields(job.session_id, future_file=str(path))
         refreshed = store.get(job.session_id)
@@ -1588,6 +1594,36 @@ def cmd_jobs(args: argparse.Namespace) -> int:
             tag += f"  [{accounts.account_label(session.config_dir or '')}]"
         when = f"  [starts {session.start_date}]" if session.start_date else ""
         print(f"  {short_id(session.session_id)}  {folder:<30}  {session.aim or '—'}{tag}{when}")
+    return 0
+
+
+def cmd_job_account(args: argparse.Namespace) -> int:
+    """Show each account's usage urgency and which account a NEW job will bill to.
+
+    One aligned row per configured account — its Fable weekly used%, when that window
+    resets, the ``(100-used%)/hours-to-reset`` burn rate the ``"auto"`` policy ranks by,
+    and any reason it is unusable (no data / stale / dead / exhausted) — with a ``← pick``
+    marker on the row :func:`routing.pick_job_account` currently selects. A trailing line
+    spells out the active ``job_account`` policy and the account it resolves to. Read-only;
+    always exits 0.
+    """
+    import time
+
+    from . import accounts, routing, usage
+
+    now = int(time.time())
+    scores = routing.score_accounts(now)
+    _pick_label, pick_dir = routing.pick_job_account(now)
+    print(f"  {'account':<10} {'used':>5}  {'reset':<16} {'urgency':>9}  note")
+    for score in scores:
+        used = f"{score.used_pct:.0f}%" if score.used_pct is not None else "—"
+        reset = usage.format_reset(score.resets_at, now) if score.resets_at is not None else "—"
+        urgency = f"{score.urgency:.2f}%/h" if score.urgency is not None else "—"
+        note = "exhausted" if score.exhausted else ("" if score.note == "ok" else score.note)
+        marker = " ← pick" if accounts.same_config_dir(score.config_dir, pick_dir) else ""
+        print(f"  {score.label:<10} {used:>5}  {reset:<16} {urgency:>9}  {note}{marker}")
+    policy = config.load_config().job_account
+    print(f'policy: job_account = "{policy}" -> new jobs bill to: {_pick_label}')
     return 0
 
 
@@ -2862,6 +2898,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_unlaunch.set_defaults(func=cmd_unlaunch)
 
     sub.add_parser("jobs", help="list registered future jobs (drafts)").set_defaults(func=cmd_jobs)
+
+    sub.add_parser(
+        "job-account",
+        help="Show per-account usage urgency and which account new jobs will bill to",
+    ).set_defaults(func=cmd_job_account)
 
     p_rm = sub.add_parser("rm", help="remove a tracked session from the command center")
     p_rm.add_argument("session_id")

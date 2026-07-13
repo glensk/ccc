@@ -2237,3 +2237,74 @@ def test_scheduled_for_edit_field_and_deduped_edit_head(
             assert saved is not None and saved.start_date is None
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# f+j resident toggle — identity publish, stale-toggle clear, poll dispatch
+# --------------------------------------------------------------------------- #
+def test_tui_mount_publishes_identity_and_clears_stale_toggle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """on_mount publishes (pid|iterm) and clears a stale toggle left by a dead TUI."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import jumpstate
+
+    jumpstate.request_toggle()  # a stale toggle a dead TUI never consumed
+    assert jumpstate.peek_toggle() is True
+
+    from command_center.views.tui import CommandCenterApp
+
+    seen: dict = {}
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            # Assert while mounted — on_unmount clears the identity again on exit.
+            seen["ident"] = jumpstate.get_tui()
+            seen["toggle"] = jumpstate.peek_toggle()
+
+    asyncio.run(scenario())
+    assert seen["ident"] is not None and seen["ident"][0] == os.getpid()
+    assert seen["toggle"] is False  # stale toggle cleared on mount
+
+    # on_unmount retracted the identity.
+    assert jumpstate.get_tui() is None
+
+
+def test_tui_poll_consumes_toggle_and_focuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A seeded toggle is consumed by the poll and runs _handle_jump_toggle.
+
+    With no ITERM_SESSION_ID (unset by conftest) and iTerm not frontmost, the handler
+    must degrade to the title focus without ever touching the warm link or the current-
+    session osascript probe. Terminal focus is stubbed to record-and-return-True.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import jumpstate, terminal
+
+    records: dict = {"name": [], "iterm": []}
+    monkeypatch.setattr(terminal, "is_iterm_frontmost", lambda: False)
+    monkeypatch.setattr(
+        terminal, "focus_session_name", lambda needle: (records["name"].append(needle), True)[1]
+    )
+    monkeypatch.setattr(
+        terminal, "focus_iterm_session", lambda sid: (records["iterm"].append(sid), True)[1]
+    )
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            jumpstate.request_toggle()  # seed after mount (mount clears any stale one)
+            app._poll_jump_request()  # consume + dispatch the toggle handler
+            await settle(pilot)
+            records["toggle_after"] = jumpstate.peek_toggle()
+
+    asyncio.run(scenario())
+    assert records["toggle_after"] is False  # poll consumed the toggle
+    assert records["name"] == ["!!!"]  # fell through to the tab-title focus
+    assert records["iterm"] == []  # no ITERM_SESSION_ID → never focused by uuid

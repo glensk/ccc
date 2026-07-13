@@ -12,7 +12,7 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from .. import tabsymbol
+from .. import accounts, config, tabsymbol
 from ..adapters.base import Adapter
 from ..core import Row, build_rows
 from ..future_files import display_hash, obsidian_uri
@@ -97,7 +97,13 @@ def _collapse_home(path: str) -> str:
     return "~" + path[len(home) :] if path.startswith(home) else path
 
 
-def _render_row(row: Row, enabled: bool, warn_days: int, aim_threshold: int) -> list[str]:
+def _render_row(
+    row: Row,
+    enabled: bool,
+    warn_days: int,
+    aim_threshold: int,
+    account_dirs: dict[str, Path] | None = None,
+) -> list[str]:
     session = row.session
     status = row.status
     icon = _paint(_STATUS_COLOR.get(status, _DIM), STATUS_ICON.get(status, "?"), enabled)
@@ -179,7 +185,10 @@ def _render_row(row: Row, enabled: bool, warn_days: int, aim_threshold: int) -> 
         if session.draft
         else model_effort_cell(session.model, session.effort)
     )
-    model_cell = _paint(_DIM, model_text, enabled)
+    # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
+    # only); other rows get an equal-width blank so the model text stays aligned.
+    home = accounts.home_marker(session.config_dir or "", account_dirs)
+    model_cell = home + _paint(_DIM, model_text, enabled)
     line1 = (
         f"{icon} {sid}  {ver}  {badge_cell}{folder}  {bar_cell}  "
         f"{age}{badge}  {model_cell}  {aim}{dot}"
@@ -245,11 +254,12 @@ def render(
     enabled = _color_enabled()
     if not rows:
         return _paint(_DIM, "No Claude Code sessions tracked yet.", enabled)
+    account_dirs = config.claude_config_dirs()  # resolved once; drives the home-icon marker
     out: list[str] = []
     counts: dict[Status, int] = {}
     for row in rows:
         counts[row.status] = counts.get(row.status, 0) + 1
-        out.extend(_render_row(row, enabled, warn_days, aim_threshold))
+        out.extend(_render_row(row, enabled, warn_days, aim_threshold, account_dirs))
     summary = "  ".join(
         _paint(_STATUS_COLOR.get(st, _DIM), f"{STATUS_ICON.get(st, '?')} {st.value}:{n}", enabled)
         for st, n in sorted(counts.items(), key=lambda kv: kv[0].value)

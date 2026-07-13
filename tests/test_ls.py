@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
+from command_center import accounts
 from command_center.core import Row
 from command_center.models import Session, Status
 from command_center.views import ls as ls_view
@@ -40,6 +42,25 @@ def test_render_row_unscored_aim_not_red() -> None:
 
 
 _DEP = "abcd1234-1234-5678-9abc-def012345678"
+
+
+def test_render_row_home_icon_marks_private_account() -> None:
+    """Multi-account: a private-account row carries the 🏠 marker; a work row gets a blank."""
+    dirs = {"private": Path("/home/u/.claude"), "work": Path("/home/u/.claude-work")}
+    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    work = Session(session_id="w", cwd="/repo", aim="x", config_dir="/home/u/.claude-work")
+    line_priv = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
+    line_work = ls_view._render_row(Row(work, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
+    assert accounts._HOME_GLYPH in line_priv
+    assert "🏠" not in line_work  # the work row gets the equal-width blank, not the glyph
+
+
+def test_render_row_no_home_icon_in_single_account() -> None:
+    """Single account: no marker at all (it would sit on every row and mean nothing)."""
+    dirs = {"private": Path("/home/u/.claude")}
+    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    line = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
+    assert "🏠" not in line
 
 
 def test_render_row_hoisted_marker_prefix() -> None:
