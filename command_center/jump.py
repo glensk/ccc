@@ -13,16 +13,46 @@ where you are when you fire it:
 So tapping ``f+j`` repeatedly flips between the command center and the tab you came
 from. The TUI itself is located by the bare ``ccc`` process's controlling tty
 (title-independent); coordination with the live TUI goes through :mod:`jumpstate`.
+
+Two paths do this:
+
+- **Fast path** (a live TUI is running) — ``ccc jump`` only writes the toggle *verb*
+  (:func:`jumpstate.request_toggle`) and returns (~80 ms). The resident TUI, which
+  holds a warm iTerm2 API link (see :mod:`iterm_api`), decides context and focuses
+  in-process — no ps scan, no osascript walk here.
+- **Slow path** (no TUI, or ``--no-toggle``) — this process does the whole toggle
+  itself: ``ps`` to find the ccc tty, then AppleScript to read the focused session and
+  focus the target tab (~1 s). It must keep working with no TUI at all.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 
 from . import accounts, config, jumpstate, terminal
 from .store import Store
+
+
+def _pid_alive(pid: int) -> bool:
+    """True if a process with *pid* exists (signal 0 probe).
+
+    A local copy of adapters.claude's private helper — the fast path only needs to
+    know the recorded TUI pid is still around before handing it the toggle.
+    """
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another user
+    except OSError:
+        return False
+    return True
 
 
 def find_ccc_tty() -> str | None:
@@ -116,6 +146,15 @@ def _focus_ccc(ccc_tty: str | None, no_launch: bool) -> int:
 
 def run(args: argparse.Namespace) -> int:
     """Toggle between the ccc TUI and the focused session's tab (see module docstring)."""
+    # Fast path: a live TUI owns the whole toggle (warm iTerm2 API link — see
+    # iterm_api). This process then only writes the request verb (~80 ms total)
+    # instead of paying ps + 2-3 osascript walks (~1 s). --no-toggle keeps the
+    # old direct path (it must work with no TUI at all).
+    if not getattr(args, "no_toggle", False):
+        ident = jumpstate.get_tui()
+        if ident is not None and _pid_alive(ident[0]):
+            jumpstate.request_toggle()
+            return 0
     ccc_tty = find_ccc_tty()
     # Context-aware toggle only when the user is actually looking at iTerm.
     if not getattr(args, "no_toggle", False) and terminal.is_iterm_frontmost():

@@ -12,6 +12,10 @@ dependencies = [
     # (macOS only); imported lazily so non-GUI commands never pay the AppKit cost.
     "pyobjc-framework-Cocoa>=10; sys_platform == 'darwin'",
     "pyyaml>=6.0.3",
+    # Warm iTerm2 Python-API link for the live TUI's f+j jump (see command_center.
+    # iterm_api): sub-ms focus/lookup vs the ~620 ms AppleScript window walk. Imported
+    # lazily inside methods so the package stays optional (non-mac / no API server).
+    "iterm2>=2.20",
 ]
 
 [project.optional-dependencies]

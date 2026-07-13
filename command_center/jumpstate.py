@@ -1,6 +1,6 @@
 """Cross-process UI state for the ``f+j`` toggle between the ccc TUI and session tabs.
 
-Two one-way signals coordinate the live TUI with out-of-process ``ccc jump`` runs
+Four one-way signals coordinate the live TUI with out-of-process ``ccc jump`` runs
 (fired by the global Karabiner chord). Each is a single tiny file under
 :func:`config.app_home` — separate files, so the TUI's writes and ``ccc jump``'s
 writes never race on a shared blob:
@@ -11,6 +11,12 @@ writes never race on a shared blob:
 - **request** (``jump_request``) — a session id ``ccc jump`` asks the TUI to move its
   cursor to, when run from a *session* tab (focus ccc + select that session's row).
   The TUI consumes (clears) it once it has moved the cursor there.
+- **tui** (``jump_tui``) — the live TUI's identity (``pid|iterm_session_id``), written
+  on mount. It lets ``ccc jump`` hand the *whole* toggle to a live TUI (the fast path:
+  the TUI owns a warm iTerm2 API link, so it decides context and focuses in-process)
+  instead of paying its own ps + osascript walks.
+- **toggle** (``jump_toggle``) — the request verb for that fast path: ``ccc jump`` just
+  writes it and returns; the TUI's fast poll consumes it and runs the toggle itself.
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from . import config
 
 _SELECTED = "jump_selected"
 _REQUEST = "jump_request"
+_TUI = "jump_tui"
+_TOGGLE = "jump_toggle"
 
 
 def _read(name: str) -> str | None:
@@ -64,3 +72,40 @@ def peek_request() -> str | None:
 def clear_request() -> None:
     """Drop the pending cursor-move request (the TUI calls this once it has acted)."""
     _write(_REQUEST, None)
+
+
+def set_tui(pid: int, iterm_session_id: str) -> None:
+    """Publish the live TUI's identity (``pid|iterm_session_id``) — TUI → ``ccc jump``."""
+    _write(_TUI, f"{pid}|{iterm_session_id}")
+
+
+def get_tui() -> tuple[int, str] | None:
+    """The live TUI's ``(pid, iterm_session_id)``, or None on missing/garbage."""
+    raw = _read(_TUI)
+    if not raw:
+        return None
+    pid_str, _, iterm_session_id = raw.partition("|")
+    try:
+        return int(pid_str), iterm_session_id
+    except ValueError:
+        return None
+
+
+def clear_tui() -> None:
+    """Drop the TUI identity (on unmount) so ``ccc jump`` stops using the fast path."""
+    _write(_TUI, None)
+
+
+def request_toggle() -> None:
+    """Ask the live TUI to run the whole f+j toggle itself (``ccc jump`` → TUI)."""
+    _write(_TOGGLE, "1")
+
+
+def peek_toggle() -> bool:
+    """True if a toggle is pending (does not clear it)."""
+    return _read(_TOGGLE) is not None
+
+
+def clear_toggle() -> None:
+    """Drop the pending toggle (the TUI calls this once it has consumed it)."""
+    _write(_TOGGLE, None)
