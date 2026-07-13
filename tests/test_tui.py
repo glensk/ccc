@@ -12,6 +12,7 @@ import pytest
 from rich.text import Text
 from textual.widgets import Label, ListView
 
+from command_center import accounts
 from command_center.store import Store
 
 # Generic repo-tree root for the category-grouping fixtures (no personal anchors).
@@ -1605,8 +1606,6 @@ def test_inline_edit_account_select_saves_config_dir(
 
     asyncio.run(scenario())
 
-    from command_center import accounts
-
     store = Store(tmp_path / "command-center" / "state.db")
     saved = store.get(draft_sid)
     store.close()
@@ -1615,6 +1614,90 @@ def test_inline_edit_account_select_saves_config_dir(
     # The guard _commit_edit relies on: an unknown label maps to "" → no write.
     assert accounts.account_config_dir("work") == str(work)
     assert accounts.account_config_dir("nosuch") == ""
+
+
+def test_tp_tw_switch_account_on_draft_and_guard_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`tw`/`tp` flip a FUTURE job's account freely; a PARKED session is re-stamped only
+    when its transcript lives under the target account — else the switch is refused."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    work = tmp_path / "work"
+    work.mkdir()
+    from command_center import config as _config
+
+    dirs = {"private": tmp_path, "work": work}
+    monkeypatch.setattr(_config, "claude_config_dirs", lambda: dict(dirs))
+
+    draft_sid = "draft-acct-chord"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # config_dir = private
+    store.ensure("parked-acct", cwd="/Users/x/parked")
+    store.update_fields("parked-acct", config_dir=str(tmp_path))  # ran under private, no work tx
+    store.close()
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.cfg.aim_score_on_set = False
+            app._current = draft_sid
+            app.action_account_work()  # draft: never ran → flips freely
+            await pilot.pause()
+            app._current = "parked-acct"
+            app.action_account_work()  # parked, no work transcript → refused, left unchanged
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    draft = store.get(draft_sid)
+    parked = store.get("parked-acct")
+    store.close()
+    assert draft is not None and accounts.same_config_dir(draft.config_dir, str(work))
+    assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
+
+
+def test_tp_switches_parked_when_transcript_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PARKED session IS re-stamped to the target account when its transcript lives there."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    work = tmp_path / "work"
+    work.mkdir()
+    from command_center import config as _config
+
+    dirs = {"private": tmp_path, "work": work}
+    monkeypatch.setattr(_config, "claude_config_dirs", lambda: dict(dirs))
+
+    cwd = "/Users/x/parked2"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("parked-tx", cwd=cwd)
+    store.update_fields("parked-tx", config_dir=str(work))  # last ran under work
+    store.close()
+    # A transcript for it exists under the PRIVATE account → tp may re-stamp to private.
+    tx = tmp_path / "projects" / cwd.replace("/", "-") / "parked-tx.jsonl"
+    tx.parent.mkdir(parents=True)
+    tx.write_text('{"type":"x"}\n', encoding="utf-8")
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._current = "parked-tx"
+            app.action_account_private()  # transcript is under private → allowed
+            await pilot.pause()
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    parked = store.get("parked-tx")
+    store.close()
+    assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
 
 
 def test_account_row_hidden_in_single_account_mode(

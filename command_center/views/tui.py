@@ -1763,6 +1763,8 @@ class CommandCenterApp(App[None]):
         self.sub_title = "Claude Command Center" if self.cfg.tab_title else ""
         self._current: str | None = None
         self._rows: dict[str, Row] = {}
+        # Account map cached per render tick (see _apply_rows) → the model column's home marker.
+        self._account_dirs: dict[str, Path] = {}
         self._sep_seq = 0  # monotonic counter giving each header/separator row a unique key
         # Last time we spawned a detached `ccc claude-usage` warmer (monotonic seconds); an
         # in-process throttle so a failing OAuth fetch can't respawn on every render tick.
@@ -1928,6 +1930,9 @@ class CommandCenterApp(App[None]):
         table = self.query_one("#sessions", DataTable)
         previous = self._current
         table.clear()
+        # Resolve the account map once per render — drives the model column's home-icon
+        # marker (see _add_session_row). One cheap read per tick, like the detail pane.
+        self._account_dirs = config.claude_config_dirs()
         self._rows = {r.session.session_id: r for r in rows}
         self._sep_seq = 0
         self._sep_category = {}
@@ -2312,14 +2317,17 @@ class CommandCenterApp(App[None]):
             sid = _draft_id_cell(session)
         else:
             sid = Text("  " + short_id(session.session_id), style=_DONE_STYLE if done else "grey50")
+        # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
+        # only); every other row gets an equal-width blank so the model text stays aligned.
+        home = accounts.home_marker(session.config_dir or "", self._account_dirs)
         if session.draft:
             # Future job: it never ran, so show the CONFIGURED overseer ▸ executor model
             # pair (colour-coded, single name when they match) instead of an observed "—".
-            model_cell = _models_cell(session)
+            model_cell = _models_cell(session, prefix="  " + home)
         else:
             # OBSERVED model·effort the session ran on.
             model_cell = Text(
-                "  " + model_effort_cell(session.model, session.effort),
+                "  " + home + model_effort_cell(session.model, session.effort),
                 style=_DONE_STYLE if done else "grey50",
             )
         low_score = low_aim_score(session.aim, session.aim_score, self.cfg.aim_score_threshold)
@@ -2964,6 +2972,75 @@ class CommandCenterApp(App[None]):
             return
         store.update_fields(sid, importance=(session.importance + 1) % 4)
         self.refresh_data()
+
+    def _transcript_under(self, cwd: str, session_id: str, account_dir: Path) -> bool:
+        """True if *session_id*'s transcript lives specifically under *account_dir*.
+
+        Mirrors ClaudeAdapter's layout (``<account>/projects/<cwd-slashes-as-dashes>/<id>.jsonl``)
+        but pinned to ONE account — the public ``transcript_path`` searches EVERY account
+        (the D14 fallback), which would defeat the "is it under the TARGET account?" guard
+        the ``tp``/``tw`` switch needs for a parked session.
+        """
+        projects = Path(account_dir) / "projects"
+        if (projects / cwd.replace("/", "-") / f"{session_id}.jsonl").exists():
+            return True
+        try:
+            return any(projects.glob(f"*/{session_id}.jsonl"))
+        except OSError:
+            return False
+
+    def _set_account(self, label: str) -> None:
+        """Set the highlighted row's Claude account to *label* — the `tp`/`tw` chords.
+
+        Flips a FUTURE job (draft) freely (it never ran); re-stamps a PARKED session only
+        when its transcript already lives under the target account (else resume would find
+        nothing); refuses a LIVE session (it already bills the account its process runs
+        under); a no-op with a single account configured.
+        """
+        if not (sid := self._current) or (store := self.store) is None:
+            return
+        dirs = config.claude_config_dirs()
+        if len(dirs) <= 1:
+            self.notify("Only one Claude account is configured — nothing to switch.")
+            return
+        target = dirs.get(label)
+        if target is None:
+            self.notify(f"No Claude account labelled {label!r} is configured.", severity="warning")
+            return
+        session = store.get(sid)
+        if session is None:
+            return
+        if session.config_dir and accounts.same_config_dir(str(target), session.config_dir):
+            self.notify(f"Already billing the {label} account.")
+            return
+        row = self._rows.get(sid)
+        if row is not None and row.is_open:
+            self.notify(
+                "That session is live — it already bills the account its process runs "
+                "under; close it (c) first to change the account.",
+                severity="warning",
+            )
+            return
+        if not session.draft and not self._transcript_under(session.cwd, sid, target):
+            # A parked/finished session's conversation is account-bound: re-stamping to an
+            # account that holds no transcript would only make resume find nothing.
+            self.notify(
+                f"Can't switch to {label}: this session's conversation isn't stored under "
+                "that account (resuming there would find nothing).",
+                severity="warning",
+            )
+            return
+        store.update_fields(sid, config_dir=str(target))
+        self.refresh_data()
+        self.notify(f"Account set to {label}.")
+
+    def action_account_private(self) -> None:
+        """Bill the highlighted row under the private (cpriv) account — the `tp` chord."""
+        self._set_account("private")
+
+    def action_account_work(self) -> None:
+        """Bill the highlighted row under the work account — the `tw` chord."""
+        self._set_account("work")
 
     def action_toggle_subgoal(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
