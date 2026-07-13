@@ -58,6 +58,13 @@ _BG_SHELL_SIGNATURE = "shell-snapshots/snapshot-"
 # ``models.EFFORT_LEVELS`` by the caller.
 _EFFORT_ARG_RE = re.compile(r"--effort(?:=|\s+)(\S+)")
 
+# Seconds a "no transcript found" resolution is trusted before the glob fallback
+# re-runs. A found path is cached indefinitely (transcripts never move) but
+# revalidated with a cheap exists() on every hit; the exact-munged-path probe
+# still runs on every negative hit, so a brand-new transcript in its canonical
+# location is picked up instantly — only cross-account glob DISCOVERY is delayed.
+_TRANSCRIPT_NEG_TTL = 60.0
+
 
 def _same_dir(a: Path, b: Path) -> bool:
     """True if paths *a* and *b* point at the same directory (resolve-tolerant)."""
@@ -377,6 +384,10 @@ class ClaudeAdapter:
             self.home = Path(claude_home)
         self.sessions_dir = self.home / "sessions"
         self.projects_dir = self.home / "projects"
+        # Per-session-id transcript resolution cache (see ``transcript_path``): a
+        # found Path is trusted (revalidated with exists()), a None is trusted for
+        # ``_TRANSCRIPT_NEG_TTL`` seconds. Instance-level so a fresh adapter starts clean.
+        self._transcript_cache: dict[str, tuple[Path | None, float]] = {}
 
     def discover(self) -> list[LiveSession]:
         """Every live session across ALL configured account registries (D0/D9).
@@ -455,16 +466,45 @@ class ClaudeAdapter:
         when known. This makes D0's shared-store symlink an optimisation rather than a
         correctness precondition: a transcript resolves even if the trees were never
         shared. ``None`` when no account holds it.
+
+        Resolution is memoized per session id (ids are unique UUIDs, so the found
+        transcript is THE session's transcript regardless of cwd spelling or account
+        ordering — the cross-account glob is the TUI-refresh hot path). A positive hit
+        is revalidated with a cheap ``exists()`` (a deleted transcript triggers full
+        re-resolution); a negative result is trusted for ``_TRANSCRIPT_NEG_TTL`` seconds
+        with the exact-munged-path probe still live, so a new transcript in its canonical
+        location lands instantly — only cross-account glob DISCOVERY is delayed. The
+        plain-dict cache is safe under the GIL for the TUI's worker-thread use: a race
+        only causes redundant re-resolution, never a wrong answer.
         """
         encoded = cwd.replace("/", "-")
+        cached = self._transcript_cache.get(session_id)
+        if cached is not None:
+            path, stamp = cached
+            if path is not None:
+                if path.exists():
+                    return path
+                self._transcript_cache.pop(session_id, None)  # deleted → full re-resolve below
+            elif time.monotonic() - stamp < _TRANSCRIPT_NEG_TTL:
+                # cheap exact-path probes only; skip the expensive glob during the TTL
+                for projects_dir in self._ordered_projects_dirs(config_dir):
+                    candidate = projects_dir / encoded / f"{session_id}.jsonl"
+                    if candidate.exists():
+                        self._transcript_cache[session_id] = (candidate, time.monotonic())
+                        return candidate
+                return None
+        resolved = None
         for projects_dir in self._ordered_projects_dirs(config_dir):
             candidate = projects_dir / encoded / f"{session_id}.jsonl"
             if candidate.exists():
-                return candidate
+                resolved = candidate
+                break
             hits = list(projects_dir.glob(f"*/{session_id}.jsonl"))
             if hits:
-                return hits[0]
-        return None
+                resolved = hits[0]
+                break
+        self._transcript_cache[session_id] = (resolved, time.monotonic())
+        return resolved
 
     def all_user_prompts_in_file(self, path: Path) -> list[str]:
         """Every human-typed prompt in transcript *path*, oldest first (cleaned).

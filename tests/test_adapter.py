@@ -69,6 +69,73 @@ def test_transcript_path_glob_fallback(tmp_path: Path) -> None:
     assert adapter.transcript_path("/does/not/match", "sid") == target
 
 
+def test_transcript_path_caches_glob_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    target = tmp_path / "projects" / "weird-encoding" / "sid.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}\n", encoding="utf-8")
+
+    # First resolution walks the glob fallback and memoizes the hit.
+    assert adapter.transcript_path("/does/not/match", "sid") == target
+
+    # A second resolution must be served from the cache: any glob call now fails loudly.
+    def _no_glob(self: Path, pattern: str) -> list[Path]:
+        raise AssertionError(f"glob should not run on a cache hit: {pattern}")
+
+    monkeypatch.setattr(Path, "glob", _no_glob)
+    assert adapter.transcript_path("/does/not/match", "sid") == target
+
+
+def test_transcript_path_positive_cache_revalidates(tmp_path: Path) -> None:
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    encoded = "-repo"
+    target = tmp_path / "projects" / encoded / "sid.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}\n", encoding="utf-8")
+
+    assert adapter.transcript_path("/repo", "sid") == target
+
+    # Deleting the file must invalidate the positive cache: the stale path is never
+    # returned; with nothing left to find, resolution falls back to None.
+    target.unlink()
+    assert adapter.transcript_path("/repo", "sid") is None
+
+
+def test_transcript_path_negative_ttl_exact_probe_still_lands(tmp_path: Path) -> None:
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    # Missing transcript → None, negatively cached.
+    assert adapter.transcript_path("/repo", "sid") is None
+
+    # Creating it at the EXACT munged path must be found despite the negative cache:
+    # the exact-path probe stays live during the TTL, only the glob is skipped.
+    target = tmp_path / "projects" / "-repo" / "sid.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}\n", encoding="utf-8")
+    assert adapter.transcript_path("/repo", "sid") == target
+
+
+def test_transcript_path_negative_ttl_delays_glob_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from command_center.adapters import claude as claude_mod
+
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    # Missing transcript → None, negatively cached.
+    assert adapter.transcript_path("/does/not/match", "sid") is None
+
+    # A glob-only location is NOT discovered while the negative cache is trusted.
+    target = tmp_path / "projects" / "weird-encoding" / "sid.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}\n", encoding="utf-8")
+    assert adapter.transcript_path("/does/not/match", "sid") is None
+
+    # Expiring the TTL re-enables glob discovery.
+    monkeypatch.setattr(claude_mod, "_TRANSCRIPT_NEG_TTL", 0.0)
+    assert adapter.transcript_path("/does/not/match", "sid") == target
+
+
 def test_is_oneshot_headless(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(claude_home=tmp_path)
     proj = tmp_path / "projects" / "-repo"

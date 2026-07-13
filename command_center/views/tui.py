@@ -52,6 +52,7 @@ from textual.widgets import (
     Static,
     TextArea,
 )
+from textual.worker import get_current_worker
 
 from .. import (
     accounts,
@@ -1846,22 +1847,51 @@ class CommandCenterApp(App[None]):
 
     # ---- data -----------------------------------------------------------
     def refresh_data(self) -> None:
+        """Schedule an off-loop rebuild of the session rows (coalesced).
+
+        build_rows() (reconcile + transcript scans) can take hundreds of ms, so it
+        runs in a thread worker; the widget updates land back on the UI thread via
+        _apply_rows. exclusive=True coalesces bursts: a newer refresh cancels the
+        pending one, whose stale rows are then discarded (see _refresh_worker).
+        """
         if self._editing:
             return
-        assert self.store is not None
-        table = self.query_one("#sessions", DataTable)
-        previous = self._current
-        table.clear()
+        self.run_worker(
+            self._refresh_worker,
+            thread=True,
+            exclusive=True,
+            group="data-refresh",
+            description="rebuild session rows",
+        )
+
+    def _refresh_worker(self) -> None:
+        # Worker thread. self.store is safe here: check_same_thread=False and the
+        # sqlite3 module is compiled serialized (threadsafety 3); busy_timeout covers
+        # cross-process writers.
+        if (store := self.store) is None:
+            return
         rows = build_rows(
-            self.store,
+            store,
             self.adapter,
             include_done=self._show_finished,
             done_max_age_days=self.cfg.done_max_age_days,
             folder_order=tuple(self.cfg.folder_order),
             include_future=self._show_future,
         )
+        self._sync_tab_badges(rows)  # AppleScript spawn — belongs off-loop too
+        if get_current_worker().is_cancelled:
+            return  # superseded by a newer refresh — let that one repaint
+        self.call_from_thread(self._apply_rows, rows)
+
+    def _apply_rows(self, rows: list[Row]) -> None:
+        # UI thread: everything the old refresh_data did AFTER build_rows, minus
+        # _sync_tab_badges (now done in the worker).
+        if self._editing:  # edit mode opened while the worker ran — don't clobber it
+            return
+        table = self.query_one("#sessions", DataTable)
+        previous = self._current
+        table.clear()
         self._rows = {r.session.session_id: r for r in rows}
-        self._sync_tab_badges(rows)
         self._sep_seq = 0
         self._sep_category = {}
         self._rule_seps = {}
@@ -2663,19 +2693,21 @@ class CommandCenterApp(App[None]):
         # and the whole tab if Claude was the only pane (the single process) in it.
         # A done session keeps DONE (never demoted to PARKED) so closing it sinks
         # the row to the FINISHED section instead of leaving it in the active list.
-        closed = self._signal_and_close_pane(session, close_pane=was_live)
         store.update_fields(sid, status=Status.DONE.value if session.done else Status.PARKED.value)
         label = colors.short_folder(session.cwd)
         verb = "Finished" if session.done else "Parked"
-        if closed == "tab":
-            self.notify(f"{verb} and closed tab: {label}")
-        elif closed == "session":
-            self.notify(f"{verb} and closed pane: {label}")
-        elif session.done:
-            self.notify("Session closed (done — moved to FINISHED).")
-        else:
-            self.notify("Session parked (process signalled; resume by id).")
-        self.refresh_data()
+        self.refresh_data()  # the status flip repaints immediately
+        # SIGTERM + the osascript pane close (walks all iTerm windows) is slow — run it
+        # off-loop. NON-exclusive and NOT the data-refresh group: two different sessions'
+        # closes must never cancel each other.
+        self.run_worker(
+            lambda: self._close_worker(
+                session, close_pane=was_live, label=label, verb=verb, done=session.done
+            ),
+            thread=True,
+            group="close-pane",
+            description=f"close pane {label}",
+        )
 
     def action_mark_done(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
@@ -2702,12 +2734,14 @@ class CommandCenterApp(App[None]):
             if session.future_file:
                 futuresync.archive_file(store, self.cfg, session, "archived")
             store.update_fields(sid, archived=True)
-        self.refresh_data()
         # The done flag lands in the store immediately; the session's own status line
         # (`ccc statusline`) reads it and shows "done" on its next render. Marking done
-        # on a *live* session also offers to close its tab/pane (never on un-done).
+        # on a *live* session also offers to close its tab/pane (never on un-done) —
+        # pushed here, before refresh_data, so the confirm dialog appears synchronously
+        # in the keypress rather than waiting out the off-loop row rebuild.
         if new and was_live:
             self._confirm_close_after_done(sid)
+        self.refresh_data()
 
     def _confirm_close_after_done(self, sid: str) -> None:
         """Ask whether to close the just-finished live session's tab/pane."""
@@ -2745,10 +2779,43 @@ class CommandCenterApp(App[None]):
             return terminal.close_iterm_session(session.iterm_session_id)
         return ""
 
+    def _close_worker(
+        self, session: Session, *, close_pane: bool, label: str, verb: str, done: bool
+    ) -> None:
+        # Worker thread: SIGTERM + the osascript pane close (slow — walks iTerm windows).
+        closed = self._signal_and_close_pane(session, close_pane=close_pane)
+        self.call_from_thread(self._notify_closed, closed, label, verb, done)
+
+    def _notify_closed(self, closed: str, label: str, verb: str, done: bool) -> None:
+        # UI thread: report what the park closed (action_close's Parked/Finished verb).
+        if closed == "tab":
+            self.notify(f"{verb} and closed tab: {label}")
+        elif closed == "session":
+            self.notify(f"{verb} and closed pane: {label}")
+        elif done:
+            self.notify("Session closed (done — moved to FINISHED).")
+        else:
+            self.notify("Session parked (process signalled; resume by id).")
+        self.refresh_data()  # liveness changed once the pane is gone — repaint
+
     def _close_live_session(self, session: Session) -> None:
-        """SIGTERM the session's process, then close its iTerm pane/tab."""
-        closed = self._signal_and_close_pane(session, close_pane=True)
+        """SIGTERM the session's process, then close its iTerm pane/tab (off-loop)."""
         label = colors.short_folder(session.cwd)
+        # Same off-loop treatment as action_close: the osascript pane close is slow.
+        self.run_worker(
+            lambda: self._close_live_worker(session, label),
+            thread=True,
+            group="close-pane",
+            description=f"close pane {label}",
+        )
+
+    def _close_live_worker(self, session: Session, label: str) -> None:
+        # Worker thread (see _close_worker): the pane close walks every iTerm window.
+        closed = self._signal_and_close_pane(session, close_pane=True)
+        self.call_from_thread(self._notify_live_closed, closed, label)
+
+    def _notify_live_closed(self, closed: str, label: str) -> None:
+        # UI thread: the mark-done confirm's plain close wording, then repaint.
         if closed == "tab":
             self.notify(f"Closed tab: {label}")
         elif closed == "session":
@@ -2758,7 +2825,7 @@ class CommandCenterApp(App[None]):
                 "Process signalled; couldn't locate its iTerm tab to close.",
                 severity="warning",
             )
-        self.refresh_data()
+        self.refresh_data()  # liveness changed once the pane is gone — repaint
 
     def action_keep(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:

@@ -18,6 +18,20 @@ from command_center.store import Store
 _BASE = "/repo-root"
 
 
+async def settle(pilot) -> None:
+    """Wait out the app's thread workers (data refresh, pane close), then let the UI apply.
+
+    Refresh is exclusive, so a newer refresh coalesces the pending one to CANCELLED — and
+    a pane-close schedules a follow-up refresh that does exactly that. wait_for_complete
+    would re-raise that benign WorkerCancelled, so poll until the worker set drains
+    instead. call_from_thread blocks the worker until its UI callback returns, so a
+    finished worker has already applied its rows; one final pause flushes the deferrals.
+    """
+    while any(not worker.is_finished for worker in pilot.app.workers):
+        await pilot.pause()
+    await pilot.pause()
+
+
 @pytest.fixture(autouse=True)
 def _color_textual_tests(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run Textual TUI tests with color enabled and category grouping pointed at ``_BASE``."""
@@ -60,7 +74,7 @@ def test_tui_mounts_lists_and_marks_done(tmp_path: Path, monkeypatch: pytest.Mon
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             assert table.row_count >= 1  # the seeded session shows up
 
@@ -106,7 +120,7 @@ def test_table_row_paints_only_low_aim_score_red(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             aim_cell = table.get_row_at(table.get_row_index(sid))[_AIM_COL]
             assert isinstance(aim_cell, Text)
@@ -148,7 +162,7 @@ def test_table_row_shows_codex_badge_and_waiting_reset_status(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             cells = table.get_row_at(table.get_row_index(sid))
             icon = cells[0]
@@ -246,7 +260,7 @@ def test_mark_done_live_offers_close(tmp_path: Path, monkeypatch: pytest.MonkeyP
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app._current = sid
             app.action_mark_done()
             await pilot.pause()
@@ -260,7 +274,7 @@ def test_mark_done_live_offers_close(tmp_path: Path, monkeypatch: pytest.MonkeyP
             assert [b.id for b in buttons] == ["yes"]
             assert "Close" in str(buttons[0].label)
             screen.dismiss(True)  # confirm "close"
-            await pilot.pause()
+            await settle(pilot)
 
     asyncio.run(scenario())
 
@@ -285,7 +299,7 @@ def test_mark_done_parked_no_dialog(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app._current = sid
             app.action_mark_done()
             await pilot.pause()
@@ -322,10 +336,10 @@ def test_close_live_closes_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app._current = sid
             app.action_close()
-            await pilot.pause()
+            await settle(pilot)
 
     asyncio.run(scenario())
 
@@ -358,10 +372,10 @@ def test_close_parked_no_tab_close(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app._current = sid
             app.action_close()
-            await pilot.pause()
+            await settle(pilot)
 
     asyncio.run(scenario())
 
@@ -387,10 +401,10 @@ def test_close_done_session_stays_done(tmp_path: Path, monkeypatch: pytest.Monke
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app._current = sid
             app.action_close()
-            await pilot.pause()
+            await settle(pilot)
 
     asyncio.run(scenario())
 
@@ -435,7 +449,7 @@ def test_row_shows_per_tab_badge_before_folder(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
                 cell = table.get_row_at(i)[3]  # folder column (after icon, !, ver)
@@ -478,7 +492,7 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
                 cell = table.get_row_at(i)[3]  # folder column (after icon, !, ver)
@@ -516,7 +530,7 @@ def test_list_groups_by_category_with_nested_repos(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
                 cell = table.get_row_at(i)[3]  # folder column (after icon, importance, version)
@@ -566,7 +580,7 @@ def test_column_cursor_navigates_columns_and_edits(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(sid))
             table.focus()
@@ -632,7 +646,7 @@ def test_multiline_field_editor(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(sid))
             table.focus()
@@ -697,7 +711,7 @@ def test_fast_row_jump_via_word_keys(tmp_path: Path, monkeypatch: pytest.MonkeyP
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=1)  # row 0 is the "sdsc" category header
             table.focus()
@@ -738,7 +752,7 @@ def test_arrow_keys_wrap_top_and_bottom(tmp_path: Path, monkeypatch: pytest.Monk
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.focus()
             last = table.row_count - 1
@@ -914,19 +928,19 @@ def test_td_chord_toggles_done_sessions(tmp_path: Path, monkeypatch: pytest.Monk
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_finished is False
             assert "done-1" not in app._rows  # finished hidden by default
 
             await pilot.press("t")
             await pilot.press("d")
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_finished is True
             assert "done-1" in app._rows  # shown after td
 
             await pilot.press("t")
             await pilot.press("d")
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_finished is False
             assert "done-1" not in app._rows  # hidden again
 
@@ -952,19 +966,19 @@ def test_tf_chord_toggles_future_jobs(tmp_path: Path, monkeypatch: pytest.Monkey
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_future is True
             assert "job-1" in app._rows  # future jobs shown by default
 
             await pilot.press("t")
             await pilot.press("f")
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_future is False
             assert "job-1" not in app._rows  # hidden after tf
 
             await pilot.press("t")
             await pilot.press("f")
-            await pilot.pause()
+            await settle(pilot)
             assert app._show_future is True
             assert "job-1" in app._rows  # shown again
 
@@ -985,7 +999,7 @@ def test_ah_chord_shows_aim_history(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app._current == "s1"  # the only session is selected
 
             # `ah` chord → the AIM-history modal listing every revision.
@@ -1034,7 +1048,7 @@ def test_sh_chord_shows_subgoal_history(tmp_path: Path, monkeypatch: pytest.Monk
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app._current == "s1"
 
             await pilot.press("s")
@@ -1190,7 +1204,7 @@ def test_oo_chord_opens_future_file_in_obsidian(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             assert app._current == "job-1"
 
             await pilot.press("o")
@@ -1216,7 +1230,7 @@ def test_oo_chord_notifies_when_draft_has_no_future_file(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             notes: list[str] = []
             monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
 
@@ -1271,7 +1285,7 @@ def test_aim_column_stretches_so_progress_is_flush_right(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test(size=(160, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.fit_aim_column()  # deterministic: run the stretch now
             await pilot.pause()
@@ -1298,7 +1312,7 @@ def test_e_opens_inline_edit_form_and_esc_saves(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(sid))
             table.focus()
@@ -1366,7 +1380,7 @@ def test_e_warns_before_saving_blank_aim(tmp_path: Path, monkeypatch: pytest.Mon
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(sid))
@@ -1411,7 +1425,7 @@ def test_inline_edit_prompt_visibility_and_subgoals(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(draft_sid))
@@ -1472,7 +1486,7 @@ def test_draft_next_step_cell_shows_models_readout(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
 
             models_row = table.get_row_at(table.get_row_index("job-models"))
@@ -1512,7 +1526,7 @@ def test_inline_edit_models_selects_save_through_commit(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(draft_sid))
@@ -1571,7 +1585,7 @@ def test_inline_edit_account_select_saves_config_dir(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(draft_sid))
@@ -1618,7 +1632,7 @@ def test_account_row_hidden_in_single_account_mode(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(draft_sid))
@@ -1648,7 +1662,7 @@ def test_click_draft_next_step_cell_opens_model_editor(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(draft_sid))
@@ -1677,7 +1691,7 @@ def test_enter_on_row_resumes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             calls: list[bool] = []
             monkeypatch.setattr(app, "action_resume", lambda: calls.append(True))
             table = app.query_one("#sessions", SessionTable)
@@ -1904,7 +1918,7 @@ def test_marked_codex_ver_cell_width_over_all_status_icons(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.update_detail = lambda: None  # type: ignore[method-assign]  # skip the highlight→detail side-effect
             table = app.query_one("#sessions", SessionTable)
             for status in Status:
@@ -1947,7 +1961,7 @@ def test_edit_depends_row_visible_and_commit_roundtrip(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index("edited"))
@@ -1992,7 +2006,7 @@ def test_hoisted_draft_renders_without_future_separator(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test() as pilot:
-            await pilot.pause()
+            await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             # Directly under the parent: no separator row was inserted between them.
             assert table.get_row_index("child") == table.get_row_index("parent") + 1
@@ -2095,7 +2109,7 @@ def test_edit_mode_focuses_visibly_and_status_head_is_a_tab_stop(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index("focus-draft"))
@@ -2178,7 +2192,7 @@ def test_scheduled_for_edit_field_and_deduped_edit_head(
     async def scenario() -> None:
         app = CommandCenterApp()
         async with app.run_test(size=(120, 40)) as pilot:
-            await pilot.pause()
+            await settle(pilot)
             app.cfg.aim_score_on_set = False
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index("sched-edit"))
