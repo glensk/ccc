@@ -45,14 +45,14 @@ _DEP = "abcd1234-1234-5678-9abc-def012345678"
 
 
 def test_render_row_home_icon_marks_private_account() -> None:
-    """Multi-account: a private-account row carries the 🏠 marker; a work row gets a blank."""
+    """Multi-account: a private-account row carries 🏠, a work-account row carries 💼."""
     dirs = {"private": Path("/home/u/.claude"), "work": Path("/home/u/.claude-work")}
     priv = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
     work = Session(session_id="w", cwd="/repo", aim="x", config_dir="/home/u/.claude-work")
     line_priv = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
     line_work = ls_view._render_row(Row(work, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
-    assert accounts._HOME_GLYPH in line_priv
-    assert "🏠" not in line_work  # the work row gets the equal-width blank, not the glyph
+    assert accounts._HOME_GLYPH in line_priv and "💼" not in line_priv
+    assert accounts._WORK_GLYPH in line_work and "🏠" not in line_work
 
 
 def test_render_row_no_home_icon_in_single_account() -> None:

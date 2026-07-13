@@ -272,21 +272,24 @@ def test_transcript_path_falls_back_to_other_account(two_accounts: dict[str, Pat
 # ---------------------------------------------------------------------------
 # home-icon marker for the model column (private/cpriv rows get 🏠)
 # ---------------------------------------------------------------------------
-def test_is_private_account_matches_only_private(two_accounts: dict[str, Path]) -> None:
-    """Only the resolved `private` dir is private; work and the UNKNOWN sentinel are not."""
+def test_is_private_and_work_account_match_only_their_dir(two_accounts: dict[str, Path]) -> None:
+    """Each predicate matches only its own account dir; the UNKNOWN sentinel matches neither."""
     assert accounts.is_private_account(str(two_accounts["private"])) is True
     assert accounts.is_private_account(str(two_accounts["work"])) is False
+    assert accounts.is_work_account(str(two_accounts["work"])) is True
+    assert accounts.is_work_account(str(two_accounts["private"])) is False
     assert accounts.is_private_account("") is False  # multi-account UNKNOWN → never private
+    assert accounts.is_work_account("") is False
 
 
-def test_home_marker_multi_account_marks_private_only(two_accounts: dict[str, Path]) -> None:
-    """The private row gets the home glyph; every other row gets an equal-width blank."""
+def test_home_marker_multi_account_marks_private_and_work(two_accounts: dict[str, Path]) -> None:
+    """The private row gets 🏠, the work row gets 💼; an UNKNOWN row gets an equal-width blank."""
     priv = accounts.home_marker(str(two_accounts["private"]))
-    assert priv == accounts._HOME_GLYPH
-    assert "🏠" in priv
-    # work + UNKNOWN get the SAME blank filler (so the model column stays aligned).
-    blank = accounts.home_marker(str(two_accounts["work"]))
-    assert accounts.home_marker("") == blank
+    work = accounts.home_marker(str(two_accounts["work"]))
+    assert priv == accounts._HOME_GLYPH and "🏠" in priv
+    assert work == accounts._WORK_GLYPH and "💼" in work
+    # An unattributed (UNKNOWN) row gets blanks only, so the model column stays aligned.
+    blank = accounts.home_marker("")
     assert blank == accounts._NO_HOME
     assert set(blank) == {" "}  # blanks only, no glyph
 

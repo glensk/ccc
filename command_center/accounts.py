@@ -97,14 +97,25 @@ def account_config_dir(label: str) -> str:
     return str(path) if path is not None else ""
 
 
-# The ccc ``model`` column marks every row billing to the ``private`` (cpriv) account
-# with a little home icon. ``_HOME_GLYPH`` is a width-2 colored emoji + a trailing space
-# (3 terminal cells, matching the width-2 badge emoji convention in ``tabsymbol``);
-# ``_NO_HOME`` is the same width in blanks so the model text stays column-aligned on the
-# rows that do NOT get the icon. In single-account mode the marker is empty (every row
-# would carry it, so it would mean nothing).
+# The ccc ``model`` column marks each row with a per-account glyph: 🏠 for the ``private``
+# (cpriv) account, 💼 for the ``work`` (cwork) account. Each is a width-2 colored emoji + a
+# trailing space (3 terminal cells, matching the width-2 badge emoji convention in
+# ``tabsymbol``); ``_NO_HOME`` is the same width in blanks so the model text stays
+# column-aligned on rows for any OTHER (unknown / third) account. In single-account mode the
+# marker is empty (every row would carry it, so it would mean nothing). The statusline
+# (``dotfiles/claude/.claude/statusline-command.sh``) shows the SAME 🏠/💼 after the model —
+# keep the two in sync.
 _HOME_GLYPH = "🏠 "
+_WORK_GLYPH = "💼 "
 _NO_HOME = "   "
+
+
+def _bills_account(config_dir: str, label: str, dirs: dict[str, Path]) -> bool:
+    """True when *config_dir* resolves to the account *label*'s dir (empty ⇒ never)."""
+    if not config_dir:
+        return False
+    target = dirs.get(label)
+    return target is not None and _resolve(config_dir) == _resolve(target)
 
 
 def is_private_account(config_dir: str, dirs: dict[str, Path] | None = None) -> bool:
@@ -115,25 +126,34 @@ def is_private_account(config_dir: str, dirs: dict[str, Path] | None = None) -> 
     or differently-spelled dir still matches. *dirs* is the already-parsed account map
     (pass it to avoid a config-file read per row); ``None`` reads the config.
     """
-    if not config_dir:
-        return False
-    dirs = config.claude_config_dirs() if dirs is None else dirs
-    priv = dirs.get("private")
-    return priv is not None and _resolve(config_dir) == _resolve(priv)
+    return _bills_account(
+        config_dir, "private", config.claude_config_dirs() if dirs is None else dirs
+    )
+
+
+def is_work_account(config_dir: str, dirs: dict[str, Path] | None = None) -> bool:
+    """True when *config_dir* bills to the account labelled ``work`` (cwork). See
+    :func:`is_private_account` for the empty-``config_dir`` / resolution semantics."""
+    return _bills_account(config_dir, "work", config.claude_config_dirs() if dirs is None else dirs)
 
 
 def home_marker(config_dir: str, dirs: dict[str, Path] | None = None) -> str:
-    """A fixed-width home-icon prefix for the ccc ``model`` column (TUI + ``ccc ls``).
+    """A fixed-width per-account glyph for the ccc ``model`` column (TUI + ``ccc ls``).
 
-    Returns ``"🏠 "`` for a row billing to the ``private`` (cpriv) account, an
-    equal-width blank for any other account (so the model text stays aligned), and ``""``
-    in single-account mode (the mark would be on every row and so carries no signal).
-    *dirs* is the already-parsed account map — pass it to avoid a config read per row.
+    Returns ``"🏠 "`` for the ``private`` (cpriv) account, ``"💼 "`` for the ``work``
+    (cwork) account, an equal-width blank for any OTHER account (so the model text stays
+    aligned), and ``""`` in single-account mode (the mark would be on every row and so
+    carries no signal). *dirs* is the already-parsed account map — pass it to avoid a
+    config read per row.
     """
     dirs = config.claude_config_dirs() if dirs is None else dirs
     if len(dirs) <= 1:  # single account → the mark would be on every row → drop it
         return ""
-    return _HOME_GLYPH if is_private_account(config_dir, dirs) else _NO_HOME
+    if is_private_account(config_dir, dirs):
+        return _HOME_GLYPH
+    if is_work_account(config_dir, dirs):
+        return _WORK_GLYPH
+    return _NO_HOME
 
 
 def _export_value(config_dir: str) -> str:

@@ -1211,10 +1211,14 @@ filenames); malformed entries are skipped.
   file's `account` frontmatter + control — all shown **only when more than one
   account is configured**, so single-account setups see nothing new. `ccc jobs` tags
   a non-default account `[<label>]`.
-- **Home-icon marker + the `tp`/`tw` quick switches.** In the **model** column (TUI and
-  `ccc ls`), every row billing to the **`private` (cpriv)** account is prefixed with a
-  little **🏠** — so you can see at a glance which sessions are personal vs work; every
-  other row gets an equal-width blank so the model text stays aligned. The marker only
+- **Per-account glyph + the `tp`/`tw` quick switches.** In the **model** column (TUI and
+  `ccc ls`), each row is prefixed with a little per-account glyph: **🏠** for the
+  **`private` (cpriv)** account, **💼** for the **`work` (cwork)** account — so you can see
+  at a glance which sessions are personal vs work; any other (unknown) account gets an
+  equal-width blank so the model text stays aligned. The same 🏠 / 💼 also appears in the
+  **statusline** right after the model name (`Model: Opus 4.8 🏠 | xhigh | …`) — driven in
+  `dotfiles/claude/.claude/statusline-command.sh` off the session's `CLAUDE_CONFIG_DIR`;
+  keep its glyphs in sync with `accounts._HOME_GLYPH` / `_WORK_GLYPH`. The glyph only
   shows in multi-account mode (with one account it would sit on every row and mean
   nothing). To change a row's account fast, without opening the `e` form: highlight it
   and press **`tp`** (type `t` then `p`) for **private** or **`tw`** for **work**. Both
