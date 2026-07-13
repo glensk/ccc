@@ -150,12 +150,14 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
 
 # How long a leader stays pending before its timeout. A leader with a standalone action
 # (`a` → edit_aim, `s` → settings) stays snappy — the timeout just fires that action — so
-# 350 ms. A *pure* leader (`t`, `f`: no standalone action) only pops an info menu on timeout,
-# so it can afford to wait longer — and it MUST, because a follower keyed under `f` (or `f`
-# itself as a leader) is delayed by Karabiner's vi-mode `f`-simultaneous layer
-# (`basic.simultaneous_threshold_milliseconds`, 500 ms here). 700 ms comfortably beats it so
-# the `tf` / `fn` chords register instead of timing out.
-_CHORD_WINDOW_FALLBACK = 0.35
+# 250 ms (the vi-mode layers that used to withhold follower keys inside iTerm are now
+# Karabiner-scoped OUT of it, so a real follower arrives fast). A *pure* leader (`t`, `f`:
+# no standalone action) only pops an info menu on timeout, so it can afford to wait longer
+# — and it MUST, because `f` itself is still delayed by the global Karabiner `f+j` jump
+# chord (`basic.simultaneous_threshold_milliseconds`, 500 ms here): `f` is delivered on
+# key-UP. 700 ms comfortably beats it so the `tf` / `fn` chords register instead of
+# timing out.
+_CHORD_WINDOW_FALLBACK = 0.25
 _CHORD_WINDOW_PURE = 0.7
 # Min seconds between TUI-spawned `ccc claude-usage` warmers. The Claude OAuth fetch, unlike
 # the Copilot fetch, writes NOTHING on failure (no keychain token ⇒ oauth_fetched_at never
