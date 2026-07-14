@@ -108,10 +108,14 @@ and the provider is pluggable.
 
 A few features that don't fit in a one-liner but are the reason people keep it running:
 
-- **Auto-resume after a rate-limit reset.** When the account hits its session/weekly
-  limit, tracked sessions go `|| halted`. Turn on `resume_halted` and a watcher resumes
-  them automatically the moment the limit clears — staggered across repos, serial within
-  a repo, so nothing thundering-herds and no two resumes edit one checkout at once.
+- **Auto-resume after a rate-limit reset.** When an account hits its session/weekly
+  limit, its tracked sessions go `|| halted`. Turn on `resume_halted` and a watcher
+  resumes them the moment that limit clears — staggered across repos, serial within a
+  repo, so nothing thundering-herds and no two resumes edit one checkout at once. Each
+  account has its **own** reset gate and each session is revived **on the seat it was
+  started from** (a `work` session comes back on `work`), so one account's limit never
+  holds back another's. A halt that ccc will revive shows a green `▶` after the red
+  `||` (`||▶`); a bare `||` means it is stranded until you resume it yourself.
 - **Impartial drift + DONE checkers with published rubrics.** A long-running agent that
   sharpens its own AIM and re-derives its own sub-goals can quietly move the goalposts.
   A **separate** model — never the session agent, fed only the goals and the evidence —

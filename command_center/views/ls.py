@@ -12,12 +12,14 @@ import sys
 import urllib.parse
 from pathlib import Path
 
-from .. import accounts, config, tabsymbol
+from .. import accounts, cachettl, config, resume, tabsymbol
 from ..adapters.base import Adapter
+from ..adapters.claude import ClaudeAdapter
 from ..core import Row, build_rows
 from ..future_files import display_hash, obsidian_uri
 from ..links import folder_link, osc8_link
 from ..models import (
+    HALTED_RESUME_ICON,
     STATUS_ICON,
     Status,
     aim_score_pct,
@@ -51,10 +53,16 @@ _STATUS_COLOR: dict[Status, int] = {
     Status.FAILED: 196,
 }
 _SEVERITY_COLOR = {"green": 35, "amber": 214, "red": 196, "none": 244}
+# Prompt-cache TTL countdown colours (see cachettl). Orange is 208 (#ff8700) to match the
+# TUI's own #ff8700; green/red reuse the palette's clear bright green / severity red.
+_CACHE_COLOR = {"green": 40, "orange": 208, "red": 196}
 _DIM = 240
 _WHITE = 15
 _BLACK = 16
 _BLUE = 39  # the unresolved-drift dot
+# The green ▶ appended to a red || when ccc will auto-revive that halted session on its
+# account's reset. 40 = the WORKING green ("this one runs again by itself").
+_RESUME_GREEN = 40
 _FOLDER_WIDTH = 34
 _OAI_BADGE_FG = 16
 _OAI_BADGE_BG = 15
@@ -103,10 +111,16 @@ def _render_row(
     warn_days: int,
     aim_threshold: int,
     account_dirs: dict[str, Path] | None = None,
+    adapter: Adapter | None = None,
+    resume_armed_ids: frozenset[str] = frozenset(),
 ) -> list[str]:
     session = row.session
     status = row.status
     icon = _paint(_STATUS_COLOR.get(status, _DIM), STATUS_ICON.get(status, "?"), enabled)
+    # A halted session ccc will auto-revive once its account's limit resets gets a green ▶
+    # after the red || (models.HALTED_RESUME_ICON). Bare || = stranded until you resume it.
+    if session.session_id in resume_armed_ids:
+        icon += _paint(_RESUME_GREEN, HALTED_RESUME_ICON, enabled)
 
     display = _truncate_left(_collapse_home(session.cwd or "?"), _FOLDER_WIDTH)
     folder = folder_link(session.cwd or ".", label=display, width=_FOLDER_WIDTH, color=enabled)
@@ -188,7 +202,15 @@ def _render_row(
     # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
     # only); other rows get an equal-width blank so the model text stays aligned.
     home = accounts.home_marker(session.config_dir or "", account_dirs)
-    model_cell = home + _paint(_DIM, model_text, enabled)
+    # Prompt-cache TTL countdown, prepended BEFORE the account glyph: how long this
+    # session's Anthropic prompt cache stays warm (transcript mtime + TTL). Skipped on
+    # drafts (never ran) and done rows, mirroring the statusline's ♨/❄ readout (cachettl).
+    cache_cell = ""
+    if adapter is not None and not session.draft and status is not Status.DONE:
+        cache_text, cache_level = cachettl.countdown_for(adapter, session)
+        if cache_text:
+            cache_cell = _paint(_CACHE_COLOR[cache_level], cache_text, enabled) + " "
+    model_cell = cache_cell + home + _paint(_DIM, model_text, enabled)
     line1 = (
         f"{icon} {sid}  {ver}  {badge_cell}{folder}  {bar_cell}  "
         f"{age}{badge}  {model_cell}  {aim}{dot}"
@@ -255,11 +277,25 @@ def render(
     if not rows:
         return _paint(_DIM, "No Claude Code sessions tracked yet.", enabled)
     account_dirs = config.claude_config_dirs()  # resolved once; drives the home-icon marker
+    # Which halted rows will auto-revive on their account's reset (green ▶ after the red ||).
+    # Evaluated ONLY for halted rows — it stats a transcript — and the config is read once.
+    armed: set[str] = set()
+    halted = [r for r in rows if r.status is Status.HALTED]
+    if halted and isinstance(adapter, ClaudeAdapter):
+        cfg = config.load_config()
+        armed = {
+            r.session.session_id for r in halted if resume.will_auto_resume(r.session, adapter, cfg)
+        }
+    resume_armed_ids = frozenset(armed)
     out: list[str] = []
     counts: dict[Status, int] = {}
     for row in rows:
         counts[row.status] = counts.get(row.status, 0) + 1
-        out.extend(_render_row(row, enabled, warn_days, aim_threshold, account_dirs))
+        out.extend(
+            _render_row(
+                row, enabled, warn_days, aim_threshold, account_dirs, adapter, resume_armed_ids
+            )
+        )
     summary = "  ".join(
         _paint(_STATUS_COLOR.get(st, _DIM), f"{STATUS_ICON.get(st, '?')} {st.value}:{n}", enabled)
         for st, n in sorted(counts.items(), key=lambda kv: kv[0].value)

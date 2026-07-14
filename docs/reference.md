@@ -245,7 +245,7 @@ session **successfully** resumes past the limit (a non-error assistant turn land
 Detection reads the transcript tail and keys on the **last *assistant* record** being a
 genuine API-error: a queued "continue", a background task-notification, or any other
 trailing *user* record arriving while still rate-limited does **not** clear it — otherwise
-the indicator would flip-flop between the red `||` and a green `▶` during the wait, with no
+the indicator would flip-flop between `halted` and `working` during the wait, with no
 work actually happening. A prompt that merely *quotes* the phrase never trips it. A
 Codex-workflow session waiting on an exhausted OpenAI Codex usage window shows `😴`
 instead; it is lower-precedence than active/waiting/halted states and lower than
@@ -861,15 +861,20 @@ on. `ccc doctor`'s Daemon section is platform-aware. See
 
 ### Auto-resume rate-limit-halted sessions
 
-When the shared Claude account hits its session/rate limit, tracked sessions
-stall (`||` **halted** — the last turn was a `You've hit your … limit` error).
+When a Claude account hits its session/rate limit, its tracked sessions stall
+(`||` **halted** — the last turn was a `You've hit your … limit` error).
 With `resume_halted` on (**off by default** — fresh-install inert; enable it to use this),
 the daemon spawns a singleton watcher (`ccc resume-halted --watch`) that resumes them
 **automatically once the limit resets**, via `claude-session-continue.py`:
 
-- **Reset is detected once, explicitly** — a single headless
-  `claude-session-continue.py --wait-only` reuses the script's probe/verify and
-  signals the watcher; resumes only fire after the limit is confirmed clear.
+- **Reset is detected explicitly, per account** — each account with queued work gets
+  its own headless `claude-session-continue.py --wait-only` detector, spawned with that
+  account's `CLAUDE_CONFIG_DIR` pinned, so it probes the rate-limit window of the very
+  seat it gates. Resumes only fire after **that** account's limit is confirmed clear.
+- **Each session is revived on the account it was started from** — a `work` session
+  comes back on `work`, a `private` one on `private` (the stored `config_dir` is
+  prefixed onto the resume command). A `work` halt never gates a `private` resume,
+  and vice versa: the two windows are independent.
 - **Staggered across repos** — at most one resume every `resume_stagger_sec`
   (default 120 s), so a backlog doesn't thundering-herd the moment the window opens.
 - **Serial within a repo** — one resume in flight per git repo; the next in that
@@ -880,6 +885,11 @@ A still-open halted REPL is SIGTERM'd (at its freshly-resolved pid) and relaunch
 in a new tab; a resume that re-hits the limit just re-halts and is requeued
 (bounded by `resume_max_attempts`, default 3). Inspect without acting:
 `ccc resume-halted --dry-run`. Disable with `resume_halted = false`.
+
+The one thing auto-resume still **refuses** is a session whose account it cannot
+identify (no stamped `config_dir` while several accounts are configured): reviving it
+would probe and bill an arbitrary seat, so it is skipped rather than guessed. Such a
+row shows a bare `||` (no `▶`) — see the status-icon table below.
 
 ### List order
 
@@ -908,13 +918,27 @@ forces every `Status` to carry an icon and a help line):
 |:----:|-----------------|------------------------------------------|
 | `▶`  | `working`       | live — the agent is busy right now       |
 | `⏸`  | `waiting_input` | live — paused, waiting for your input     |
-| `\|\|` | `halted`        | live — stopped on a Claude rate limit    |
+| `\|\|▶` | `halted`     | live — rate-limit halt; **auto-resumes** when that account's limit resets |
+| `\|\|` | `halted`        | live — rate-limit halt; **nothing will revive it** (resume it yourself with `r`) |
 | `😴` | `waiting_codex` | live — idle, waiting for Codex quota reset |
 | `●`  | `idle`          | live — open tab, idle this moment         |
 | `💤` | `snoozed`       | live — idle, waiting on a background task |
 | `☾`  | `parked`        | closed — process gone; resume with `r`    |
 | `✓`  | `done`          | AIM marked achieved (done)                |
 | `✗`  | `failed`        | ended in failure                          |
+
+**The `||▶` two-tone halt icon.** A rate-limit halt is painted **red `||`**. When ccc will
+bring that session back by itself — once **its own** account's limit resets — a **green `▶`**
+is appended, so the red/green pair answers "do I need to do anything?" at a glance:
+
+- **`||▶`** — leave it. The reset will revive it on the account it was started from.
+- **`||`** — **stranded**: nothing will resume it but you (`r`).
+
+The `▶` is per-session, not decoration: it appears only when the resume watcher would
+actually act — `resume_halted` is on, the session's Claude account is identifiable, and it
+has a transcript on disk (`claude --resume` needs a recorded conversation). Done, draft and
+archived sessions never get one. See
+[Auto-resume rate-limit-halted sessions](#auto-resume-rate-limit-halted-sessions).
 
 A session marked **done** while the agent is still mid-turn keeps showing `▶`
 (working) in the head column until that turn ends — the `✓` takes over the moment
@@ -1245,9 +1269,13 @@ filenames); malformed entries are skipped.
 - **Transcripts.** `transcript_path` searches the session's **owning account first**,
   then every other account, so a shared transcript tree is an optimisation — never a
   correctness precondition.
-- **Auto-resume.** The rate-limit auto-resumer watches a **single** reset signal —
-  the default account's — so in multi-account mode it skips (and purges from its
-  queue) any session that would bill a non-default account.
+- **Auto-resume.** The rate-limit auto-resumer keeps **one reset gate per account** —
+  a detector process and signal file each, spawned with that account's
+  `CLAUDE_CONFIG_DIR` pinned — and revives each session **on the seat it was started
+  from**. The accounts' limit windows are independent: `work` being rate-limited never
+  holds back a `private` resume. Only a session whose account cannot be identified (no
+  stamped `config_dir` in multi-account mode) is skipped and purged from the queue —
+  ccc will not guess which seat to bill.
 - **ccc's own state stays account-independent**: the DB/config root is `$CCC_HOME`
   (default: the `claude_home()` tree), so one store, daemon and TUI serve every
   account; only the usage snapshots are per-account.

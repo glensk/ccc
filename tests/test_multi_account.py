@@ -396,24 +396,76 @@ def test_hooks_account_switch_warning_fires_on_mismatch(
 
 
 # ---------------------------------------------------------------------------
-# D12 auto-resume purge
+# auto-resume: per-account reset gate (each seat revived on its own account)
 # ---------------------------------------------------------------------------
-def test_purge_non_default_entry_before_plan(two_accounts: dict[str, Path], tmp_path: Path) -> None:
-    """A queued entry that bills a non-default account is purged from the queue (D12)."""
+def test_account_key_maps_each_seat_to_its_own_gate(two_accounts: dict[str, Path]) -> None:
+    """Every KNOWN account gets its own reset-gate key; only the unknown one is refused."""
+    assert resume.account_key(str(two_accounts["work"])) == "work"
+    assert resume.account_key(str(two_accounts["private"])) == "private"
+    # Unstamped in multi-account mode → cannot attribute → never auto-resumed.
+    assert resume.account_key("") == resume.UNATTRIBUTED
+    # Each key round-trips back to the config dir the resume/detector env is pinned to.
+    assert Path(resume._config_dir_for_key("work")) == two_accounts["work"]
+    assert Path(resume._config_dir_for_key("private")) == two_accounts["private"]
+
+
+def test_purge_only_drops_unattributable_entry(
+    two_accounts: dict[str, Path], tmp_path: Path
+) -> None:
+    """Both seats survive the purge — only a session with no known account is dropped."""
     with Store(tmp_path / "s.db") as store:
         store.ensure("w-job", cwd="/repo/w")
         store.update_fields("w-job", config_dir=str(two_accounts["work"]))
         store.ensure("p-job", cwd="/repo/p")
         store.update_fields("p-job", config_dir=str(two_accounts["private"]))
+        store.ensure("x-job", cwd="/repo/x")  # never attributed to an account
         state = resume.QueueState(
             entries={
                 "w-job": resume.Entry(session_id="w-job", repo="/repo/w", cwd="/repo/w"),
                 "p-job": resume.Entry(session_id="p-job", repo="/repo/p", cwd="/repo/p"),
+                "x-job": resume.Entry(session_id="x-job", repo="/repo/x", cwd="/repo/x"),
             }
         )
-        resume.purge_non_default_entries(store, state)
-        assert "w-job" not in state.entries  # non-default → dropped
-        assert "p-job" in state.entries  # default → kept
+        resume.purge_unattributable_entries(store, state)
+        assert "w-job" in state.entries  # work is resumable — on the work seat
+        assert "p-job" in state.entries  # private is resumable — on the private seat
+        assert "x-job" not in state.entries  # unknown account → refused, never guessed
+
+
+def test_work_halt_does_not_gate_private_resume(two_accounts: dict[str, Path]) -> None:
+    """Per-account gate: private's reset dispatches private while work still waits."""
+    observed = {
+        "p": resume.Observation(
+            alive=False,
+            raw_status="",
+            halted=True,
+            transcript_size=0,
+            cwd="/repo/p",
+            repo="/repo/p",
+            account="private",
+        ),
+        "w": resume.Observation(
+            alive=False,
+            raw_status="",
+            halted=True,
+            transcript_size=0,
+            cwd="/repo/w",
+            repo="/repo/w",
+            account="work",
+        ),
+    }
+    now = 1_000_000_000_000
+    # Only PRIVATE's limit has reset; work's detector has not fired.
+    state, actions = resume.plan(
+        observed, {"p", "w"}, resume.QueueState(), now, config.Config(), reset_signals={"private"}
+    )
+    assert state.reset_confirmed_at == {"private": now}  # work's gate stays shut
+    launched = [a.session_id for a in actions if a.kind == "launch_resume"]
+    assert launched == ["p"]  # private went; work stayed queued behind its own limit
+    assert state.entries["w"].state == "queued"
+    # ...and work still has a detector of its own being spawned, pinned to the work seat.
+    waits = [a.account for a in actions if a.kind == "ensure_reset_wait"]
+    assert waits == ["work"]
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,7 @@ from textual.worker import get_current_worker
 
 from .. import (
     accounts,
+    cachettl,
     colors,
     config,
     deps,
@@ -67,6 +68,7 @@ from .. import (
     jumpstate,
     launchd,
     repos,
+    resume,
     routing,
     tabsymbol,
     tags,
@@ -78,6 +80,8 @@ from ..core import Row, build_rows
 from ..models import (
     DEFAULT_LLM,
     DEP_MARKER,
+    HALTED_RESUME_HELP,
+    HALTED_RESUME_ICON,
     JOB_TYPE_LABELS,
     LLM_ARROW,
     LLM_CHOICES,
@@ -178,9 +182,15 @@ _STATUS_STYLE: dict[Status, str] = {
     Status.DONE: "green3",
     Status.FAILED: "bold red",
 }
+# The green ▶ appended to a red || when that halted session WILL be auto-revived on its
+# account's reset. Same green as WORKING: "this one is going to run again by itself".
+_RESUME_ARMED_STYLE = "bold green"
 _SEVERITY_STYLE = {"green": "green", "amber": "yellow", "red": "bold red", "none": "grey62"}
 _DONE_STYLE = "green3"
 _GOLD = "#ffaf00"
+# Prompt-cache TTL countdown colours (see cachettl). Hex values equal xterm-256 40/208/196
+# so this column renders pixel-identically to the ``ccc ls`` version; orange is #ff8700.
+_CACHE_STYLE = {"green": "#00d700", "orange": "#ff8700", "red": "#ff0000"}
 _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt preview
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
@@ -1068,6 +1078,18 @@ the shell: `ccc daemon --install` / `--uninstall` (one pass now: `ccc daemon`). 
 with `launchctl list | grep claude-command-center`; logs in ~/.claude/command-center/."""
 
 
+def _icon_text(glyph: str, style: str, resume_armed: bool = False) -> Text:
+    """The first-column icon, two-tone when a halted row is armed for auto-resume.
+
+    *resume_armed* appends a green ``▶`` to the (red) ``||``: this session comes back on
+    its own when its account's rate limit resets. Bare ``||`` = stranded until you (r)esume.
+    """
+    out = Text(glyph, style=style)
+    if resume_armed:
+        out.append(HALTED_RESUME_ICON, style=_RESUME_ARMED_STYLE)
+    return out
+
+
 def _status_legend() -> Text:
     """The first-column status legend, generated from the Status registry.
 
@@ -1075,17 +1097,42 @@ def _status_legend() -> Text:
     ``STATUS_HELP``) and the TUI's own ``_STATUS_STYLE`` colours, so it always
     matches the icons painted in the table and can never go stale: add or remove
     a status and this legend updates itself (models' asserts force icon + help).
+
+    HALTED is the one status with TWO renderings — ``||▶`` (ccc will auto-revive it on
+    that account's reset) and a bare ``||`` (nothing will) — so it gets two lines, both
+    fed from the same ``models`` constants the table paints from.
     """
     out = Text()
     out.append("Status", style="bold")
     out.append("  (the first-column icon on every row)\n", style="grey58")
+    width = 4  # widest icon is ||▶ (3 cells) + a space
+
+    def _line(icon: Text, label: str, help_text: str, style: str) -> None:
+        out.append("  ")
+        out.append_text(icon)
+        out.append(" " * max(1, width - icon.cell_len))
+        out.append(f"{label:<14}", style=style)
+        out.append(help_text, style="grey70")
+        out.append("\n")
+
     for status in Status:
         style = _STATUS_STYLE.get(status, "grey70")
-        out.append("  ")
-        out.append(f"{STATUS_ICON[status]:<3}", style=style)
-        out.append(f"{status.value:<14}", style=style)
-        out.append(STATUS_HELP[status], style="grey70")
-        out.append("\n")
+        if status is Status.HALTED:
+            _line(
+                _icon_text(STATUS_ICON[status], style, resume_armed=True),
+                status.value,
+                HALTED_RESUME_HELP,
+                style,
+            )
+        _line(_icon_text(STATUS_ICON[status], style), status.value, STATUS_HELP[status], style)
+    out.append("\n")
+    out.append("  ▶ ", style=_RESUME_ARMED_STYLE)
+    out.append(
+        "on a || needs resume_halted=on (Settings s) + a known account + a transcript;\n"
+        "    each account waits for its OWN limit reset, and is revived on its own seat.",
+        style="grey58",
+    )
+    out.append("\n")
     return out
 
 
@@ -2263,12 +2310,21 @@ class CommandCenterApp(App[None]):
         # cancelled/missing (see deps.is_unsatisfied) — except on a done row: a job that
         # already finished no longer waits on anything, so it never wears the marker.
         marked = deps.is_unsatisfied(row.dep_state) and not done
-        icon = Text("|", style="bold red") if marked else Text(icon_glyph, style=icon_style)
+        # A halted session ccc will auto-revive on its account's reset wears a green ▶ after
+        # the red || (see models.HALTED_RESUME_ICON) — a bare || means it is stranded.
+        resume_armed = row.status is Status.HALTED and resume.will_auto_resume(
+            session, self.adapter, self.cfg
+        )
+        icon = (
+            Text("|", style="bold red")
+            if marked
+            else _icon_text(icon_glyph, icon_style, resume_armed)
+        )
         sched = scheduled_date(session)
         if marked:
             imp = Text("--", style="bold red")
             ver = Text(">", style="bold red")
-            ver.append(icon_glyph, style=icon_style)
+            ver.append_text(_icon_text(icon_glyph, icon_style, resume_armed))
             # Append the OAI badge only when the composed ver cell stays ≤5 cells — the
             # 2-cell status icons (||, 😴, 💤) push it over, so it is dropped there.
             if row.uses_codex_workflow and ver.cell_len + 3 <= 5:
@@ -2334,11 +2390,17 @@ class CommandCenterApp(App[None]):
             # pair (colour-coded, single name when they match) instead of an observed "—".
             model_cell = _models_cell(session, prefix="  " + home)
         else:
-            # OBSERVED model·effort the session ran on.
-            model_cell = Text(
-                "  " + home + model_effort_cell(session.model, session.effort),
-                style=_DONE_STYLE if done else "grey50",
-            )
+            # OBSERVED model·effort the session ran on, with the prompt-cache TTL countdown
+            # prepended BEFORE the account glyph (how long the session's Anthropic prompt
+            # cache stays warm — transcript mtime + TTL). Done rows skip it, mirroring the
+            # statusline's ♨/❄ readout (see cachettl).
+            style = _DONE_STYLE if done else "grey50"
+            model_cell = Text("  ", style=style)
+            if not done:
+                cache_text, cache_level = cachettl.countdown_for(self.adapter, session)
+                if cache_text:
+                    model_cell.append(cache_text + " ", style=_CACHE_STYLE[cache_level])
+            model_cell.append(home + model_effort_cell(session.model, session.effort), style=style)
         low_score = low_aim_score(session.aim, session.aim_score, self.cfg.aim_score_threshold)
         aim_style = _DONE_STYLE if done else (_GOLD if session.aim else "grey50")
         # Leading score chip ('NN%', or '-1' while unscored) so /aim quality is visible.

@@ -24,6 +24,7 @@ import copy
 import dataclasses
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,13 +34,22 @@ from pathlib import Path
 from . import config
 from .adapters.claude import ClaudeAdapter
 from .core import reconcile
-from .models import LiveSession, now_ms
+from .models import LiveSession, Session, now_ms
 from .notify import notify
 from .store import Store
 
 # Terminal entry states never re-launched; live ones drive dispatch.
 _TERMINAL = ("done", "failed")
 _IN_FLIGHT = ("launching", "running")
+
+# Reset-gate account keys. Each Claude account has its own rate-limit window, so the
+# gate (detector process + signal file + confirmed-reset stamp) is keyed per account.
+# ``_DEFAULT_KEY`` ("") is single-account mode — it also keeps the historical signal
+# filename. ``UNATTRIBUTED`` marks a session whose account cannot be resolved: never
+# resumed (we will not guess which seat to bill). Neither can collide with a real
+# account label, which is a non-empty key of ``config.claude_config_dirs()``.
+_DEFAULT_KEY = ""
+UNATTRIBUTED = "?"
 
 _NOTIFIED: set[str] = set()  # one-shot notify keys for this watcher process
 _REPO_CACHE: dict[str, str] = {}
@@ -55,6 +65,7 @@ class Candidate:
     session_id: str
     cwd: str
     repo: str
+    account: str = _DEFAULT_KEY  # reset-gate key (see account_key)
 
 
 @dataclass
@@ -67,6 +78,7 @@ class Observation:
     transcript_size: int
     cwd: str
     repo: str
+    account: str = _DEFAULT_KEY  # reset-gate key (see account_key)
 
 
 @dataclass
@@ -81,15 +93,24 @@ class Entry:
     baseline_offset: int = 0  # transcript size at launch (progress is growth past it)
     attempts: int = 0
     fail_reason: str = ""
+    account: str = _DEFAULT_KEY  # which account's reset gates this entry (see account_key)
 
 
 @dataclass
 class QueueState:
-    """Persisted orchestration state (single-writer: the flock watcher)."""
+    """Persisted orchestration state (single-writer: the flock watcher).
 
-    reset_confirmed_at: int = 0  # epoch ms the limit was confirmed reset (0 = waiting)
+    The reset bookkeeping is keyed PER ACCOUNT: rate-limit windows are per-seat, so a
+    halted ``work`` session must wait for ``work``'s reset and must not be held back
+    by — or released early by — ``private``'s. ``last_launch_at`` stays global: it is
+    an anti-herd stagger across the machine, not an account concern.
+    """
+
     last_launch_at: int = 0  # epoch ms of the last real resume (global stagger gate)
-    reset_wait_pid: int = 0  # pid of the headless --wait-only detector (0 = none)
+    # account key -> epoch ms that account's limit was confirmed reset (absent = waiting)
+    reset_confirmed_at: dict[str, int] = field(default_factory=dict)
+    # account key -> pid of that account's headless --wait-only detector (absent = none)
+    reset_wait_pid: dict[str, int] = field(default_factory=dict)
     entries: dict[str, Entry] = field(default_factory=dict)
 
 
@@ -101,6 +122,7 @@ class Action:
     session_id: str = ""
     cwd: str = ""
     detail: str = ""
+    account: str = _DEFAULT_KEY  # which account's gate ensure_reset_wait/confirm_reset acts on
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +132,16 @@ def _state_path() -> Path:
     return config.app_home() / "resume_queue.json"
 
 
-def _signal_path() -> Path:
-    return config.app_home() / "resume_reset.signal"
+def _signal_path(account: str = _DEFAULT_KEY) -> Path:
+    """That account's reset-signal file (one detector touches one file).
+
+    The default/single-account key keeps the historical unsuffixed name; a named
+    account gets a slugged suffix so two seats' detectors can never share a file.
+    """
+    if not account or account == _DEFAULT_KEY:
+        return config.app_home() / "resume_reset.signal"
+    slug = re.sub(r"[^A-Za-z0-9_.-]", "_", account)
+    return config.app_home() / f"resume_reset.{slug}.signal"
 
 
 def _lock_path() -> Path:
@@ -144,62 +174,105 @@ def repo_of(cwd: str) -> str:
     return top
 
 
-def _bills_non_default(config_dir: str) -> bool:
-    """True when auto-resuming *config_dir*'s session could bill a NON-default account.
+def account_key(config_dir: str) -> str:
+    """The reset-gate key for *config_dir* — ``UNATTRIBUTED`` when it cannot be resolved.
 
-    Auto-resume owns a SINGLE reset gate — the default account's limit (per-account
-    reset detectors are out of scope, D12). In single-account mode nothing is
-    non-default. In multi-account mode a session is fail-closed non-default unless its
-    ``config_dir`` provably resolves to the default account: an unknown ("") account is
-    treated as non-default so a not-yet-attributed work session can never slip through.
+    Every Claude account has its OWN rate-limit window, so auto-resume runs one reset
+    detector (and one signal file) PER account and a session is revived under the very
+    account it was started from — a halted ``work`` session comes back on ``work``, a
+    ``private`` one on ``private``.
+
+    Single-account mode collapses to one key (``_DEFAULT_KEY``, ""), which also keeps
+    the historical single-account signal-file name. In multi-account mode the key is
+    the account's configured label (``private`` / ``work``). What stays fail-closed is
+    the genuinely UNKNOWN case: a session with no stamped ``config_dir`` (or one naming
+    a dir no configured account owns) cannot be attributed, and reviving it would probe
+    and bill an arbitrary seat — so it is skipped rather than guessed.
     """
     from . import accounts
 
     if not accounts.is_multi_account():
+        return _DEFAULT_KEY
+    if not config_dir:
+        return UNATTRIBUTED
+    label = accounts.account_label(config_dir)
+    return label if label in config.claude_config_dirs() else UNATTRIBUTED
+
+
+def _config_dir_for_key(key: str) -> str:
+    """Invert :func:`account_key` — the config dir to pin for that account ("" = default)."""
+    if key in (_DEFAULT_KEY, UNATTRIBUTED):
+        return ""
+    from . import accounts
+
+    return accounts.account_config_dir(key)
+
+
+def is_resumable(session: Session, adapter: ClaudeAdapter) -> bool:
+    """Per-session auto-resume eligibility, EXCLUDING haltedness and the config gate.
+
+    Shared by :func:`candidates` (what the watcher actually queues) and
+    :func:`will_auto_resume` (what the ``||▶`` icon promises), so the icon can never
+    advertise a revival the watcher would not perform.
+
+    Excludes done / draft / archived; requires a real cwd, an attributable account and
+    a transcript on disk (``claude --resume`` needs a recorded conversation).
+    """
+    if session.done or session.draft or session.archived:
         return False
-    return config_dir == "" or not accounts.is_default_config_dir(config_dir)
+    if account_key(session.config_dir) == UNATTRIBUTED:
+        return False
+    if not session.cwd or not os.path.isdir(session.cwd):
+        return False
+    return adapter.transcript_path(session.cwd, session.session_id, session.config_dir) is not None
+
+
+def will_auto_resume(session: Session, adapter: ClaudeAdapter, cfg: config.Config) -> bool:
+    """True when a HALTED *session* will be auto-revived once its rate limit resets.
+
+    Precondition: the caller already established the session is halted (its row status
+    is ``Status.HALTED``) — this adds the ``resume_halted`` config gate on top of the
+    same eligibility the watcher applies. Drives the green ``▶`` suffix on the red
+    ``||`` icon, so a bare red ``||`` means "stranded: nothing will revive this".
+    """
+    return cfg.resume_halted and is_resumable(session, adapter)
 
 
 def candidates(store: Store, adapter: ClaudeAdapter) -> list[Candidate]:
-    """Halted sessions eligible for auto-resume (alive HALTED or parked-after-429).
-
-    Excludes done / draft / archived; requires a real cwd and a transcript on disk
-    (``claude --resume`` needs a recorded conversation). Fail-closed on multi-account:
-    a session that would bill a non-default account is skipped (D12) — auto-resume's
-    reset gate only tracks the default account's limit.
-    """
+    """Halted sessions eligible for auto-resume (alive HALTED or parked-after-429)."""
     out: list[Candidate] = []
     for session in store.list_sessions():
-        if session.done or session.draft or session.archived:
-            continue
-        if _bills_non_default(session.config_dir):
-            continue
-        if not session.cwd or not os.path.isdir(session.cwd):
+        if not is_resumable(session, adapter):
             continue
         if not adapter.is_halted(session.cwd, session.session_id):
             continue
-        if adapter.transcript_path(session.cwd, session.session_id, session.config_dir) is None:
-            continue
-        out.append(Candidate(session.session_id, session.cwd, repo_of(session.cwd)))
+        out.append(
+            Candidate(
+                session.session_id,
+                session.cwd,
+                repo_of(session.cwd),
+                account_key(session.config_dir),
+            )
+        )
     return out
 
 
-def purge_non_default_entries(store: Store, state: QueueState) -> None:
-    """Drop any queued entry that would bill a non-default account (D12).
+def purge_unattributable_entries(store: Store, state: QueueState) -> None:
+    """Drop any queued entry whose Claude account cannot be attributed.
 
     ``resume.py`` observes ``candidate_ids | set(state.entries)``, so an entry queued
-    while single-account (or before an account was attributed) can reach ``plan()`` and
-    dispatch through the single default-account reset gate. Purge those BEFORE
-    ``_observe()``/``plan()`` so a non-default session is never auto-resumed. Logged.
+    while single-account (or before an account was attributed) can reach ``plan()``
+    with no resolvable account and dispatch against an arbitrary seat's reset gate.
+    Purge those BEFORE ``_observe()``/``plan()``. Logged.
     """
     for session_id in list(state.entries):
         session = store.get(session_id)
         config_dir = session.config_dir if session else ""
-        if _bills_non_default(config_dir):
+        if account_key(config_dir) == UNATTRIBUTED:
             del state.entries[session_id]
             print(
-                f"resume-halted: dropped {session_id[:8]} — bills a non-default Claude "
-                "account; auto-resume only handles the default account's reset."
+                f"resume-halted: dropped {session_id[:8]} — its Claude account is "
+                "unknown; auto-resume will not guess which seat to revive it on."
             )
 
 
@@ -228,6 +301,7 @@ def _observe(adapter: ClaudeAdapter, store: Store, ids: set[str]) -> dict[str, O
             transcript_size=_transcript_size(adapter, cwd, session_id) if cwd else 0,
             cwd=cwd,
             repo=repo_of(cwd) if cwd else "",
+            account=account_key(session.config_dir if session else ""),
         )
     return observed
 
@@ -256,12 +330,15 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
     state: QueueState,
     now: int,
     cfg: config.Config,
-    reset_signal: bool,
+    reset_signals: set[str],
 ) -> tuple[QueueState, list[Action]]:
     """Pure: given observed state + the queue, return the next queue + actions.
 
     No side effects — the executor performs the returned actions and persists the
     returned state. This is the unit-tested heart of the feature.
+
+    *reset_signals* is the set of account keys whose limit is confirmed reset (their
+    detector touched its signal file) — the gate is per account, not global.
     """
     state = copy.deepcopy(state)
     actions: list[Action] = []
@@ -276,8 +353,16 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
                 session_id=session_id,
                 repo=obs.repo if obs else "",
                 cwd=obs.cwd if obs else "",
+                account=obs.account if obs else _DEFAULT_KEY,
             )
-        elif entry.state == "done":
+            continue
+        # Re-stamp the account from the live observation every tick. This backfills entries
+        # persisted BEFORE the gate was per-account (they carry the default key regardless of
+        # which seat they actually ran on), so a legacy queue file cannot park a work session
+        # on the private gate forever.
+        if obs is not None:
+            entry.account = obs.account
+        if entry.state == "done":
             entry.state = "queued"
             entry.attempts = 0
             entry.launched_at = 0
@@ -285,7 +370,7 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
 
     # 2. Reconcile + classify. A queued entry the user already resumed (alive, not
     #    halted) is adopted as in-flight rather than relaunched (no double resume).
-    rehalt = False
+    rehalted: set[str] = set()
     for session_id, entry in list(state.entries.items()):
         if entry.state in _TERMINAL:
             continue
@@ -302,8 +387,8 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
         # baseline (a real resume produced content) — the persistent, poll-timing-
         # independent signal (Codex O5), not a transient "seen busy" flag.
         resumed = obs.transcript_size > entry.baseline_offset
-        if obs.halted:  # the account-wide limit is back → requeue + re-gate everyone
-            rehalt = True
+        if obs.halted:  # THIS account's limit is back → requeue + re-gate that account only
+            rehalted.add(entry.account)
             _fail_or_requeue(entry, cfg, "re-halted on the limit", actions)
             continue
         if resumed and (_is_idle(obs.raw_status) or not obs.alive):  # turn completed → free repo
@@ -323,30 +408,38 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
             continue
         # else: still launching/running — leave in place
 
-    if rehalt:
-        state.reset_confirmed_at = 0  # limit returned; wait for the next reset
+    for account in rehalted:  # that seat's limit returned; wait for ITS next reset
+        state.reset_confirmed_at.pop(account, None)
 
-    # 3. Reset gate — do not dispatch any resume until the limit is confirmed reset.
-    if not state.reset_confirmed_at:
-        if reset_signal:
-            state.reset_confirmed_at = now
-            actions.append(Action("confirm_reset"))
+    # 3. Reset gate — PER ACCOUNT. Rate-limit windows are per-seat, so each account with
+    #    queued work gets its own headless --wait-only detector (pinned to that account's
+    #    CLAUDE_CONFIG_DIR) and its own signal file. A `work` session waits for `work`'s
+    #    reset; it neither blocks nor is released by `private`'s.
+    for account in sorted({e.account for e in state.entries.values() if e.state == "queued"}):
+        if state.reset_confirmed_at.get(account):
+            continue
+        if account in reset_signals:
+            state.reset_confirmed_at[account] = now
+            actions.append(Action("confirm_reset", account=account))
         else:
-            if any(e.state == "queued" for e in state.entries.values()):
-                actions.append(Action("ensure_reset_wait"))
-            state.entries = {s: e for s, e in state.entries.items() if e.state != "done"}
-            return state, actions
+            actions.append(Action("ensure_reset_wait", account=account))
 
-    # 4. Dispatch — one launch per tick (global stagger), one in-flight per repo.
+    # 4. Dispatch — one launch per tick (global stagger), one in-flight per repo, and only
+    #    for an account whose OWN limit is confirmed reset (others stay queued, waiting on
+    #    their detector).
     busy_repos = {e.repo for e in state.entries.values() if e.state in _IN_FLIGHT}
     if now - state.last_launch_at >= cfg.resume_stagger_sec * 1000:
         for session_id, entry in state.entries.items():
             if entry.state != "queued" or entry.repo in busy_repos:
                 continue
+            if not state.reset_confirmed_at.get(entry.account):
+                continue  # this seat is still rate-limited
             obs = observed.get(session_id)
             if obs and obs.alive:  # stuck live REPL: kill it before re-resuming
                 actions.append(Action("reap", session_id))
-            actions.append(Action("launch_resume", session_id, cwd=entry.cwd))
+            actions.append(
+                Action("launch_resume", session_id, cwd=entry.cwd, account=entry.account)
+            )
             entry.state = "launching"
             entry.launched_at = now
             entry.baseline_offset = obs.transcript_size if obs else 0
@@ -430,25 +523,33 @@ def _launch_resume(session_id: str, cwd: str, cfg: config.Config, config_dir: st
     return terminal.resume_halted_in_new_tab(cwd, session_id, script, config_dir)
 
 
-def _consume_reset_signal(state: QueueState) -> None:
-    """Reset confirmed: remove the signal file and stop the detector."""
+def _consume_reset_signal(state: QueueState, account: str) -> None:
+    """*account*'s reset confirmed: remove its signal file and stop its detector."""
     try:
-        _signal_path().unlink(missing_ok=True)
+        _signal_path(account).unlink(missing_ok=True)
     except OSError:
         pass
-    if state.reset_wait_pid and _pid_alive(state.reset_wait_pid):
+    pid = state.reset_wait_pid.get(account, 0)
+    if pid and _pid_alive(pid):
         try:
-            os.kill(state.reset_wait_pid, 15)
+            os.kill(pid, 15)
         except OSError:
             pass
-    state.reset_wait_pid = 0
+    state.reset_wait_pid.pop(account, None)
 
 
-def _ensure_reset_wait(state: QueueState, cfg: config.Config) -> None:
-    """Make sure exactly one headless ``--wait-only`` reset detector is running."""
-    if state.reset_wait_pid and _pid_alive(state.reset_wait_pid):
-        return  # a detector is already waiting — leave its signal file alone
-    signal = _signal_path()
+def _ensure_reset_wait(state: QueueState, cfg: config.Config, account: str) -> None:
+    """Make sure exactly one ``--wait-only`` reset detector runs FOR *account*.
+
+    One detector per account, each probing its own seat: the child's env pins that
+    account's ``CLAUDE_CONFIG_DIR`` (via :func:`accounts.launch_env`), so the ``claude
+    -p`` probe inside ``claude-session-continue`` reads the rate-limit window of the
+    very account whose sessions this gate releases — never an ambient/wrong seat.
+    """
+    pid = state.reset_wait_pid.get(account, 0)
+    if pid and _pid_alive(pid):
+        return  # a detector is already waiting for this account — leave its signal alone
+    signal = _signal_path(account)
     try:
         signal.unlink(missing_ok=True)  # clear any stale signal before a fresh wait
     except OSError:
@@ -468,18 +569,19 @@ def _ensure_reset_wait(state: QueueState, cfg: config.Config) -> None:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
-            # The reset detector probes the DEFAULT account's limit (auto-resume only
-            # handles that account) — pin its env so an ambient work CLAUDE_CONFIG_DIR
-            # can't make it probe/bill the wrong seat (D8).
-            env=accounts.launch_env(""),
+            # Pin the detector to THIS account's config dir, so its `claude -p` probe reads
+            # the rate-limit window of the seat whose sessions this gate releases — and an
+            # ambient CLAUDE_CONFIG_DIR can never make it probe/bill the wrong one (D8).
+            env=accounts.launch_env(_config_dir_for_key(account)),
         )
-        state.reset_wait_pid = proc.pid
+        state.reset_wait_pid[account] = proc.pid
     except OSError:
-        state.reset_wait_pid = 0
+        state.reset_wait_pid.pop(account, None)
 
 
-def _reset_signal_present() -> bool:
-    return _signal_path().exists()
+def reset_signals_present(accounts_in_play: set[str]) -> set[str]:
+    """The subset of *accounts_in_play* whose reset detector has fired (signal on disk)."""
+    return {account for account in accounts_in_play if _signal_path(account).exists()}
 
 
 def apply_actions(
@@ -494,16 +596,19 @@ def apply_actions(
         if action.kind == "reap":
             _reap_fresh(adapter, store, action.session_id)
         elif action.kind == "launch_resume":
+            # Revive on the SAME seat the session was started from: the stored config_dir
+            # is prefixed onto the resume command (terminal.launch_env_prefix), so a work
+            # session comes back on work and a private one on private.
             resumed = store.get(action.session_id)
-            config_dir = resumed.config_dir if resumed else ""
+            config_dir = resumed.config_dir if resumed else _config_dir_for_key(action.account)
             if not _launch_resume(action.session_id, action.cwd, cfg, config_dir):
                 _notify_once(
                     cfg, "cannot open a terminal to resume — is iTerm/osascript available?"
                 )
         elif action.kind == "ensure_reset_wait":
-            _ensure_reset_wait(state, cfg)
+            _ensure_reset_wait(state, cfg, action.account)
         elif action.kind == "confirm_reset":
-            _consume_reset_signal(state)
+            _consume_reset_signal(state, action.account)
         elif action.kind == "notify":
             notify("ccc resume-halted", action.detail, cfg.notify)
 
@@ -520,7 +625,16 @@ def _summary(state: QueueState, actions: list[Action]) -> str:
     for entry in state.entries.values():
         by_state[entry.state] = by_state.get(entry.state, 0) + 1
     kinds = ", ".join(a.kind + (f":{a.session_id[:8]}" if a.session_id else "") for a in actions)
-    reset = "reset✓" if state.reset_confirmed_at else "waiting-reset"
+    # One reset flag PER account in play: `private=reset✓ work=waiting-reset`.
+    in_play = sorted({e.account for e in state.entries.values()} | set(state.reset_confirmed_at))
+    reset = (
+        " ".join(
+            f"{account or 'default'}="
+            + ("reset✓" if state.reset_confirmed_at.get(account) else "waiting-reset")
+            for account in in_play
+        )
+        or "no-accounts"
+    )
     states = " ".join(f"{k}={v}" for k, v in sorted(by_state.items())) or "(empty)"
     return f"[{reset}] {states}" + (f" | actions: {kinds}" if kinds else "")
 
@@ -533,12 +647,18 @@ def tick(cfg: config.Config, *, dry_run: bool = False) -> bool:
         cands = candidates(store, adapter)
         candidate_ids = {c.session_id for c in cands}
         state = load_state()
-        # D12: fail closed BEFORE observe/plan — a queued non-default-account entry must
-        # never dispatch through the single default-account reset gate.
-        purge_non_default_entries(store, state)
+        # Fail closed BEFORE observe/plan — an entry whose Claude account cannot be
+        # attributed must never dispatch against some other seat's reset gate.
+        purge_unattributable_entries(store, state)
         observed = _observe(adapter, store, candidate_ids | set(state.entries))
+        accounts_in_play = {c.account for c in cands} | {e.account for e in state.entries.values()}
         new_state, actions = plan(
-            observed, candidate_ids, state, now_ms(), cfg, _reset_signal_present()
+            observed,
+            candidate_ids,
+            state,
+            now_ms(),
+            cfg,
+            reset_signals_present(accounts_in_play),
         )
         if dry_run:
             print(f"[dry-run] candidates={len(cands)} {_summary(new_state, actions)}")
@@ -586,6 +706,26 @@ def has_candidates() -> bool:
 # ---------------------------------------------------------------------------
 # state persistence (atomic; single-writer)
 # ---------------------------------------------------------------------------
+def _int_map(raw: object) -> dict[str, int]:
+    """Coerce a persisted reset field to the per-account ``{key: int}`` map.
+
+    Tolerates the pre-multi-account scalar shape (a bare int meaning "the one gate"):
+    a non-zero legacy value is adopted as the default account's, anything else starts
+    empty. A stale queue file therefore upgrades in place instead of crashing.
+    """
+    if isinstance(raw, dict):
+        out: dict[str, int] = {}
+        for key, value in raw.items():
+            try:
+                out[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return out
+    if isinstance(raw, int) and raw:
+        return {_DEFAULT_KEY: raw}
+    return {}
+
+
 def load_state() -> QueueState:
     """Load the queue state (empty on missing / corrupt — readers see whole files)."""
     try:
@@ -609,11 +749,12 @@ def load_state() -> QueueState:
                 baseline_offset=int(raw.get("baseline_offset", 0) or 0),
                 attempts=int(raw.get("attempts", 0) or 0),
                 fail_reason=str(raw.get("fail_reason", "")),
+                account=str(raw.get("account", _DEFAULT_KEY)),
             )
     return QueueState(
-        reset_confirmed_at=int(data.get("reset_confirmed_at", 0) or 0),
         last_launch_at=int(data.get("last_launch_at", 0) or 0),
-        reset_wait_pid=int(data.get("reset_wait_pid", 0) or 0),
+        reset_confirmed_at=_int_map(data.get("reset_confirmed_at")),
+        reset_wait_pid=_int_map(data.get("reset_wait_pid")),
         entries=entries,
     )
 

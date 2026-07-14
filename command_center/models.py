@@ -65,7 +65,7 @@ STATUS_ORDER: dict[Status, int] = {
 STATUS_HELP: dict[Status, str] = {
     Status.WORKING: "live — the agent is busy right now",
     Status.WAITING_INPUT: "live — paused, waiting for your input",
-    Status.HALTED: "live — stopped on a Claude rate limit",
+    Status.HALTED: "live — stopped on a Claude rate limit; nothing will revive it",
     Status.WAITING_CODEX: "live — idle, waiting for OpenAI Codex quota reset",
     Status.IDLE: "live — open tab, idle this moment",
     Status.SNOOZED: "live — idle, waiting on a background task to finish",
@@ -77,6 +77,16 @@ STATUS_HELP: dict[Status, str] = {
 assert set(STATUS_ICON) == set(Status), "every Status needs a STATUS_ICON entry"
 assert set(STATUS_ORDER) == set(Status), "every Status needs a STATUS_ORDER entry"
 assert set(STATUS_HELP) == set(Status), "every Status needs a STATUS_HELP entry"
+
+# A HALTED row wears a green ▶ AFTER its red || when ccc will auto-revive it once that
+# account's rate limit resets (resume.will_auto_resume: `resume_halted` on, account
+# attributable, transcript on disk). So the icon is honest at a glance:
+#   ||▶  the limit reset will bring this session back by itself — nothing to do
+#   ||   stranded: it will sit here until YOU resume it (r)
+# The suffix is per-session, not a static icon, so it never promises a revival that the
+# resume watcher would not actually perform.
+HALTED_RESUME_ICON = "▶"
+HALTED_RESUME_HELP = "live — rate-limit halt; auto-resumes when that account's limit resets"
 
 
 @dataclass

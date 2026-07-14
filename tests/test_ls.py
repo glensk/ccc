@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
+from typing import cast
+
+import pytest
 
 from command_center import accounts
+from command_center.adapters.base import Adapter
 from command_center.core import Row
 from command_center.models import Session, Status
 from command_center.views import ls as ls_view
 
 _RED = "\x1b[38;5;196m"  # _SEVERITY_COLOR["red"] painted by _paint()
+_GREEN = "\x1b[38;5;40m"  # _RESUME_GREEN — the ▶ appended to a || armed for auto-resume
 _OAI = "\x1b[1;38;5;16;48;5;15mOAI\x1b[0m"
 
 
@@ -101,6 +107,21 @@ def test_render_row_halted_shows_red_double_bar() -> None:
     row = Row(session, None, Status.HALTED, 0, 0)
     lines = ls_view._render_row(row, enabled=True, warn_days=2, aim_threshold=50)
     assert f"{_RED}||\x1b[0m" in lines[0]  # red "||" rate-limit icon leads the row
+    assert _GREEN not in lines[0]  # not armed for auto-resume → NO green ▶ (it is stranded)
+
+
+def test_render_row_halted_armed_appends_green_play() -> None:
+    """A halted row ccc will auto-revive wears a green ▶ after the red || (red || + green ▶)."""
+    session = Session(session_id="s1", cwd="/repo", aim="x")
+    row = Row(session, None, Status.HALTED, 0, 0)
+    lines = ls_view._render_row(
+        row,
+        enabled=True,
+        warn_days=2,
+        aim_threshold=50,
+        resume_armed_ids=frozenset({"s1"}),
+    )
+    assert lines[0].startswith(f"{_RED}||\x1b[0m{_GREEN}▶\x1b[0m")  # red ||, then green ▶
 
 
 def test_render_row_shows_per_repo_badge() -> None:
@@ -206,6 +227,94 @@ def test_render_row_draft_shows_models_readout() -> None:
     mixed = ls_view._render_row(row, enabled=False, warn_days=2, aim_threshold=50)
     assert "fable-5 ▸ sonnet-5" in mixed[0]  # differing pair shown in full, in the model column
     assert "▸" not in mixed[1]
+
+
+_MULTI = {"private": Path("/home/u/.claude"), "work": Path("/home/u/.claude-work")}
+
+
+class _FakeAdapter:
+    """Adapter stub exposing only ``transcript_path`` (the probed capability)."""
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+
+    def transcript_path(
+        self, cwd: str, session_id: str, config_dir: str | None = None
+    ) -> Path | None:
+        return self._path
+
+
+def _fresh_transcript(tmp_path: Path) -> Path:
+    """A transcript file whose mtime is now → a warm (green) cache countdown."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("{}", encoding="utf-8")
+    now = time.time()
+    os.utime(transcript, (now, now))
+    return transcript
+
+
+def test_render_row_cache_countdown_before_home_glyph(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live/parked row shows the ♨ TTL countdown BEFORE the 🏠 account glyph."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    line = ls_view._render_row(
+        Row(session, None, Status.PARKED, 0, 0),
+        True,
+        2,
+        50,
+        _MULTI,
+        cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
+    )[0]
+    assert "♨" in line
+    assert accounts._HOME_GLYPH in line
+    assert line.index("♨") < line.index("🏠")
+
+
+def test_render_row_cache_countdown_absent_without_transcript() -> None:
+    """No transcript → empty cell (no ♨), glyph still rendered."""
+    session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    line = ls_view._render_row(
+        Row(session, None, Status.PARKED, 0, 0),
+        True,
+        2,
+        50,
+        _MULTI,
+        cast(Adapter, _FakeAdapter(None)),
+    )[0]
+    assert "♨" not in line
+    assert accounts._HOME_GLYPH in line
+
+
+def test_render_row_cache_countdown_skipped_on_draft(tmp_path: Path) -> None:
+    """A draft never ran → no countdown even with a live transcript path."""
+    session = Session(
+        session_id="p", cwd="/repo", aim="x", draft=True, config_dir="/home/u/.claude"
+    )
+    line = ls_view._render_row(
+        Row(session, None, Status.PARKED, 0, 0),
+        True,
+        2,
+        50,
+        _MULTI,
+        cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
+    )[0]
+    assert "♨" not in line
+
+
+def test_render_row_cache_countdown_skipped_on_done(tmp_path: Path) -> None:
+    """A done row is excluded from the countdown (mirrors the statusline / TUI branch)."""
+    session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    line = ls_view._render_row(
+        Row(session, None, Status.DONE, 0, 0),
+        True,
+        2,
+        50,
+        _MULTI,
+        cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
+    )[0]
+    assert "♨" not in line
 
 
 def test_render_row_shows_blue_drift_dot() -> None:
