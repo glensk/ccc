@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -245,10 +246,19 @@ class _FakeAdapter:
 
 
 def _fresh_transcript(tmp_path: Path) -> Path:
-    """A transcript file whose mtime is now → a warm (green) cache countdown."""
+    """A transcript whose newest line is a fresh assistant turn → warm (green) countdown.
+
+    The cache anchor is the newest main-chain ``"type":"assistant"`` entry, so a fresh
+    mtime alone is not enough — the file must carry a recent API turn (see cachettl).
+    """
     transcript = tmp_path / "t.jsonl"
-    transcript.write_text("{}", encoding="utf-8")
     now = time.time()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + ".000000Z"
+    line = json.dumps(
+        {"type": "assistant", "isSidechain": False, "timestamp": ts, "requestId": "r"},
+        separators=(",", ":"),
+    )
+    transcript.write_text(line + "\n", encoding="utf-8")
     os.utime(transcript, (now, now))
     return transcript
 

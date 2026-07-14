@@ -7,9 +7,21 @@ next message pays a full cache re-write — on ANY account (the cache is per-acc
 switching cpriv↔cwork then costs the same as continuing). Surfacing the remaining warm
 time lets you decide whether a parked session is still cheap to resume.
 
-"Last request" has no first-class signal, so we approximate it by the **mtime of the
-session's transcript file** — every API turn appends to it. That is a single ``os.stat``
-per row and we never read the transcript (this runs per row per refresh).
+"Last request" has no first-class signal, so we anchor the clock on the session's last
+real API interaction: the **timestamp of the newest main-chain ``"type":"assistant"``
+transcript entry**. Each assistant entry is the product of one API response (it carries a
+``requestId``) and re-reads/refreshes the prompt-cache prefix, so its timestamp is exactly
+"when the cache was last warmed". Assistant entries with ``"isSidechain":true`` are
+EXCLUDED — subagent traffic refreshes a *different* cache prefix, not the main session's.
+
+The transcript **mtime is only a fast path, never the anchor.** Claude Code appends LOCAL
+entries on session open — ``mode``, ``permission-mode``, ``bridge-session``,
+``attachment``, ``last-prompt``, ``file-history-snapshot`` — with NO API call, so a
+freshly resumed but days-old session has a warm-looking mtime yet a cold cache. We only
+trust mtime to prove *coldness*: if the file itself is already older than the TTL then
+every entry (≤ mtime) is expired, so we render ``❄ cold`` without opening the file. When
+mtime is fresh we read the transcript tail *backwards* to find the true anchor; a fresh
+mtime with no qualifying assistant entry (only local entries) is still cold.
 
 This mirrors the user's statusline (``statusline-command.sh`` "Prompt-cache TTL
 countdown" block); the thresholds/colours here are authoritative:
@@ -20,7 +32,7 @@ countdown" block); the thresholds/colours here are authoritative:
 * remaining ≤ 0 → ``❄ cold`` **red**
 * no transcript (missing / draft / done row) → empty cell
 
-:func:`countdown` is a pure function of ``(mtime, now)`` — it returns a ``(text, level)``
+:func:`countdown` is a pure function of ``(anchor, now)`` — it returns a ``(text, level)``
 pair where ``level`` is a colour-agnostic name (``"green"``/``"orange"``/``"red"``/``""``).
 Each view maps that level to its own palette (``ccc ls`` uses xterm-256 codes, the TUI uses
 Rich style strings) so the two stay pixel-identical without this module knowing either
@@ -29,8 +41,11 @@ colour system.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -51,6 +66,31 @@ _ORANGE_MIN_S = 600
 _WARM_GLYPH = "♨"
 _COLD_TEXT = "❄ cold"
 
+# Backwards-read chunk sizing. We scan the transcript tail from EOF toward the start in
+# chunks, doubling each step (capped) until a qualifying assistant line is found or the
+# file start is reached — so a multi-MB transcript is never loaded whole just to read its
+# newest turn.
+_CHUNK_BYTES = 64 * 1024
+_MAX_CHUNK_BYTES = 1024 * 1024
+
+# Cheap substring prefilter (bytes) applied before any JSON parse — mirrors the
+# statusline's ``grep '"type":"assistant"' | grep -v '"isSidechain":true'``. Claude Code
+# writes compact JSON (no spaces after colons), so these literals match verbatim.
+_ASSISTANT_MARK = b'"type":"assistant"'
+_SIDECHAIN_MARK = b'"isSidechain":true'
+
+# Fallback timestamp extractor for a single (already-qualified) line when JSON parsing
+# fails. ``findall()[-1]`` takes the LAST match — the top-level ``timestamp`` is emitted
+# after ``message`` in Claude Code's field order, so the last match is the entry's own
+# timestamp (mirrors the statusline's greedy ``sed`` capture).
+_TS_RE = re.compile(r'"timestamp":"([^"]+)"')
+
+# Module-level anchor read-cache: ``{path: (mtime, anchor_or_None)}``. The TUI renders per
+# row per refresh and the daemon is long-lived, so an unchanged transcript must be read at
+# most once (same rationale as ``mirrors._PROMPT_CACHE``). Re-read only when mtime moved.
+# The fast path (mtime expired) neither consults nor populates this — it is pure stat math.
+_ANCHOR_CACHE: dict[Path, tuple[float, float | None]] = {}
+
 
 def cache_ttl_seconds() -> int:
     """The prompt-cache TTL in seconds — ``CC_CACHE_TTL_S`` when a sane positive int, else 3600.
@@ -68,20 +108,20 @@ def cache_ttl_seconds() -> int:
     return value if value > 0 else _DEFAULT_TTL_S
 
 
-def countdown(mtime: float | None, now: float, *, ttl: int | None = None) -> tuple[str, str]:
-    """The ``(text, level)`` cache-TTL cell for a transcript last touched at *mtime*.
+def countdown(anchor: float | None, now: float, *, ttl: int | None = None) -> tuple[str, str]:
+    """The ``(text, level)`` cache-TTL cell for a cache last warmed at *anchor*.
 
-    *mtime* is the transcript's modification time (``st_mtime``), *now* the current epoch
-    seconds; *ttl* overrides :func:`cache_ttl_seconds` (tests pass it explicitly). ``level``
-    is a colour name — ``"green"`` / ``"orange"`` / ``"red"`` — that the caller maps to its
-    own palette. A ``None`` *mtime* (no transcript) yields ``("", "")`` — an empty cell.
-    Warm rows read ``♨ M:SS`` (whole minutes, zero-padded seconds); an expired cache reads
-    ``❄ cold``.
+    *anchor* is the epoch-seconds timestamp of the session's last real API interaction (its
+    newest main-chain assistant entry), *now* the current epoch seconds; *ttl* overrides
+    :func:`cache_ttl_seconds` (tests pass it explicitly). ``level`` is a colour name —
+    ``"green"`` / ``"orange"`` / ``"red"`` — that the caller maps to its own palette. A
+    ``None`` *anchor* (no transcript) yields ``("", "")`` — an empty cell. Warm rows read
+    ``♨ M:SS`` (whole minutes, zero-padded seconds); an expired cache reads ``❄ cold``.
     """
-    if mtime is None:
+    if anchor is None:
         return ("", "")
     ttl_s = cache_ttl_seconds() if ttl is None else ttl
-    remaining = int(ttl_s - (now - mtime))
+    remaining = int(ttl_s - (now - anchor))
     if remaining <= 0:
         return (_COLD_TEXT, "red")
     minutes, seconds = divmod(remaining, 60)
@@ -93,13 +133,94 @@ def countdown(mtime: float | None, now: float, *, ttl: int | None = None) -> tup
     return (text, "red")
 
 
-def transcript_mtime(adapter: object, session: Session) -> float | None:
-    """The mtime of *session*'s transcript, or ``None`` when it can't be resolved/stat'd.
+def _parse_iso(ts: str) -> float | None:
+    """ISO-8601 UTC timestamp (``…Z``) → epoch seconds, or ``None`` when unparseable."""
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, OSError):
+        return None
+
+
+def _anchor_from_line(line: bytes) -> float | None:
+    """Anchor epoch-seconds for one transcript line, or ``None`` when it does not qualify.
+
+    Qualification is the cheap substring prefilter (a main-chain assistant entry); the
+    timestamp is then read from the parsed object's top-level ``timestamp`` key (a regex
+    grabs the last match when the line will not parse as JSON).
+    """
+    if _ASSISTANT_MARK not in line or _SIDECHAIN_MARK in line:
+        return None
+    text = line.decode("utf-8", "replace")
+    try:
+        obj = json.loads(text)
+    except ValueError:
+        obj = None
+    if isinstance(obj, dict):
+        raw = obj.get("timestamp")
+        return _parse_iso(raw) if isinstance(raw, str) else None
+    matches = _TS_RE.findall(text)
+    return _parse_iso(matches[-1]) if matches else None
+
+
+def _scan_anchor(path: Path) -> float | None:
+    """Newest main-chain assistant entry's anchor by reading *path* backwards, or ``None``.
+
+    Reads bounded chunks from EOF toward the start, doubling the chunk each step (capped at
+    :data:`_MAX_CHUNK_BYTES`). Lines are appended chronologically, so the FIRST qualifying
+    line found while scanning backwards is the newest — returned immediately. The partial
+    first line of each chunk is carried into the next (earlier) chunk so a line that
+    straddles — or is longer than — a chunk boundary is reassembled before it is inspected.
+    ``None`` when the file holds no qualifying assistant entry (or cannot be read).
+    """
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            pos = handle.tell()
+            carry = b""
+            chunk = _CHUNK_BYTES
+            while pos > 0:
+                read = min(chunk, pos)
+                pos -= read
+                handle.seek(pos)
+                data = handle.read(read) + carry
+                lines = data.split(b"\n")
+                if pos > 0:
+                    # ``lines[0]`` starts earlier in the file — carry it to the next chunk.
+                    carry = lines[0]
+                    lines = lines[1:]
+                else:
+                    carry = b""
+                for line in reversed(lines):
+                    anchor = _anchor_from_line(line)
+                    if anchor is not None:
+                        return anchor
+                chunk = min(chunk * 2, _MAX_CHUNK_BYTES)
+    except OSError:
+        return None
+    return None
+
+
+def _cached_anchor(path: Path, mtime: float) -> float | None:
+    """:func:`_scan_anchor` for *path*, memoized on *mtime* in :data:`_ANCHOR_CACHE`.
+
+    An unchanged transcript (same mtime) is read at most once per process; a moved mtime
+    forces a re-scan. Only reached off the fast path, so the cache is populated solely for
+    transcripts fresh enough to still be warm.
+    """
+    cached = _ANCHOR_CACHE.get(path)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    anchor = _scan_anchor(path)
+    _ANCHOR_CACHE[path] = (mtime, anchor)
+    return anchor
+
+
+def _transcript_path(adapter: object, session: Session) -> Path | None:
+    """Resolve *session*'s transcript ``Path``, or ``None`` when it can't be.
 
     ``transcript_path`` is a concrete-adapter capability (not part of the ``Adapter``
-    protocol), so it is probed defensively via ``getattr`` — a stub adapter without it
-    degrades to ``None`` (an empty cell). Exactly one ``os.stat`` and never a transcript
-    read, since this runs per row per refresh.
+    protocol), so it is probed defensively via ``getattr`` — a stub adapter without it (or
+    one that raises / returns a non-``Path``) degrades to ``None`` (an empty cell).
     """
     getter = getattr(adapter, "transcript_path", None)
     if getter is None:
@@ -108,19 +229,48 @@ def transcript_mtime(adapter: object, session: Session) -> float | None:
         path = getter(session.cwd, session.session_id)
     except OSError:
         return None
-    if not isinstance(path, Path):
+    return path if isinstance(path, Path) else None
+
+
+def transcript_anchor(adapter: object, session: Session, now: float, ttl: int) -> float | None:
+    """Epoch-seconds cache anchor for *session* to feed :func:`countdown`, or ``None``.
+
+    Exactly one ``os.stat`` per call (the transcript is read only when it might be warm).
+    The returned value is what :func:`countdown` turns into the cell:
+
+    * ``None`` — no transcript at all (missing / unresolved / unstat-able): an empty cell.
+    * the transcript **mtime** — FAST PATH: the file itself is already older than *ttl*, so
+      every entry (≤ mtime) is expired. We return without reading the file (and without
+      touching :data:`_ANCHOR_CACHE`), and mtime feeds :func:`countdown` to ``❄ cold``.
+    * ``now - ttl - 1`` — the transcript is fresh but carries no qualifying assistant entry
+      yet (a freshly resumed/opened session whose only new lines are local ``mode`` /
+      ``bridge-session`` / … entries with no API call): a deliberately-expired sentinel so
+      :func:`countdown` renders ``❄ cold`` — the warm cache the fresh mtime implied is a lie.
+    * the **real anchor** — the transcript is fresh AND holds a qualifying assistant entry;
+      its timestamp is the last-request clock :func:`countdown` counts down from.
+    """
+    path = _transcript_path(adapter, session)
+    if path is None:
         return None
     try:
-        return path.stat().st_mtime
+        mtime = path.stat().st_mtime
     except OSError:
         return None
+    if now - mtime >= ttl:
+        return mtime  # fast path: file already older than the TTL → cold, no read
+    anchor = _cached_anchor(path, mtime)
+    if anchor is None:
+        return now - ttl - 1  # fresh mtime but no API turn yet → cold sentinel
+    return anchor
 
 
 def countdown_for(adapter: object, session: Session, now: float | None = None) -> tuple[str, str]:
-    """:func:`countdown` for *session* — resolve its transcript mtime, then format.
+    """:func:`countdown` for *session* — resolve its cache anchor, then format.
 
     A convenience the views call once per (non-draft, non-done) row; *now* defaults to the
     wall clock and is injectable for tests. The draft/done gating stays in the views (they
     already branch on it) — this only turns a live/parked/waiting row into a cell.
     """
-    return countdown(transcript_mtime(adapter, session), time.time() if now is None else now)
+    now = time.time() if now is None else now
+    ttl = cache_ttl_seconds()
+    return countdown(transcript_anchor(adapter, session, now, ttl), now, ttl=ttl)
