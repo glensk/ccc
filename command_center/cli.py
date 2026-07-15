@@ -891,21 +891,29 @@ def cmd_prune(args: argparse.Namespace) -> int:
     ``ai.py``'s commit-message generation) that inherited the launching session's
     AIM. ``--dry-run`` lists them without deleting.
     """
-    from .core import headless_leak_ids
+    from .core import headless_leak_ids, orphan_launched_ids
     from .models import humanize_age, short_id
 
     adapter = _adapter()
     live_ids = {ls.session_id for ls in adapter.discover()}
     with Store() as store:
         headless_ids = headless_leak_ids(store, adapter, live_ids)
-        victims = store.prunable_sessions(protect_ids=live_ids, headless_ids=headless_ids)
+        orphan_ids = orphan_launched_ids(store, adapter, live_ids)
+        victims = store.prunable_sessions(
+            protect_ids=live_ids, headless_ids=headless_ids, orphan_ids=orphan_ids
+        )
         if not victims:
             print("nothing to prune — no leftover sessions")
             return 0
         for session in victims:
             cwd = session.cwd or "?"
             age = humanize_age(session.last_response_at)
-            tag = "headless" if session.session_id in headless_ids else "empty"
+            if session.session_id in headless_ids:
+                tag = "headless"
+            elif session.session_id in orphan_ids:
+                tag = "orphan"
+            else:
+                tag = "empty"
             print(f"  {short_id(session.session_id)}  {cwd:<28}  {age:<6}  [{tag}]")
         if args.dry_run:
             print(f"[dry-run] would prune {len(victims)} session(s)")
@@ -1830,62 +1838,67 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
     return 1
 
 
-def cmd_unlaunch(args: argparse.Namespace) -> int:
-    """Bring a launched job back to FUTURE (draft) so it can be re-launched (decision 12).
+def unlaunch_job(
+    store: Store, cfg: config.Config, session_id: str, live_ids: set[str]
+) -> tuple[bool, str]:
+    """Bring a launched job back to FUTURE (draft); return ``(ok, message)`` (decision 12).
 
-    Guards: (a) NO live process (fresh live-registry check) — kill/exit the tab first;
+    The pure state-logic core shared by ``ccc unlaunch`` (CLI) and the TUI dead-row dialog:
+    no printing, and it takes an already-open *store* plus the caller's live-id set.
+    Guards: (a) NO live process (id in *live_ids*) — kill/exit the tab first;
     (b) launched-draft provenance — a ``future_file`` on the row OR an archived job file for
     the UUID (refuse otherwise, so a hand-typed or genuinely-live session id can't be
-    demoted); (c) ``done=0``. Action: restore ``draft=1`` + ``status=parked``, move the job
-    file back out of ``future/_archive/`` (fresh export if the archive copy is gone), and
-    remove the running mirror. The transcript is preserved untouched, so a later ``start-job``
-    resumes it (decision 14).
+    demoted); (c) ``done=0``. On success: restore ``draft=1`` + ``status=parked``, move the
+    job file back out of ``future/_archive/`` (fresh export if the archive copy is gone), and
+    remove the running mirror. Any transcript is preserved untouched, so a later ``start-job``
+    resumes it (decision 14). The caller runs ``_spawn_sync_mirrors`` afterwards.
     """
     from . import futuresync, mirrors
 
+    session = store.get(session_id)
+    if session is None:
+        return False, f"no such session {session_id}"
+    if session_id in live_ids:  # (a)
+        return False, f"{session_id} is still live — kill or exit its tab first"
+    if session.done:  # (c)
+        return False, f"{session_id} is done — reopen it with `ccc mark-done --undo` first"
+    archived_file = None if session.future_file else _archived_job_file(cfg, session_id)
+    if not session.future_file and archived_file is None:  # (b)
+        return False, (
+            f"{session_id} has no launched-draft provenance (no future-job file) — "
+            "refusing to unlaunch"
+        )
+    # Restore the future-job state, then the file, then drop the running mirror.
+    if archived_file is not None:  # future_file was cleared — point it back at the archive
+        store.update_fields(
+            session_id,
+            future_file=futuresync._vault_relpath(cfg, archived_file),  # pylint: disable=protected-access
+        )
+    store.update_fields(session_id, draft=True, status=Status.PARKED.value)
+    refreshed = store.get(session_id)
+    if refreshed is not None:
+        futuresync.unarchive_file(store, cfg, refreshed)  # archive → live (fresh export if gone)
+    mirrors.remove_mirror(cfg, session_id)  # drop its running mirror now
+    return True, f"unlaunched {session_id} → future job (draft)"
+
+
+def cmd_unlaunch(args: argparse.Namespace) -> int:
+    """Bring a launched job back to FUTURE (draft) so it can be re-launched (decision 12).
+
+    Thin CLI wrapper over :func:`unlaunch_job`: takes a fresh live-registry snapshot, opens
+    the store, and prints the ``(ok, message)`` result. See that function for the guards +
+    action.
+    """
     cfg = config.load_config()
     adapter = _adapter()
     live_ids = {ls.session_id for ls in adapter.discover() if ls.alive}
     with Store() as store:
-        session = store.get(args.session_id)
-        if session is None:
-            print(f"error: no such session {args.session_id}", file=sys.stderr)
-            return 1
-        if args.session_id in live_ids:  # (a)
-            print(
-                f"error: {args.session_id} is still live — kill or exit its tab first",
-                file=sys.stderr,
-            )
-            return 1
-        if session.done:  # (c)
-            print(
-                f"error: {args.session_id} is done — reopen it with `ccc mark-done --undo` first",
-                file=sys.stderr,
-            )
-            return 1
-        archived_file = None if session.future_file else _archived_job_file(cfg, args.session_id)
-        if not session.future_file and archived_file is None:  # (b)
-            print(
-                f"error: {args.session_id} has no launched-draft provenance "
-                "(no future-job file) — refusing to unlaunch",
-                file=sys.stderr,
-            )
-            return 1
-        # Restore the future-job state, then the file, then drop the running mirror.
-        if archived_file is not None:  # future_file was cleared — point it back at the archive
-            store.update_fields(
-                args.session_id,
-                future_file=futuresync._vault_relpath(cfg, archived_file),  # pylint: disable=protected-access
-            )
-        store.update_fields(args.session_id, draft=True, status=Status.PARKED.value)
-        refreshed = store.get(args.session_id)
-        if refreshed is not None:
-            futuresync.unarchive_file(
-                store, cfg, refreshed
-            )  # archive → live (fresh export if gone)
-        mirrors.remove_mirror(cfg, args.session_id)  # drop its running mirror now
+        ok, msg = unlaunch_job(store, cfg, args.session_id, live_ids)
+    if not ok:
+        print(f"error: {msg}", file=sys.stderr)
+        return 1
     _spawn_sync_mirrors(cfg)
-    print(f"unlaunched {args.session_id} → future job (draft)")
+    print(msg)
     return 0
 
 
@@ -2923,7 +2936,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_rm.set_defaults(func=cmd_rm)
 
     p_prune = sub.add_parser(
-        "prune", help="delete contentless leftover rows (e.g. headless `claude -p` junk)"
+        "prune",
+        help=(
+            "delete leftover rows: contentless junk, headless `claude -p` one-shots, and "
+            "dead-launched jobs (started but never had a turn → no resumable transcript)"
+        ),
     )
     p_prune.add_argument("--dry-run", action="store_true", help="list candidates without deleting")
     p_prune.set_defaults(func=cmd_prune)

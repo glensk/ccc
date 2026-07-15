@@ -396,11 +396,14 @@ class Store:  # pylint: disable=too-many-public-methods
         return len(ids)
 
     def prunable_sessions(
-        self, protect_ids: Iterable[str] = (), headless_ids: Iterable[str] = ()
+        self,
+        protect_ids: Iterable[str] = (),
+        headless_ids: Iterable[str] = (),
+        orphan_ids: Iterable[str] = (),
     ) -> list[Session]:
         """Sessions that look like leftover headless/SDK junk.
 
-        Two kinds qualify, and neither is ever live (id in *protect_ids*), done, or
+        Three kinds qualify, and none is ever live (id in *protect_ids*), done, or
         kept (a user deliberately marked those):
 
         * **Contentless** — no signal of its own at all: no aim, prompts,
@@ -414,16 +417,23 @@ class Store:  # pylint: disable=too-many-public-methods
           launching session, so they slip past the contentless guards; we prune them
           regardless of that spurious content. The caller supplies the set (it owns
           transcript classification — see ``ClaudeAdapter.is_oneshot_headless``).
+        * **Dead launched** (*orphan_ids*) — a future job that ``start-job`` launched
+          (draft flag cleared) but that never had a turn, so no transcript exists and
+          it can't be resumed. It carries an AIM inherited from the launch, so the
+          contentless guards spare it too; we prune it regardless. The caller owns
+          transcript classification — see ``core.orphan_launched_ids``.
 
-        Transcripts persist either way — a pruned id is still resumable.
+        Transcripts persist either way — a pruned id is still resumable (an
+        orphan/dead-launched one had none to begin with).
         """
         protect = set(protect_ids)
         headless = set(headless_ids)
+        orphans = set(orphan_ids)
         out: list[Session] = []
         for session in self.list_sessions(include_archived=True):
             if session.session_id in protect or session.done or session.keep:
                 continue
-            if session.session_id in headless:
+            if session.session_id in headless or session.session_id in orphans:
                 out.append(session)
                 continue
             if session.aim or session.summary:

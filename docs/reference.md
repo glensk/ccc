@@ -50,7 +50,7 @@ flags. Grouped by what they do:
 - `ccc resume <id>` — resume a session in this terminal (`execvp`).
 - `ccc resume-job <id>` — resume a parked session in a new tab (focuses it if already live).
 - `ccc focus-job <id>` — bring a live session's tab forward (verifies it is live first).
-- `ccc rm` · `ccc prune` — drop a tracked row / delete contentless `claude -p` leftovers.
+- `ccc rm` · `ccc prune` — drop a tracked row / delete leftovers (contentless, headless `claude -p`, and dead-launched jobs that never had a turn).
 - `ccc peek` (`--print`) · `ccc jump` — the macOS peek panel / the ccc↔session toggle.
 
 **Obsidian & mirrors**
@@ -531,6 +531,18 @@ shell-invokable equivalent of pressing **`r`** on a parked (`☾`) row — it op
 focuses the existing tab instead when the session is still live, and refuses a transcript-less or
 draft session.
 
+**Dead rows (a launched job that never had a turn).** `ccc start-job` clears a future job's draft
+flag and execs `claude --session-id <id>`; if that tab is closed before the first turn (or the work
+happened in a different session), the row is stranded — no longer a FUTURE draft, yet with no
+`<id>.jsonl` it can't be resumed. Pressing **`r`** on such a row opens a triage dialog: **Restore to
+FUTURE** (re-lists it as a job to run — offered only when the launched-draft file is still
+recoverable), **Delete** (removes it from the command center), or **Keep**. These phantoms carry an
+AIM inherited from the launch, so the contentless guards spare them; `ccc prune` and a daemon pass
+now reap them anyway (they are `[orphan]`-tagged in `prune`'s output) — a row is only ever treated
+as dead-launched when it is parked, not live, `prompt_count == 0`, **and** has no transcript under
+any account (so a real session whose transcript was merely deleted, which keeps a non-zero
+`prompt_count`, is never auto-deleted).
+
 > **Headless `claude -p` sessions never appear.** Both row-creating paths skip
 > them: the adapter ignores live `~/.claude/sessions/<pid>.json` entries whose
 > `entrypoint` starts with `sdk` (the daemon's own summary calls, etc.), and the
@@ -845,10 +857,11 @@ ccc daemon --uninstall             # remove it
 Reaping is **off by default** (`reap = false` — fresh-install inert; enable it to
 auto-close). When on it is conservative: only `interactive`, only `idle` past
 `idle_timeout_min` (default 60), never `keep`/`done`, never while a child process (tool) runs.
-Each pass also prunes leftover rows from headless `claude -p` runs — both
-*contentless* rows (zero signal of their own: no aim/prompts/summary/next/sub-goals)
-and *headless one-shots* detected by their transcript (e.g. `ai.py`'s
-commit-message generation, which carries an inherited aim) — never a row that is
+Each pass also prunes leftover rows three ways — *contentless* rows (zero signal of
+their own: no aim/prompts/summary/next/sub-goals), *headless one-shots* detected by
+their transcript (e.g. `ai.py`'s commit-message generation, which carries an inherited
+aim), and *dead-launched* jobs (a `start-job` that never had a turn: parked,
+`prompt_count == 0`, no transcript, despite an inherited aim) — never a row that is
 live, done, or kept. Transcripts persist — resume any reaped session by id.
 Tunables live in `~/.claude/command-center/config.toml`.
 

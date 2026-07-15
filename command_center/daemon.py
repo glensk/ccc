@@ -31,7 +31,7 @@ from pathlib import Path
 
 from . import config
 from .adapters.claude import ClaudeAdapter
-from .core import headless_leak_ids, reconcile
+from .core import headless_leak_ids, orphan_launched_ids, reconcile
 from .models import Session, Status, deadline_badge, now_ms
 from .notify import notify
 from .store import Store
@@ -162,6 +162,7 @@ def run_once(
             victims = store.prunable_sessions(
                 protect_ids=live.keys(),
                 headless_ids=headless_leak_ids(store, adapter, set(live)),
+                orphan_ids=orphan_launched_ids(store, adapter, set(live)),
             )
             report.pruned = [s.session_id for s in victims]
             if victims and not dry_run:

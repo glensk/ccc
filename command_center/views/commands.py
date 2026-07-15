@@ -106,7 +106,8 @@ COMMANDS: list[Command] = [
             "so r just brings it forward. If it is PARKED (process gone) r resumes it in "
             "a new tab — unless it has no recorded conversation on disk (it never had a "
             "turn, or its transcript was deleted), which can't be resumed: r then offers "
-            "to archive the dead row instead of opening a doomed tab."
+            "to restore the dead row to FUTURE (so it can be re-run), delete it, or keep "
+            "it — instead of opening a doomed tab."
             " Enter on the highlighted row does the same (resume / switch to its tab)."
         ),
         action="resume",

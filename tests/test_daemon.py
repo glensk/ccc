@@ -27,6 +27,18 @@ from command_center.store import Store
 DAY_MS = 86_400_000
 
 
+def _write_transcript(home: Path, cwd: str, session_id: str) -> None:
+    """Give *session_id* a real (minimal) transcript under *home*'s projects dir.
+
+    A session the daemon scores / short-aims genuinely has a transcript on disk; without
+    one it is a *dead-launched orphan* (``core.orphan_launched_ids``) and the prune pass
+    reaps it before scoring — so tests exercising the backfill passes must materialise it.
+    """
+    path = home / "projects" / cwd.replace("/", "-") / f"{session_id}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "last-prompt"}) + "\n", encoding="utf-8")
+
+
 class _VersionStub:
     """Minimal adapter returning a fixed Claude Code version for any session."""
 
@@ -163,6 +175,7 @@ def test_daemon_backfills_unscored_aim(tmp_path: Path, monkeypatch: pytest.Monke
     with Store() as store:
         store.ensure("s1", cwd="/repo")
         store.update_fields("s1", aim="ship the usage panel with passing tests", aim_score=-1)
+    _write_transcript(tmp_path, "/repo", "s1")  # a real (scorable) session, not a dead orphan
 
     report = run_once(do_reap=False, do_summary=False, do_progress=False, do_alerts=False)
     assert "s1" in report.scored
@@ -197,6 +210,8 @@ def test_daemon_backfills_missing_short_aim(
         store.ensure("has", cwd="/repo")
         store.update_fields("has", aim="the login bug is fixed", aim_score=70)
         store.set_short_aim("has", "fix login bug")
+    for sid in ("needs", "has"):  # real (labelled) sessions, not dead-launched orphans
+        _write_transcript(tmp_path, "/repo", sid)
 
     report = run_once(do_reap=False, do_summary=False, do_progress=False, do_alerts=False)
     assert "needs" in report.short_aimed

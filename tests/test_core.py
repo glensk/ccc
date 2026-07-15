@@ -702,3 +702,43 @@ def test_scheduled_drafts_sink_below_finished_soonest_first(tmp_path: Path) -> N
     order = [r.session.session_id for r in build_rows(store, _StubAdapter())]
     assert order == ["active", "future", "done", "sched-soon", "sched-late"]
     store.close()
+
+
+def test_orphan_launched_ids_flags_only_never_turned_parked_rows(tmp_path: Path) -> None:
+    """A dead-launched phantom (parked, no turn, no transcript) is flagged; real work isn't."""
+    from command_center.core import orphan_launched_ids
+
+    class _TxAdapter(_StubAdapter):
+        """Adds the concrete-adapter ``transcript_path`` probe; reports a hit only for *have*."""
+
+        def __init__(self, have: set[str]) -> None:
+            self._have = have
+
+        def transcript_path(
+            self, cwd: str, session_id: str, config_dir: str | None = None
+        ) -> Path | None:
+            return Path(f"/x/{session_id}.jsonl") if session_id in self._have else None
+
+    store = Store(tmp_path / "s.db")
+    # dead-launched phantom: parked, prompt_count 0, inherited AIM, NO transcript → flagged.
+    store.ensure("dead", cwd="/repo")
+    store.update_fields("dead", aim="fix antennapod", status=Status.PARKED.value)
+    # real parked session whose transcript was merely deleted (kept prompt_count) → spared.
+    store.ensure("deleted_tx", cwd="/repo")
+    store.update_fields("deleted_tx", aim="x", status=Status.PARKED.value, prompt_count=3)
+    # real parked session WITH a transcript → spared.
+    store.ensure("real", cwd="/repo")
+    store.update_fields("real", status=Status.PARKED.value)
+    # a FUTURE draft (no transcript by design) → spared.
+    store.ensure("draft", cwd="/repo")
+    store.update_fields("draft", aim="later", draft=True, status=Status.PARKED.value)
+    # a freshly-created idle row still awaiting its first turn / scoring → spared (not parked).
+    store.ensure("idle", cwd="/repo")
+    store.update_fields("idle", aim="pending", status=Status.IDLE.value)
+    # a live never-turned row → spared via live_ids.
+    store.ensure("live", cwd="/repo")
+    store.update_fields("live", status=Status.PARKED.value)
+
+    got = orphan_launched_ids(store, _TxAdapter(have={"real"}), live_ids={"live"})
+    assert got == {"dead"}
+    store.close()

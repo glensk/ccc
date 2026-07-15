@@ -588,6 +588,64 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class DeadRowScreen(ModalScreen[str | None]):
+    """Triage a dead row (a launched job that never had a turn → no resumable transcript).
+
+    Three real outcomes, returned as a choice string: ``"restore"`` (put it back in FUTURE so
+    it can be re-run — only offered when *allow_restore*), ``"delete"`` (remove it from the
+    command center), or ``None`` (Keep, the safe default on Esc). Keys: ``r`` restore,
+    ``d`` delete, ``Esc``/``k`` keep.
+    """
+
+    BINDINGS = [
+        Binding("escape", "keep", show=False),
+        Binding("k", "keep", show=False),
+        Binding("d", "delete", show=False),
+        Binding("r", "restore", show=False),
+    ]
+    DEFAULT_CSS = """
+    DeadRowScreen { align: center middle; }
+    #box {
+        width: 70%;
+        max-width: 84;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: round $accent;
+    }
+    #box Label { margin-bottom: 1; }
+    #buttons { height: auto; align-horizontal: right; }
+    #buttons Button { margin-left: 2; }
+    """
+
+    def __init__(self, prompt: str, *, allow_restore: bool) -> None:
+        super().__init__()
+        self._prompt = prompt
+        self._allow_restore = allow_restore
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="box"):
+            yield Label(self._prompt)
+            with Horizontal(id="buttons"):
+                yield Button("Keep", id="keep")
+                if self._allow_restore:
+                    yield Button("Restore to FUTURE", id="restore")
+                yield Button("Delete", id="delete", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(None if event.button.id == "keep" else event.button.id)
+
+    def action_keep(self) -> None:
+        self.dismiss(None)
+
+    def action_delete(self) -> None:
+        self.dismiss("delete")
+
+    def action_restore(self) -> None:
+        if self._allow_restore:
+            self.dismiss("restore")
+
+
 # --------------------------------------------------------------------------- #
 # Future-job (draft) creation modals: pick a category → pick/create a repo →
 # capture AIM + prompt + deadline. Chained from `action_new_job` (the `fn` chord).
@@ -2856,24 +2914,54 @@ class CommandCenterApp(App[None]):
             )
 
     def _offer_archive_orphan(self, sid: str) -> None:
-        """A parked session with no transcript can't be resumed — offer to archive it."""
+        """A parked session with no transcript can't be resumed — triage the dead row.
+
+        Such a row is almost always a future job that ``start-job`` launched but that never
+        had a turn (its tab was closed first, or the work happened in another session), so
+        there is no ``<id>.jsonl`` to resume. Offer the three real outcomes: restore it to
+        FUTURE so it can be re-run (only when it still has launched-draft provenance), delete
+        it from the command center outright, or keep it as-is.
+        """
         if (store := self.store) is None or (session := store.get(sid)) is None:
             return
-        label = colors.short_folder(session.cwd)
+        from .. import cli, mirrors  # pylint: disable=import-outside-toplevel
 
-        def handle(confirmed: bool | None) -> None:
-            if confirmed and (st := self.store) is not None:
-                st.update_fields(sid, archived=True)
-                self.notify(f"Archived (no conversation to resume): {label}")
+        label = colors.short_folder(session.cwd)
+        allow_restore = bool(session.future_file) or (
+            cli._archived_job_file(self.cfg, sid) is not None  # pylint: disable=protected-access
+        )
+
+        def handle(choice: str | None) -> None:
+            if (st := self.store) is None:
+                return
+            if choice == "delete":
+                st.delete(sid)
+                mirrors.remove_mirror(self.cfg, sid)  # drop any mirror the launch left behind
+                cli._spawn_sync_mirrors(self.cfg)  # pylint: disable=protected-access
+                self.notify(f"Deleted dead row (no conversation): {label}")
+                self.refresh_data()
+            elif choice == "restore":
+                ok, msg = cli.unlaunch_job(st, self.cfg, sid, set())
+                if ok:
+                    cli._spawn_sync_mirrors(self.cfg)  # pylint: disable=protected-access
+                self.notify(
+                    f"Restored to FUTURE: {label}" if ok else msg,
+                    severity="information" if ok else "warning",
+                    timeout=6 if ok else 10,
+                )
                 self.refresh_data()
 
+        action_line = (
+            "Restore to FUTURE re-lists it as a job to run; Delete removes it."
+            if allow_restore
+            else "Delete removes it from the command center."
+        )
         self.push_screen(
-            ConfirmScreen(
+            DeadRowScreen(
                 f"{label} {short_id(sid)} has no recorded conversation on disk — it never "
                 "had a turn (or its transcript was deleted), so it can't be resumed.\n"
-                "Archive this dead row?",
-                yes_label="Archive",
-                no_label="Keep",
+                f"{action_line}",
+                allow_restore=allow_restore,
             ),
             handle,
         )

@@ -277,6 +277,27 @@ def test_prunable_headless_overrides_content(tmp_path: Path) -> None:
     assert {s.session_id for s in victims} == {"headless"}
 
 
+def test_prunable_orphan_overrides_aim(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    # A dead-launched job: a future job that start-job launched but that never had a turn,
+    # so it carries an AIM inherited from the launch (which would spare it from the
+    # contentless guards) yet has no transcript to resume. orphan_ids prunes it anyway.
+    store.ensure("orphan", cwd="/repo")
+    store.update_fields("orphan", aim="inherited aim")
+    # done / kept / live rows are protected even when the caller names them as orphans.
+    store.ensure("done_orphan")
+    store.update_fields("done_orphan", aim="x", done=True)
+    store.ensure("kept_orphan")
+    store.update_fields("kept_orphan", aim="x", keep=True)
+    store.ensure("live_orphan")
+
+    victims = store.prunable_sessions(
+        protect_ids={"live_orphan"},
+        orphan_ids={"orphan", "done_orphan", "kept_orphan", "live_orphan"},
+    )
+    assert {s.session_id for s in victims} == {"orphan"}
+
+
 def test_aim_score_columns_roundtrip(tmp_path: Path) -> None:
     # Guards the _SESSION_COLUMNS whitelist: an un-whitelisted column is silently dropped.
     store = _store(tmp_path)

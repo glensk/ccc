@@ -95,6 +95,45 @@ def headless_leak_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set
     }
 
 
+def orphan_launched_ids(store: Store, adapter: Adapter, live_ids: set[str]) -> set[str]:
+    """Ids of *dead launched* rows: a future job that was started but never had a turn.
+
+    ``ccc start-job`` clears the draft flag and execs ``claude --session-id <id>``. If that
+    tab is closed before the first turn (e.g. the work happened in a different session), the
+    row is stranded: no longer a FUTURE draft, yet with no ``<id>.jsonl`` on disk it can't be
+    resumed either. It carries an AIM *inherited from the launch*, so the contentless guards
+    in :meth:`Store.prunable_sessions` spare it and ``prune`` never reaps it — the exact
+    phantom the dead-row dialog surfaces. This set lets ``prune`` (and the daemon) delete
+    them despite that inherited AIM.
+
+    A row qualifies only when it is unambiguously never-turned junk: a Claude session
+    (transcript-path resolution is Claude-specific), **parked** (a dead-launched job's process
+    is gone, so reconcile parks it — an ``idle`` row may just be a freshly-created session
+    still awaiting its first turn / scoring, which must NOT be reaped), not a live/draft row,
+    ``prompt_count`` still 0, AND no transcript resolves under any account. Requiring BOTH
+    ``prompt_count==0`` and a missing transcript spares a real session whose transcript was
+    merely deleted (it kept a non-zero ``prompt_count``) — those stay for the Archive/dialog
+    path. ``done`` / ``keep`` rows are filtered by the caller (``prunable_sessions``).
+
+    ``transcript_path`` is a concrete-adapter capability (like ``has_background_task`` /
+    ``observed_model``), NOT part of the :class:`Adapter` protocol — probe it defensively so a
+    stub adapter without it reaps nothing rather than raising.
+    """
+    resolve = getattr(adapter, "transcript_path", None)
+    if resolve is None:
+        return set()
+    return {
+        session.session_id
+        for session in store.list_sessions(include_archived=True)
+        if session.session_id not in live_ids
+        and session.agent == "claude"
+        and not session.draft
+        and session.status == Status.PARKED.value
+        and session.prompt_count == 0
+        and resolve(session.cwd, session.session_id, session.config_dir) is None
+    }
+
+
 def _has_background_task(adapter: Adapter, pid: int) -> bool:
     """Whether *adapter* reports a live background task for *pid* (optional capability).
 
