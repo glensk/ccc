@@ -742,6 +742,8 @@ def _register(  # pylint: disable=too-many-arguments,too-many-positional-argumen
         start_date=(job.start_date.strip() or None),
         depends_on=(job.depends_on.strip() or None),
         job_type=job.job_type,
+        llm_overseer=job.llm_overseer,
+        llm_exec=job.llm_exec,
         # No `account:` in the file ⇒ route this NEW job per the job_account policy.
         config_dir=_account_config_dir(job.account) or routing.pick_job_account()[1],
     )

@@ -353,6 +353,27 @@ def test_pad_ready_registers_a_job_and_resets_the_pad(env: Env) -> None:
     assert padjob.status == "draft" and padjob.session_id == "" and padjob.aim == ""
 
 
+def test_registration_keeps_the_files_llm_choices(env: Env) -> None:
+    """The pad's/file's llm_overseer + llm_exec land in the DB row (not DEFAULT_LLM)."""
+    env.pad.parent.mkdir(parents=True, exist_ok=True)
+    env.pad.write_text(
+        serialize(
+            session_id="",
+            aim="Cheap pad task",
+            status="ready",
+            repo="home/ccc",
+            llm_overseer="haiku-4.5",
+            llm_exec="haiku-4.5",
+        ),
+        encoding="utf-8",
+    )
+    futuresync.run_sync(env.store, env.cfg)
+
+    draft = next(s for s in env.store.list_sessions() if s.draft)
+    assert draft.llm_overseer == "haiku-4.5"
+    assert draft.llm_exec == "haiku-4.5"
+
+
 # ---------------------------------------------------------------------------
 # deletion grace + rename detection
 # ---------------------------------------------------------------------------
