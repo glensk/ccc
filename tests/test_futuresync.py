@@ -353,6 +353,34 @@ def test_pad_ready_registers_a_job_and_resets_the_pad(env: Env) -> None:
     assert padjob.status == "draft" and padjob.session_id == "" and padjob.aim == ""
 
 
+def test_pad_draft_with_launch_ticked_registers_and_launches(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Phone flow: ticking launch on the pad alone (status still draft) submits the job."""
+    calls: list[str] = []
+
+    def fake_spawn(session_id: str) -> bool:
+        calls.append(session_id)
+        return True
+
+    monkeypatch.setattr(futuresync, "_spawn_launch", fake_spawn)
+    env.pad.parent.mkdir(parents=True, exist_ok=True)
+    env.pad.write_text(
+        serialize(
+            session_id="", aim="Pad tap-launch task", status="draft", repo="home/ccc"
+        ).replace("launch: false", "launch: true"),
+        encoding="utf-8",
+    )
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert len(report.registered) == 1
+    assert report.launched == report.registered == calls
+    draft = next(s for s in env.store.list_sessions() if s.draft)
+    assert draft.aim == "Pad tap-launch task"
+    padjob = parse_job_file(env.pad.read_text(encoding="utf-8"))
+    assert padjob.status == "draft" and padjob.aim == ""  # pad reset after consuming
+
+
 def test_registration_keeps_the_files_llm_choices(env: Env) -> None:
     """The pad's/file's llm_overseer + llm_exec land in the DB row (not DEFAULT_LLM)."""
     env.pad.parent.mkdir(parents=True, exist_ok=True)

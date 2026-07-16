@@ -693,7 +693,10 @@ def _handle_pad(  # pylint: disable=too-many-arguments,too-many-positional-argum
     except OSError:
         return
     job = parse_job_file(text)
-    if job.status != "ready":
+    # A ticked launch toggle on a draft pad implies "ready": the phone flow is
+    # write AIM/prompt + tap the launch checkbox — no status edit needed. An
+    # "error" pad stays skipped until the user resets its status.
+    if job.status != "ready" and not (job.status == "draft" and launch_requested(job)):
         return  # draft / blank pad — nothing to register
     padjob = dataclasses.replace(job, session_id=_fresh_uuid(taken), status="ready")
     errors = validate(padjob, git_base)

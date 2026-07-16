@@ -78,6 +78,13 @@ the job (in an iTerm tab, or a tmux window when scripting isn't available, e.g. 
 launchd watcher). The file is reset to `launch: false` *before* the launch spawns, so a
 failed spawn never re-triggers. This is the phone-flip → sync-daemon → launch chain.
 
+On the **capture pad**, ticking `launch` is enough by itself: a `draft` pad with the
+toggle on is treated as `ready` and registers **and** launches in one pass — no status
+edit needed (the mobile Properties `status` field is free text, and `ready` never
+persists anywhere, so its suggestions can't offer the one value that matters). A pad
+flipped to `status: error` by a failed validation stays skipped until you reset its
+status, even with `launch` still ticked.
+
 ## Whole-lifecycle mirrors
 
 With the mirror flags on, every tracked session becomes a markdown note (export-only —
