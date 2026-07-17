@@ -80,7 +80,9 @@ failed spawn never re-triggers. This is the phone-flip → sync-daemon → launc
 
 On the **capture pad**, ticking `launch` is enough by itself: a `draft` pad with the
 toggle on is treated as `ready` and registers **and** launches in one pass — no status
-edit needed (the mobile Properties `status` field is free text, and `ready` never
+edit needed. An empty `repo` on the pad defaults to `$HOME`, so the minimal capture is
+literally an AIM plus the launch tick (a blank repo in a copied job *file* still
+errors — there it is more likely a mistake) (the mobile Properties `status` field is free text, and `ready` never
 persists anywhere, so its suggestions can't offer the one value that matters). A pad
 flipped to `status: error` by a failed validation keeps retrying while `launch` stays
 ticked: fix the offending field and the next sync pass registers and launches it — no

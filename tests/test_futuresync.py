@@ -425,6 +425,22 @@ def test_pad_error_with_launch_still_invalid_no_churn(env: Env) -> None:
     assert [s for s in env.store.list_sessions() if s.draft] == []
 
 
+def test_pad_empty_repo_defaults_to_home(env: Env) -> None:
+    """AIM-only pad capture: no repo picked ⇒ the job runs in $HOME."""
+    env.pad.parent.mkdir(parents=True, exist_ok=True)
+    env.pad.write_text(
+        serialize(session_id="", aim="Homeless task", status="ready", repo=""),
+        encoding="utf-8",
+    )
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert len(report.registered) == 1
+    draft = next(s for s in env.store.list_sessions() if s.draft)
+    assert draft.cwd == str(Path.home())
+    padjob = parse_job_file(env.pad.read_text(encoding="utf-8"))
+    assert padjob.status == "draft" and padjob.aim == ""  # pad reset after consuming
+
+
 def test_registration_keeps_the_files_llm_choices(env: Env) -> None:
     """The pad's/file's llm_overseer + llm_exec land in the DB row (not DEFAULT_LLM)."""
     env.pad.parent.mkdir(parents=True, exist_ok=True)

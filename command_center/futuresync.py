@@ -700,7 +700,15 @@ def _handle_pad(  # pylint: disable=too-many-arguments,too-many-positional-argum
     # invalid pad rewrites an identical error block (idempotent, no mtime churn).
     if job.status != "ready" and not (job.status in ("draft", "error") and launch_requested(job)):
         return  # draft / blank pad — nothing to register
-    padjob = dataclasses.replace(job, session_id=_fresh_uuid(taken), status="ready")
+    # Pad-only default: an empty repo means "run in $HOME" — the phone flow is
+    # often just an AIM + the launch tick. A blank repo in a copied job FILE
+    # still errors (there it is more likely a mistake than an intent).
+    padjob = dataclasses.replace(
+        job,
+        session_id=_fresh_uuid(taken),
+        status="ready",
+        repo=(job.repo.strip() or str(Path.home())),
+    )
     errors = validate(padjob, git_base)
     if errors:
         _write_error(pad, text, errors, report)
