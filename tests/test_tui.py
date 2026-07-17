@@ -1990,7 +1990,7 @@ def test_work_card_hidden_and_t2_inert_without_a_work_account(
     asyncio.run(scenario())
 
 
-def test_nixos_overseer_cards_default_visibility_and_t5_t6_toggle(
+def test_nixos_overseer_cards_default_visibility_and_to_ta_toggle(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`t5`/`t6` flip the two nixos-overseer card gates and persist; defaults differ.
@@ -2019,7 +2019,7 @@ def test_nixos_overseer_cards_default_visibility_and_t5_t6_toggle(
 
             # t5 hides the supervised card; persisted.
             await pilot.press("t")
-            await pilot.press("5")
+            await pilot.press("o")
             await pilot.pause()
             assert app.cfg.card_nixos_overseer_supervised is False
             assert config.load_config().card_nixos_overseer_supervised is False
@@ -2027,7 +2027,7 @@ def test_nixos_overseer_cards_default_visibility_and_t5_t6_toggle(
 
             # t6 shows the tier_a card; persisted.
             await pilot.press("t")
-            await pilot.press("6")
+            await pilot.press("a")
             await pilot.pause()
             assert app.cfg.card_nixos_overseer_tier_a is True
             assert config.load_config().card_nixos_overseer_tier_a is True
@@ -2071,7 +2071,7 @@ def test_t_menu_lists_nixos_overseer_chords(
             await asyncio.sleep(0.9)  # > 0.7s pure-leader window → timeout fires the menu
             await pilot.pause()
             assert notes, "pressing t alone should toast a menu"
-            assert "t5" in notes[-1] and "t6" in notes[-1]
+            assert "to" in notes[-1] and "ta" in notes[-1]
             # The menu lists each chord's gloss + its live state (now: shown/hidden).
             assert "nixos overseer supervised card  (now: shown)" in notes[-1]
             assert "nixos overseer tier_a card  (now: hidden)" in notes[-1]
@@ -2484,3 +2484,258 @@ def test_tui_poll_consumes_toggle_and_focuses(
     assert records["toggle_after"] is False  # poll consumed the toggle
     assert records["name"] == ["!!!"]  # fell through to the tab-title focus
     assert records["iterm"] == []  # no ITERM_SESSION_ID → never focused by uuid
+
+
+def test_undo_empty_stack_notifies(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`u` on a fresh app (nothing done yet) just notifies 'Nothing to undo.'"""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            notes: list[str] = []
+            monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
+            app.action_undo()
+            await pilot.pause()
+            assert notes and "Nothing to undo." in notes[-1]
+            assert app._undo_stack == []
+
+    asyncio.run(scenario())
+
+
+def test_undo_mark_done_restores_flags(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo after `d` restores done/status/done_at to their pre-mark values."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)
+    captured: dict[str, str] = {}
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._current = sid
+            assert app.store is not None
+            before = app.store.get(sid)
+            assert before is not None
+            captured["status"] = before.status
+            app.action_mark_done()
+            await settle(pilot)
+            marked = app.store.get(sid)
+            assert marked is not None and marked.done is True  # actually flipped
+            app.action_undo()
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    session = store.get(sid)
+    store.close()
+    assert session is not None
+    assert session.done is False  # un-done
+    assert session.done_at == 0  # timestamp cleared
+    assert session.status == captured["status"]  # status restored
+
+
+def test_undo_close_parked_restores_status(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo after parking a non-live session restores its pre-close status."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)  # no live registry entry => parked
+    captured: dict[str, str] = {}
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._current = sid
+            assert app.store is not None
+            before = app.store.get(sid)
+            assert before is not None
+            captured["status"] = before.status
+            app.action_close()
+            await settle(pilot)
+            app.action_undo()
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    session = store.get(sid)
+    store.close()
+    assert session is not None and session.status == captured["status"]
+
+
+def test_undo_close_live_reopens_tab(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undoing the close of a LIVE session reopens its conversation in a new tab."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)
+    _seed_live_registry(tmp_path, sid, os.getpid())  # alive pid => row is "live"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.update_fields(sid, iterm_session_id="w0t1p0:UUID-1")
+    store.close()
+
+    from command_center.adapters.claude import ClaudeAdapter
+    from command_center.views import tui as tui_mod
+    from command_center.views.tui import CommandCenterApp
+
+    killed: list[int] = []
+    closed: list[str] = []
+    resumed: list[tuple[str, str]] = []
+
+    def fake_kill(pid: int, _sig: int) -> None:
+        killed.append(pid)  # swallow — textual signals its own pid during teardown
+
+    def fake_close(iterm_session_id: str) -> str:
+        closed.append(iterm_session_id)
+        return "tab"
+
+    def fake_resume(cwd: str, session_id: str, config_dir: str = "") -> bool:
+        resumed.append((cwd, session_id))
+        return True
+
+    monkeypatch.setattr(tui_mod.os, "kill", fake_kill)
+    monkeypatch.setattr(tui_mod.terminal, "close_iterm_session", fake_close)
+    monkeypatch.setattr(tui_mod.terminal, "resume_in_new_tab", fake_resume)
+    monkeypatch.setattr(
+        ClaudeAdapter, "transcript_path", lambda self, cwd, sid, cd=None: tmp_path / "fake.jsonl"
+    )
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._current = sid
+            app.action_close()
+            await settle(pilot)
+            app.action_undo()
+            await settle(pilot)
+
+    asyncio.run(scenario())
+
+    assert os.getpid() in killed  # the close SIGTERM'd the process
+    assert resumed == [("/Users/x/repo", sid)]  # undo reopened its conversation in a new tab
+
+
+def test_undo_keep_importance_subgoal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Three undoable actions undo LIFO: the first undo reverts only the sub-goal tick."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)  # 2 sub-goals, the first checked
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.store is not None
+            app._current = sid
+            app.action_keep()  # keep: False -> True
+            app.action_cycle_importance()  # importance: 0 -> 1
+            app.action_toggle_subgoal()  # ticks the 2nd (next unchecked) sub-goal
+            await settle(pilot)
+            assert app.store.get(sid).keep is True  # type: ignore[union-attr]
+            assert app.store.get(sid).importance == 1  # type: ignore[union-attr]
+            assert app.store.list_subgoals(sid)[1].checked is True
+
+            # First undo: LIFO -> only the sub-goal tick reverts.
+            app.action_undo()
+            await settle(pilot)
+            assert app.store.list_subgoals(sid)[1].checked is False
+            assert app.store.get(sid).keep is True  # type: ignore[union-attr]
+            assert app.store.get(sid).importance == 1  # type: ignore[union-attr]
+
+            # Second undo -> importance back to 0.
+            app.action_undo()
+            await settle(pilot)
+            assert app.store.get(sid).importance == 0  # type: ignore[union-attr]
+            assert app.store.get(sid).keep is True  # type: ignore[union-attr]
+
+            # Third undo -> keep back to False.
+            app.action_undo()
+            await settle(pilot)
+            assert app.store.get(sid).keep is False  # type: ignore[union-attr]
+
+    asyncio.run(scenario())
+
+
+def test_undo_view_toggles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo restores the show/hide done + future view flags; undoing never grows the stack."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app._show_finished is False  # default
+            assert app._show_future is True  # default
+            app.action_toggle_finished()  # -> shown
+            app.action_toggle_future()  # -> hidden
+            await settle(pilot)
+            assert app._show_finished is True
+            assert app._show_future is False
+            assert len(app._undo_stack) == 2
+
+            app.action_undo()  # reverts future
+            await settle(pilot)
+            assert app._show_future is True
+            app.action_undo()  # reverts finished
+            await settle(pilot)
+            assert app._show_finished is False
+            assert app._undo_stack == []  # undo never pushed onto the stack
+
+    asyncio.run(scenario())
+
+
+def test_undo_card_toggle_restores_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo after `t1` re-flips the private-card gate and re-persists it; stack ends empty."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.cfg.usage_card_private is True  # default
+            app.action_toggle_card_private()  # -> hidden, persisted
+            await settle(pilot)
+            assert config.load_config().usage_card_private is False
+            assert len(app._undo_stack) == 1
+
+            app.action_undo()  # -> shown again, re-persisted
+            await settle(pilot)
+            assert config.load_config().usage_card_private is True
+            assert app.cfg.usage_card_private is True
+            assert app._undo_stack == []  # the re-entrant toggle did not re-push
+
+    asyncio.run(scenario())
+
+
+def test_undo_stack_caps_at_20(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The undo stack keeps only the most recent _UNDO_MAX (20) entries."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app._current = sid
+            for _ in range(25):
+                app.action_cycle_importance()
+            await settle(pilot)
+            assert len(app._undo_stack) == 20
+
+    asyncio.run(scenario())

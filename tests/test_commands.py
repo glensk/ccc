@@ -66,7 +66,7 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
     assert toggle.footer_key == "t"  # only the leader `t` is the footer mnemonic
     # The leader's chord menu lists every `t…` chord: the per-session account switches
     # tp/tw (first, in registry order), then the view toggles td/tf/ti, the four
-    # usage-card render gates t1…t4, and the two nixos-overseer cards t5/t6.
+    # usage-card render gates t1…t4, and the two nixos-overseer cards to/ta.
     menu = commands.chords_for_leader("t")
     assert [c.key for c in menu] == [
         "tp",
@@ -78,8 +78,8 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "t2",
         "t3",
         "t4",
-        "t5",
-        "t6",
+        "to",
+        "ta",
     ]
     assert {c.word for c in menu} == {
         "private",
@@ -153,26 +153,29 @@ def test_card_toggle_chords_are_t1_to_t4() -> None:
         assert cmd.explanation  # a real explanation, not blank
 
 
-def test_nixos_overseer_card_chords_are_t5_and_t6() -> None:
-    """`t5`/`t6` toggle the two nixos-overseer cards; each is a pure-menu chord (no footer)."""
+def test_nixos_overseer_card_chords_are_to_and_ta() -> None:
+    """`to`/`ta` toggle the two nixos-overseer cards; each is a pure-menu chord (no footer)."""
     expected = {
-        "5": "toggle_card_nixos_overseer_supervised",
-        "6": "toggle_card_nixos_overseer_tier_a",
+        "o": "toggle_card_nixos_overseer_supervised",
+        "a": "toggle_card_nixos_overseer_tier_a",
     }
-    for digit, action in expected.items():
+    for follower, action in expected.items():
         cmd = commands.by_action(action)
-        assert cmd.chord == ("t", digit)
-        assert cmd.key == f"t{digit}"
+        assert cmd.chord == ("t", follower)
+        assert cmd.key == f"t{follower}"
         assert cmd.key == "".join(cmd.chord)  # registry invariant
         assert cmd.section == commands.GLOBAL
         assert cmd.footer_pos is None  # shown only via the `t` leader menu
         assert cmd.bind is None  # a chord, never a plain binding
         assert cmd.explanation  # a real explanation, not blank
-    # They collide with no plain binding, alias, or existing chord digit.
-    binds = {c.bind for c in commands.COMMANDS if c.bind}
-    aliases = {a for c in commands.COMMANDS for a in c.aliases}
-    assert binds.isdisjoint({"5", "6"})
-    assert aliases.isdisjoint({"5", "6"})
+    # Chord followers are namespaced under the `t` leader (plain binds like `d`/`f`
+    # coexist with td/tf), so the only real collision class is another t-chord.
+    chord_followers = {
+        c.chord[1]
+        for c in commands.COMMANDS
+        if c.chord and c.chord[0] == "t" and c.action not in expected.values()
+    }
+    assert chord_followers.isdisjoint({"o", "a"})
 
 
 def test_registry_invariants_hold_with_new_chords() -> None:
@@ -214,6 +217,27 @@ def test_oo_chord_is_open_obsidian() -> None:
     assert cmd.key == "oo"
     assert cmd.section == commands.PER_SESSION
     assert cmd.footer_pos is not None  # visible in the footer hint line
+
+
+def test_undo_is_bound_and_in_footer() -> None:
+    """`u` is the GLOBAL undo binding, sits right after ☾lose in the footer, no collision."""
+    cmd = commands.by_action("undo")
+    assert cmd.key == "u"
+    assert cmd.bind == "u"
+    assert cmd.section == commands.GLOBAL
+    assert cmd.footer_pos is not None
+    assert cmd.explanation.strip()  # a real explanation, not blank
+    # Footer order: `undo` renders right after the ☾lose label.
+    footer = commands.footer_commands()
+    labels = [c.footer_word or c.word for c in footer]
+    assert labels[labels.index("☾lose") + 1] == "undo"
+    # `u` collides with no OTHER plain binding, alias, or chord follower.
+    other_binds = {c.bind for c in commands.COMMANDS if c.bind and c.action != "undo"}
+    aliases = {a for c in commands.COMMANDS for a in c.aliases}
+    chord_keys = {ch for c in commands.COMMANDS if c.chord for ch in c.chord}
+    assert other_binds.isdisjoint({"u"})
+    assert aliases.isdisjoint({"u"})
+    assert chord_keys.isdisjoint({"u"})
 
 
 def test_edit_command_replaces_field_keys_in_footer() -> None:

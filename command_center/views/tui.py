@@ -26,6 +26,7 @@ import subprocess
 import threading
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
 
@@ -205,6 +206,17 @@ _FUTURE_LABEL = "FUTURE"  # separator above the not-yet-started future-job block
 _SCHEDULED_LABEL = "SCHEDULED"  # separator above future jobs with a FIXED start date (very bottom)
 _NEW_REPO_SENTINEL = "\x00new-repo"  # RepoPickerScreen dismiss value → run create_repo_command
 _AT_TAG = re.compile(r"(@[\w-]+)")
+
+_UNDO_MAX = 20  # undo stack depth — plenty for "oops", small enough to never matter
+
+
+@dataclass
+class _UndoEntry:
+    """One reversible action: a toast label + the closure that reverts it."""
+
+    label: str  # e.g. "close (myrepo)" — shown as "Undid: <label>"
+    apply: Callable[[], str | None]  # returns an overriding toast message, or None
+
 
 # Separator-row labels. Only the DONE label (now "done") is still emitted as a status
 # separator (the active list groups by repo category instead); the rest are kept for
@@ -1915,6 +1927,9 @@ class CommandCenterApp(App[None]):
         # unconditionally so attribute access is always safe; only *pre-warmed* (a real
         # websocket) under iTerm — on_mount gates the connect on $ITERM_SESSION_ID.
         self._iterm_link = iterm_api.ItermLink()
+        # Undo stack (the `u` key): most recent last, capped at _UNDO_MAX, this run only.
+        self._undo_stack: list[_UndoEntry] = []
+        self._undoing = False  # True while action_undo runs an entry — suppresses re-push
 
     # ---- layout (top: table, bottom: detail) ----------------------------
     def compose(self) -> ComposeResult:
@@ -3008,6 +3023,44 @@ class CommandCenterApp(App[None]):
             handle,
         )
 
+    # ---- undo (the `u` key) --------------------------------------------
+    def _push_undo(self, label: str, apply: Callable[[], str | None]) -> None:
+        """Record the inverse of a just-performed action (no-op while undoing)."""
+        if self._undoing:
+            return
+        self._undo_stack.append(_UndoEntry(label, apply))
+        del self._undo_stack[:-_UNDO_MAX]
+
+    def action_undo(self) -> None:
+        """Undo the most recent undoable action — the `u` key. LIFO; repeat to go further."""
+        if isinstance(self.screen, ModalScreen):
+            return  # a modal owns its keys — never mutate state under a dialog
+        if not self._undo_stack:
+            self.notify("Nothing to undo.")
+            return
+        entry = self._undo_stack.pop()
+        self._undoing = True
+        try:
+            message = entry.apply()
+        finally:
+            self._undoing = False
+        self.refresh_data()
+        self.notify(message or f"Undid: {entry.label}")
+
+    def _reopen_session(self, sid: str, label: str) -> str:
+        """Reopen a closed session's conversation in a new tab (the undo of a live close).
+
+        The SIGTERMed process can't be revived — resuming the transcript in a fresh
+        tab (same as `r` on a parked row) is the real inverse.
+        """
+        if (store := self.store) is None or (session := store.get(sid)) is None:
+            return "Can't undo — session no longer exists."
+        if self.adapter.transcript_path(session.cwd, sid, session.config_dir) is None:
+            return f"Undid close: {label} restored (no conversation on disk to reopen)."
+        if terminal.resume_in_new_tab(session.cwd, sid, session.config_dir):
+            return f"Undid close: resuming {label} in a new tab."
+        return f"Undid close: {label} restored — reopen it with r."
+
     def action_close(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
             return
@@ -3018,6 +3071,7 @@ class CommandCenterApp(App[None]):
         row = self._rows.get(sid)
         live = row.live if row else None
         was_live = live is not None and live.alive
+        prev_status = session.status
         # Park: SIGTERM the process and, for a LIVE session, close its iTerm pane —
         # and the whole tab if Claude was the only pane (the single process) in it.
         # A done session keeps DONE (never demoted to PARKED) so closing it sinks
@@ -3038,6 +3092,21 @@ class CommandCenterApp(App[None]):
             description=f"close pane {label}",
         )
 
+        def undo_close(
+            sid: str | None = sid,
+            prev_status: str = prev_status,
+            was_live: bool = was_live,
+            label: str = label,
+        ) -> str | None:
+            if sid is None or (st := self.store) is None or st.get(sid) is None:
+                return "Can't undo — session no longer exists."
+            st.update_fields(sid, status=prev_status)
+            if was_live:
+                return self._reopen_session(sid, label)
+            return None
+
+        self._push_undo(f"close ({label})", undo_close)
+
     def action_mark_done(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
             return
@@ -3048,6 +3117,7 @@ class CommandCenterApp(App[None]):
         row = self._rows.get(sid)
         live = row.live if row else None
         was_live = live is not None and live.alive
+        prev_done, prev_status, prev_done_at = session.done, session.status, session.done_at
         new = not session.done
         store.update_fields(
             sid,
@@ -3055,6 +3125,7 @@ class CommandCenterApp(App[None]):
             status=Status.DONE.value if new else Status.IDLE.value,
             done_at=now_ms() if new else 0,
         )
+        draft_archived = new and session.draft
         # A future-job draft can't be "done"-graded: archive its mirror file and drop it
         # out of the FUTURE list (archived), matching cmd_mark_done / futuresync semantics.
         if new and session.draft:
@@ -3071,6 +3142,26 @@ class CommandCenterApp(App[None]):
         if new and was_live:
             self._confirm_close_after_done(sid)
         self.refresh_data()
+        label = colors.short_folder(session.cwd)
+
+        def undo_done(
+            sid: str | None = sid,
+            prev_done: bool = prev_done,
+            prev_status: str = prev_status,
+            prev_done_at: int = prev_done_at,
+            draft_archived: bool = draft_archived,
+        ) -> str | None:
+            if sid is None or (st := self.store) is None or (sess := st.get(sid)) is None:
+                return "Can't undo — session no longer exists."
+            st.update_fields(sid, done=prev_done, status=prev_status, done_at=prev_done_at)
+            if draft_archived:
+                from .. import futuresync  # pylint: disable=import-outside-toplevel
+
+                st.update_fields(sid, archived=False)
+                futuresync.unarchive_file(st, self.cfg, sess)
+            return None
+
+        self._push_undo(f"mark {'done' if new else 'not-done'} ({label})", undo_done)
 
     def _confirm_close_after_done(self, sid: str) -> None:
         """Ask whether to close the just-finished live session's tab/pane."""
@@ -3078,8 +3169,12 @@ class CommandCenterApp(App[None]):
             return
         label = colors.short_folder(session.cwd)
 
+        def undo_close(sid: str = sid, label: str = label) -> str | None:
+            return self._reopen_session(sid, label)
+
         def handle(confirmed: bool | None) -> None:
             if confirmed:
+                self._push_undo(f"close ({label})", undo_close)
                 self._close_live_session(session)
 
         self.push_screen(
@@ -3162,8 +3257,18 @@ class CommandCenterApp(App[None]):
         session = store.get(sid)
         if session is None:
             return
-        store.update_fields(sid, keep=not session.keep)
+        prev = session.keep
+        store.update_fields(sid, keep=not prev)
         self.update_detail()
+        label = colors.short_folder(session.cwd)
+
+        def undo_keep(sid: str | None = sid, prev: bool = prev) -> str | None:
+            if sid is None or (st := self.store) is None or st.get(sid) is None:
+                return "Can't undo — session no longer exists."
+            st.update_fields(sid, keep=prev)
+            return None
+
+        self._push_undo(f"Keep {'on' if not prev else 'off'} ({label})", undo_keep)
 
     def action_cycle_importance(self) -> None:
         if not (sid := self._current) or (store := self.store) is None:
@@ -3171,8 +3276,17 @@ class CommandCenterApp(App[None]):
         session = store.get(sid)
         if session is None:
             return
-        store.update_fields(sid, importance=(session.importance + 1) % 4)
+        prev = session.importance
+        store.update_fields(sid, importance=(prev + 1) % 4)
         self.refresh_data()
+
+        def undo_importance(sid: str | None = sid, prev: int = prev) -> str | None:
+            if sid is None or (st := self.store) is None or st.get(sid) is None:
+                return "Can't undo — session no longer exists."
+            st.update_fields(sid, importance=prev)
+            return None
+
+        self._push_undo("importance", undo_importance)
 
     def _transcript_under(self, cwd: str, session_id: str, account_dir: Path) -> bool:
         """True if *session_id*'s transcript lives specifically under *account_dir*.
@@ -3231,9 +3345,18 @@ class CommandCenterApp(App[None]):
                 severity="warning",
             )
             return
+        prev_dir = session.config_dir
         store.update_fields(sid, config_dir=str(target))
         self.refresh_data()
         self.notify(f"Account set to {label}.")
+
+        def undo_account(sid: str | None = sid, prev_dir: str = prev_dir) -> str | None:
+            if sid is None or (st := self.store) is None or st.get(sid) is None:
+                return "Can't undo — session no longer exists."
+            st.update_fields(sid, config_dir=prev_dir)
+            return None
+
+        self._push_undo(f"account → {label}", undo_account)
 
     def action_account_private(self) -> None:
         """Bill the highlighted row under the private (cpriv) account — the `tp` chord."""
@@ -3251,8 +3374,19 @@ class CommandCenterApp(App[None]):
             self.notify("No sub-goals; add them with /aim or `ccc subgoals`.")
             return
         target = next((s for s in subs if not s.checked), subs[-1])
-        store.set_subgoal_checked(target.id, not target.checked)
+        target_id, prev_checked = target.id, target.checked
+        store.set_subgoal_checked(target_id, not prev_checked)
         self.refresh_data()
+
+        def undo_subgoal(
+            target_id: int = target_id, prev_checked: bool = prev_checked
+        ) -> str | None:
+            if (st := self.store) is None:
+                return "Can't undo — session no longer exists."
+            st.set_subgoal_checked(target_id, prev_checked)
+            return None
+
+        self._push_undo("sub-goal tick", undo_subgoal)
 
     # ---- future jobs (the `fn` chord: register now, start later) --------
     def action_new_job(self) -> None:
@@ -3553,15 +3687,29 @@ class CommandCenterApp(App[None]):
 
     def action_toggle_finished(self) -> None:
         """Show or hide DONE (green) sessions — the `td` chord."""
-        self._show_finished = not self._show_finished
+        prev = self._show_finished
+        self._show_finished = not prev
         self.refresh_data()
         self.notify("Done sessions shown." if self._show_finished else "Done hidden.")
 
+        def undo_finished(prev: bool = prev) -> str | None:
+            self._show_finished = prev
+            return f"Undid: done sessions {'shown' if prev else 'hidden'} again."
+
+        self._push_undo("show/hide done", undo_finished)
+
     def action_toggle_future(self) -> None:
         """Show or hide FUTURE (not-yet-started, blue) jobs — the `tf` chord."""
-        self._show_future = not self._show_future
+        prev = self._show_future
+        self._show_future = not prev
         self.refresh_data()
         self.notify("Future jobs shown." if self._show_future else "Future jobs hidden.")
+
+        def undo_future(prev: bool = prev) -> str | None:
+            self._show_future = prev
+            return f"Undid: future jobs {'shown' if prev else 'hidden'} again."
+
+        self._push_undo("show/hide future", undo_future)
 
     def action_toggle_idle(self) -> None:
         """Mute or unmute Claude Code's idle 'waiting for input' popups — the `ti` chord.
@@ -3581,6 +3729,15 @@ class CommandCenterApp(App[None]):
             else "Idle popups OFF — no more 'waiting' popups (restart a live session to apply)."
         )
 
+        def undo_idle() -> str | None:
+            try:
+                now_on = idlenotify.toggle()
+            except (OSError, ValueError) as exc:
+                return f"Couldn't undo the idle-popup toggle: {exc}"
+            return "Undid: idle popups " + ("ON again." if now_on else "OFF again.")
+
+        self._push_undo("idle-popups toggle", undo_idle)
+
     def _has_work_account(self) -> bool:
         """True when a non-default ``work`` account is configured in ``claude_accounts``.
 
@@ -3590,7 +3747,9 @@ class CommandCenterApp(App[None]):
         """
         return "work" in config.parse_claude_accounts(self.cfg.claude_accounts)
 
-    def _toggle_usage_card(self, key: str, label: str, *, also: str | None = None) -> None:
+    def _toggle_usage_card(
+        self, key: str, label: str, *, also: str | None = None, announce: bool = True
+    ) -> None:
         """Flip a usage-card render gate, persist it, and re-render — reload-modify-save.
 
         ``self.cfg`` is cached at ``__init__`` and ``save_config`` writes EVERY key, so
@@ -3606,7 +3765,14 @@ class CommandCenterApp(App[None]):
         config.save_config(cfg)
         self.cfg = cfg
         self._update_usage()
-        self.notify(f"{label} card {'shown' if new_value else 'hidden'}.")
+
+        def undo_card(key: str = key, label: str = label, also: str | None = also) -> str | None:
+            self._toggle_usage_card(key, label, also=also, announce=False)
+            return f"{label} card {'shown' if getattr(self.cfg, key) else 'hidden'} again."
+
+        self._push_undo(f"{label} card toggle", undo_card)
+        if announce:
+            self.notify(f"{label} card {'shown' if new_value else 'hidden'}.")
 
     def action_toggle_card_private(self) -> None:
         """Show/hide the Claude Code (private) usage card — the `t1` chord."""

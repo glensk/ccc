@@ -430,6 +430,26 @@ COMMANDS: list[Command] = [
         # while remaining bound and listed in help via COMMANDS membership.
     ),
     Command(
+        key="u",
+        word="undo",
+        gloss="undo the last action",
+        section=GLOBAL,
+        explanation=(
+            "Undo the most recent undoable action, walking further back on each press "
+            "(up to 20 steps, remembered for this ccc run only). Covered: close/park "
+            "(c/x — including the close offered after marking a live session done), "
+            "mark-done/un-done (d), Keep (K), importance (!), a sub-goal tick (space), "
+            "an account switch (tp/tw), and every toggle (td / tf / ti, t1–t4, to/ta). "
+            "Undoing the close of a LIVE session cannot revive the killed process — it "
+            "restores the row and reopens the conversation in a new tab (same as r). "
+            "Text edits (a / n / b / D / e) are not undoable here — re-edit the field; "
+            "past AIMs live in aim-history (ah)."
+        ),
+        action="undo",
+        bind="u",
+        footer_pos=2.7,  # right after ☾lose (2.5) — the most common thing to undo
+    ),
+    Command(
         key="td",
         word="done",
         gloss="show / hide done sessions",
@@ -541,35 +561,35 @@ COMMANDS: list[Command] = [
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(
-        key="t5",
+        key="to",
         word="card-nix-supervised",
         gloss="show / hide the nixos overseer supervised card",
         section=GLOBAL,
         explanation=(
             "Show or hide the 'nixos overseer supervised' card — incidents from the "
             "external homelab overseer daemon that are awaiting a human decision "
-            "(orange-bordered). Type t then 5. Shown by default; the chord hides it (and "
+            "(orange-bordered). Type t then o. Shown by default; the chord hides it (and "
             "again shows it), persisted to ccc's config. Reads a placeholder until "
             "nixos_overseer_dir points at the overseer's directory."
         ),
         action="toggle_card_nixos_overseer_supervised",
-        chord=("t", "5"),
+        chord=("t", "o"),
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(
-        key="t6",
+        key="ta",
         word="card-nix-tier-a",
         gloss="show / hide the nixos overseer tier_a card",
         section=GLOBAL,
         explanation=(
             "Show or hide the 'nixos overseer tier_a' card — recent AUTOMATIC (tier-A) "
             "activity from the external homelab overseer daemon over the last 7 days "
-            "(teal-bordered). Type t then 6. HIDDEN by default; the chord shows it (and "
+            "(teal-bordered). Type t then a. HIDDEN by default; the chord shows it (and "
             "again hides it), persisted to ccc's config. Reads a placeholder until "
             "nixos_overseer_dir points at the overseer's directory."
         ),
         action="toggle_card_nixos_overseer_tier_a",
-        chord=("t", "6"),
+        chord=("t", "a"),
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(

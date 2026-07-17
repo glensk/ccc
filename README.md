@@ -144,9 +144,11 @@ your install and environment). Inside a Claude Code session, the slash commands 
 actions from the prompt.
 
 In the TUI, the `t` leader chord shows/hides the usage cards: `t1`…`t4` for the
-Claude/Codex/Copilot subscription cards, and `t5`/`t6` for two optional cards fed by an
+Claude/Codex/Copilot subscription cards, and `to`/`ta` for two optional cards fed by an
 *external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
-automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. See
+automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. And `u`
+undoes the last action — a close/park, mark-done, Keep, importance, sub-goal tick,
+account switch, or any toggle — walking back up to 20 steps per run. See
 [docs/reference.md](docs/reference.md).
 
 ## Platform support

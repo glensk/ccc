@@ -257,7 +257,7 @@ then `f`) shows/hides FUTURE jobs, and **`ti`** (`t` then `i`) mutes/unmutes Cla
 idle "waiting for input" macOS popups (it flips the native `agentPushNotifEnabled` in
 `settings.json` — global, ON by default; also `ccc toggle-idle`). Two more `t…` chords act on
 the highlighted row: **`tp`** / **`tw`** set its Claude account to private / work (see
-*Home-icon marker* under Multi-account). Pressing `t` alone briefly lists the available chords. The bottom footer hint line — prefixed **`keys:`** — lists **the commands that opt
+*Home-icon marker* under Multi-account). Pressing `t` alone briefly lists the available chords. **`u`** undoes the last action (close, done, toggles, account switch, sub-goal tick), walking back up to 20 steps. The bottom footer hint line — prefixed **`keys:`** — lists **the commands that opt
 in (any with a `footer_pos`), each with its key gilded gold** — single letters in place
 (`/`**a**`im`) and two-key chords with both letters gilded (**a**im-**h**istory = `ah`,
 **s**ubgoal-**h**istory = `sh`). A few keys are deliberately kept out of this line to keep
@@ -1101,9 +1101,9 @@ other:
 ╰──────────────────────────────────────╯
 ```
 
-**Show/hide each card with the persistent `t1`…`t6` chords** (`t1` = Claude private,
-`t2` = Claude work, `t3` = Codex, `t4` = Copilot, `t5` = nixos overseer supervised,
-`t6` = nixos overseer tier_a; type `t` alone for the menu). Unlike
+**Show/hide each card with the persistent `t1`…`t4` / `to` / `ta` chords** (`t1` = Claude private,
+`t2` = Claude work, `t3` = Codex, `t4` = Copilot, `to` = nixos overseer supervised,
+`ta` = nixos overseer tier_a; type `t` alone for the menu). Unlike
 the view-local `td`/`tf` toggles these **persist** to `config.toml`
 (`usage_card_private/_work/_codex/_copilot`, `card_nixos_overseer_supervised/_tier_a`
 — pure render gates); `t4` also flips the
@@ -1116,11 +1116,11 @@ box.
 future jobs) and are OFF until you point `nixos_overseer_dir` at that daemon's
 directory (its SQLite DB is read **read-only** at `<dir>/state/overseer.sqlite`,
 one cheap query per render tick, never blocking — every failure collapses to a
-one-line placeholder). The **supervised** card (`t5`, orange, shown by default)
+one-line placeholder). The **supervised** card (`to`, orange, shown by default)
 lists incidents awaiting a human decision (`<id> <status> <fingerprint> <age>`,
 newest first) with an `approve: …` hint, and prepends a red `⛔ dispatch disabled`
 line when the daemon is halted; zero rows is the good `— none —` state. The
-**tier_a** card (`t6`, teal, hidden by default) lists recent *automatic* activity
+**tier_a** card (`ta`, teal, hidden by default) lists recent *automatic* activity
 over the last 7 days (capped at 10 with a `… +N more` tail).
 
 The Claude/Codex cards show a 5-hour (`Session:`) and a weekly (`Week:`) window with
