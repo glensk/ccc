@@ -541,6 +541,38 @@ COMMANDS: list[Command] = [
         # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
     ),
     Command(
+        key="t5",
+        word="card-nix-supervised",
+        gloss="show / hide the nixos overseer supervised card",
+        section=GLOBAL,
+        explanation=(
+            "Show or hide the 'nixos overseer supervised' card — incidents from the "
+            "external homelab overseer daemon that are awaiting a human decision "
+            "(orange-bordered). Type t then 5. Shown by default; the chord hides it (and "
+            "again shows it), persisted to ccc's config. Reads a placeholder until "
+            "nixos_overseer_dir points at the overseer's directory."
+        ),
+        action="toggle_card_nixos_overseer_supervised",
+        chord=("t", "5"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
+        key="t6",
+        word="card-nix-tier-a",
+        gloss="show / hide the nixos overseer tier_a card",
+        section=GLOBAL,
+        explanation=(
+            "Show or hide the 'nixos overseer tier_a' card — recent AUTOMATIC (tier-A) "
+            "activity from the external homelab overseer daemon over the last 7 days "
+            "(teal-bordered). Type t then 6. HIDDEN by default; the chord shows it (and "
+            "again hides it), persisted to ccc's config. Reads a placeholder until "
+            "nixos_overseer_dir points at the overseer's directory."
+        ),
+        action="toggle_card_nixos_overseer_tier_a",
+        chord=("t", "6"),
+        # No footer_pos: surfaced via the `t` leader menu, like tf/ti.
+    ),
+    Command(
         key="s",
         word="settings",
         gloss="open settings",

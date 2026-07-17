@@ -111,6 +111,13 @@ DEFAULTS: dict[str, object] = {
     "usage_card_work": True,  # render the Claude Code (work) usage card
     "usage_card_codex": True,  # render the OpenAI Codex usage card
     "usage_card_copilot": True,  # RENDER the Copilot card (copilot_usage gates the FETCH)
+    # External homelab "overseer" alert-triage daemon (a SEPARATE project — unrelated to
+    # ccc's own future-job plumbing). Its incidents feed two read-only TUI cards. Empty
+    # (the default) = feature OFF: the cards render a placeholder and touch no disk. Point
+    # it at the overseer's root dir; the DB is read at <dir>/state/overseer.sqlite (ro).
+    "nixos_overseer_dir": "",
+    "card_nixos_overseer_supervised": True,  # render the "nixos overseer supervised" card
+    "card_nixos_overseer_tier_a": False,  # render the "nixos overseer tier_a" card (hidden default)
     "llm_account": "private",  # account ccc's own headless `claude -p` calls bill to
     "prune_headless": True,  # daemon deletes contentless leftover rows (headless `claude -p` junk)
     "sync_tab_titles": True,  # daemon keeps every live tab's iTerm title in sync with its badge
@@ -335,6 +342,9 @@ class Config:
     usage_card_work: bool = True
     usage_card_codex: bool = True
     usage_card_copilot: bool = True  # render gate (copilot_usage stays the fetch gate)
+    nixos_overseer_dir: str = ""  # external overseer root ("" = feature off)
+    card_nixos_overseer_supervised: bool = True
+    card_nixos_overseer_tier_a: bool = False
     llm_account: str = "private"
     prune_headless: bool = True
     sync_tab_titles: bool = True

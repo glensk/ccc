@@ -143,6 +143,12 @@ your install and environment). Inside a Claude Code session, the slash commands 
 `/next-step` `/done` `/block` `/deadline` (installed by `ccc init`) drive the same
 actions from the prompt.
 
+In the TUI, the `t` leader chord shows/hides the usage cards: `t1`…`t4` for the
+Claude/Codex/Copilot subscription cards, and `t5`/`t6` for two optional cards fed by an
+*external* homelab "overseer" alert-triage daemon (incidents awaiting you + recent
+automatic activity) — off until you set `nixos_overseer_dir` in `config.toml`. See
+[docs/reference.md](docs/reference.md).
+
 ## Platform support
 
 - **macOS is the first-class target**, with **iTerm2** recommended — resume-in-new-tab,

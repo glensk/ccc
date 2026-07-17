@@ -71,6 +71,9 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
         "usage_card_work",
         "usage_card_codex",
         "usage_card_copilot",
+        "nixos_overseer_dir",
+        "card_nixos_overseer_supervised",
+        "card_nixos_overseer_tier_a",
         "llm_account",
     ):
         assert key in config.DEFAULTS
@@ -81,11 +84,19 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
     assert fresh.usage_card_work is True
     assert fresh.usage_card_codex is True
     assert fresh.usage_card_copilot is True
+    # The nixos-overseer cards: dir defaults empty (feature off), supervised shown,
+    # tier_a hidden — and all three round-trip through save/load.
+    assert fresh.nixos_overseer_dir == ""
+    assert fresh.card_nixos_overseer_supervised is True
+    assert fresh.card_nixos_overseer_tier_a is False
     assert fresh.llm_account == "private"
 
     fresh.claude_accounts = ["private=~/.claude", "work=~/.claude-work"]
     fresh.usage_card_work = False
     fresh.usage_card_copilot = False
+    fresh.nixos_overseer_dir = "~/overseer"
+    fresh.card_nixos_overseer_supervised = False
+    fresh.card_nixos_overseer_tier_a = True
     fresh.llm_account = "work"
     config.save_config(fresh)
     reloaded = config.load_config()
@@ -93,6 +104,9 @@ def test_multi_account_config_keys_defaults_and_roundtrip(
     assert reloaded.usage_card_work is False
     assert reloaded.usage_card_copilot is False
     assert reloaded.usage_card_private is True
+    assert reloaded.nixos_overseer_dir == "~/overseer"
+    assert reloaded.card_nixos_overseer_supervised is False
+    assert reloaded.card_nixos_overseer_tier_a is True
     assert reloaded.llm_account == "work"
 
 

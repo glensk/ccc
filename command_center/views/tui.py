@@ -67,6 +67,7 @@ from .. import (
     iterm_api,
     jumpstate,
     launchd,
+    nixos_overseer,
     repos,
     resume,
     routing,
@@ -150,6 +151,8 @@ _CARD_TOGGLE_KEYS: dict[str, str] = {
     "toggle_card_work": "usage_card_work",
     "toggle_card_codex": "usage_card_codex",
     "toggle_card_copilot": "usage_card_copilot",
+    "toggle_card_nixos_overseer_supervised": "card_nixos_overseer_supervised",
+    "toggle_card_nixos_overseer_tier_a": "card_nixos_overseer_tier_a",
 }
 
 # How long a leader stays pending before its timeout. A leader with a standalone action
@@ -1855,6 +1858,14 @@ class CommandCenterApp(App[None]):
         width: auto; min-width: 38; height: auto; padding: 0 1;
         border: round #a371f7;
     }
+    #usage-nixos-supervised {
+        width: auto; min-width: 38; height: auto; padding: 0 1;
+        border: round #ff8700;
+    }
+    #usage-nixos-tier-a {
+        width: auto; min-width: 38; height: auto; padding: 0 1;
+        border: round #2bb2b2;
+    }
     #keyhints { dock: bottom; height: 1; background: $panel; }
     """
     BINDINGS = _build_bindings()
@@ -1932,6 +1943,12 @@ class CommandCenterApp(App[None]):
                     yield Static("", id="usage-work")
                     yield Static("", id="usage-codex")
                     yield Static("", id="usage-copilot")
+                    # Two read-only cards fed by the EXTERNAL homelab overseer daemon
+                    # (a separate project): supervised = incidents awaiting the human
+                    # (orange border), tier_a = recent automatic activity (teal border,
+                    # hidden by default). Both toggle via the `t5`/`t6` chords.
+                    yield Static("", id="usage-nixos-supervised")
+                    yield Static("", id="usage-nixos-tier-a")
         yield Static(id="keyhints")
 
     def on_mount(self) -> None:
@@ -1960,6 +1977,8 @@ class CommandCenterApp(App[None]):
         self.query_one(
             "#usage-copilot", Static
         ).border_title = f"{self.cfg.copilot_card_title} {self.cfg.copilot_model}"
+        self.query_one("#usage-nixos-supervised", Static).border_title = "nixos overseer supervised"
+        self.query_one("#usage-nixos-tier-a", Static).border_title = "nixos overseer tier_a"
         self._apply_split()
         self.refresh_data()
         self.set_interval(self.cfg.usage_refresh_sec, self.refresh_data)
@@ -2168,6 +2187,8 @@ class CommandCenterApp(App[None]):
             work_panel = self.query_one("#usage-work", Static)
             codex_panel = self.query_one("#usage-codex", Static)
             copilot_panel = self.query_one("#usage-copilot", Static)
+            nixos_supervised_panel = self.query_one("#usage-nixos-supervised", Static)
+            nixos_tier_a_panel = self.query_one("#usage-nixos-tier-a", Static)
         except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
             return
         # Render all four cards from their (cheap) caches; the Copilot cache read is
@@ -2176,6 +2197,16 @@ class CommandCenterApp(App[None]):
         work_panel.update(usage.render_work_usage(usage.read_usage("work")))
         codex_panel.update(usage.render_codex_usage(usage.read_codex_usage()))
         copilot_panel.update(usage.render_copilot_usage(usage.read_copilot_usage()))
+        # The two nixos-overseer cards read an EXTERNAL sqlite DB read-only; each read is
+        # one cheap query and NEVER raises (a sentinel → placeholder on any failure), so
+        # it is safe on this render tick. A "" nixos_overseer_dir short-circuits before
+        # any disk touch.
+        nixos_supervised_panel.update(
+            nixos_overseer.render_supervised(nixos_overseer.read_supervised(self.cfg))
+        )
+        nixos_tier_a_panel.update(
+            nixos_overseer.render_tier_a(nixos_overseer.read_tier_a(self.cfg))
+        )
         # Render gates: each card is shown/hidden by its own config flag. The Copilot
         # RENDER gate is `usage_card_copilot` ALONE; its network FETCH stays gated on
         # `copilot_usage` ALONE (below), so the two are independently settable by hand.
@@ -2185,6 +2216,8 @@ class CommandCenterApp(App[None]):
         work_panel.display = self.cfg.usage_card_work and self._has_work_account()
         codex_panel.display = self.cfg.usage_card_codex
         copilot_panel.display = self.cfg.usage_card_copilot
+        nixos_supervised_panel.display = self.cfg.card_nixos_overseer_supervised
+        nixos_tier_a_panel.display = self.cfg.card_nixos_overseer_tier_a
         if self.cfg.copilot_usage:
             # Keep the (network-sourced) figure warm without blocking render: when the
             # cache is stale, fire a detached `ccc copilot-usage` to refresh it for the
@@ -3607,6 +3640,14 @@ class CommandCenterApp(App[None]):
         (fetch but do not show) stays expressible by hand-editing the config.
         """
         self._toggle_usage_card("usage_card_copilot", "Copilot", also="copilot_usage")
+
+    def action_toggle_card_nixos_overseer_supervised(self) -> None:
+        """Show/hide the nixos overseer supervised card — the `t5` chord."""
+        self._toggle_usage_card("card_nixos_overseer_supervised", "nixos overseer supervised")
+
+    def action_toggle_card_nixos_overseer_tier_a(self) -> None:
+        """Show/hide the nixos overseer tier_a card — the `t6` chord."""
+        self._toggle_usage_card("card_nixos_overseer_tier_a", "nixos overseer tier_a")
 
     def action_aim_history(self) -> None:
         """Show the selected session's AIM progression — the `ah` chord / /aim-history."""

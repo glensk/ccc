@@ -1990,6 +1990,95 @@ def test_work_card_hidden_and_t2_inert_without_a_work_account(
     asyncio.run(scenario())
 
 
+def test_nixos_overseer_cards_default_visibility_and_t5_t6_toggle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`t5`/`t6` flip the two nixos-overseer card gates and persist; defaults differ.
+
+    The supervised card is shown by default (something to watch), the tier_a card is
+    hidden by default; each toggle is reload-modify-save (persists to config.toml).
+    With no ``nixos_overseer_dir`` configured the cards render a placeholder — but the
+    render gate (display) is independent of the data, so we drive the gates directly.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center import config
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            # Defaults: supervised shown, tier_a hidden.
+            assert app.cfg.card_nixos_overseer_supervised is True
+            assert app.cfg.card_nixos_overseer_tier_a is False
+            assert app.query_one("#usage-nixos-supervised").display is True
+            assert app.query_one("#usage-nixos-tier-a").display is False
+            # The dir is unset, so both render the placeholder (not a crash).
+            supervised_static = app.query_one("#usage-nixos-supervised")
+            assert "set nixos_overseer_dir" in supervised_static.render().plain
+
+            # t5 hides the supervised card; persisted.
+            await pilot.press("t")
+            await pilot.press("5")
+            await pilot.pause()
+            assert app.cfg.card_nixos_overseer_supervised is False
+            assert config.load_config().card_nixos_overseer_supervised is False
+            assert app.query_one("#usage-nixos-supervised").display is False
+
+            # t6 shows the tier_a card; persisted.
+            await pilot.press("t")
+            await pilot.press("6")
+            await pilot.pause()
+            assert app.cfg.card_nixos_overseer_tier_a is True
+            assert config.load_config().card_nixos_overseer_tier_a is True
+            assert app.query_one("#usage-nixos-tier-a").display is True
+
+    asyncio.run(scenario())
+
+
+def test_toggle_state_label_covers_nixos_overseer_cards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `t` menu annotates the two nixos-overseer card toggles with their live state."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    from command_center.views.tui import CommandCenterApp
+
+    app = CommandCenterApp()
+    # Defaults: supervised shown, tier_a hidden.
+    assert app._toggle_state_label("toggle_card_nixos_overseer_supervised") == "shown"
+    assert app._toggle_state_label("toggle_card_nixos_overseer_tier_a") == "hidden"
+
+
+def test_t_menu_lists_nixos_overseer_chords(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pressing `t` alone toasts a menu that now also lists t5/t6 with their state."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure("s1", cwd="/Users/x/repo")
+    store.update_fields("s1", status="idle")
+    store.close()
+
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await pilot.pause()
+            notes: list[str] = []
+            monkeypatch.setattr(app, "notify", lambda msg, **_kw: notes.append(msg))
+            await pilot.press("t")  # leader with no follower
+            await asyncio.sleep(0.9)  # > 0.7s pure-leader window → timeout fires the menu
+            await pilot.pause()
+            assert notes, "pressing t alone should toast a menu"
+            assert "t5" in notes[-1] and "t6" in notes[-1]
+            # The menu lists each chord's gloss + its live state (now: shown/hidden).
+            assert "nixos overseer supervised card  (now: shown)" in notes[-1]
+            assert "nixos overseer tier_a card  (now: hidden)" in notes[-1]
+
+    asyncio.run(scenario())
+
+
 def test_marked_codex_ver_cell_width_over_all_status_icons(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

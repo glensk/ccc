@@ -1101,13 +1101,27 @@ other:
 ╰──────────────────────────────────────╯
 ```
 
-**Show/hide each card with the persistent `t1`…`t4` chords** (`t1` = Claude private,
-`t2` = Claude work, `t3` = Codex, `t4` = Copilot; type `t` alone for the menu). Unlike
+**Show/hide each card with the persistent `t1`…`t6` chords** (`t1` = Claude private,
+`t2` = Claude work, `t3` = Codex, `t4` = Copilot, `t5` = nixos overseer supervised,
+`t6` = nixos overseer tier_a; type `t` alone for the menu). Unlike
 the view-local `td`/`tf` toggles these **persist** to `config.toml`
-(`usage_card_private/_work/_codex/_copilot` — pure render gates); `t4` also flips the
+(`usage_card_private/_work/_codex/_copilot`, `card_nixos_overseer_supervised/_tier_a`
+— pure render gates); `t4` also flips the
 `copilot_usage` network-fetch gate so a hidden Copilot card costs no `gh` call, and
 `t2` on a machine with no `work` account explains itself instead of toggling an empty
 box.
+
+**The two nixos-overseer cards** read incidents from an *external* homelab
+"overseer" alert-triage daemon (a separate project — nothing to do with ccc's own
+future jobs) and are OFF until you point `nixos_overseer_dir` at that daemon's
+directory (its SQLite DB is read **read-only** at `<dir>/state/overseer.sqlite`,
+one cheap query per render tick, never blocking — every failure collapses to a
+one-line placeholder). The **supervised** card (`t5`, orange, shown by default)
+lists incidents awaiting a human decision (`<id> <status> <fingerprint> <age>`,
+newest first) with an `approve: …` hint, and prepends a red `⛔ dispatch disabled`
+line when the daemon is halted; zero rows is the good `— none —` state. The
+**tier_a** card (`t6`, teal, hidden by default) lists recent *automatic* activity
+over the last 7 days (capped at 10 with a `… +N more` tail).
 
 The Claude/Codex cards show a 5-hour (`Session:`) and a weekly (`Week:`) window with
 **relative** reset times (`Session: Resets in 1h 57m`), recomputed on every re-read

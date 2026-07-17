@@ -65,10 +65,22 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
     assert toggle.action == "toggle_finished"
     assert toggle.footer_key == "t"  # only the leader `t` is the footer mnemonic
     # The leader's chord menu lists every `t…` chord: the per-session account switches
-    # tp/tw (first, in registry order), then the view toggles td/tf/ti and the four
-    # usage-card render gates t1…t4.
+    # tp/tw (first, in registry order), then the view toggles td/tf/ti, the four
+    # usage-card render gates t1…t4, and the two nixos-overseer cards t5/t6.
     menu = commands.chords_for_leader("t")
-    assert [c.key for c in menu] == ["tp", "tw", "td", "tf", "ti", "t1", "t2", "t3", "t4"]
+    assert [c.key for c in menu] == [
+        "tp",
+        "tw",
+        "td",
+        "tf",
+        "ti",
+        "t1",
+        "t2",
+        "t3",
+        "t4",
+        "t5",
+        "t6",
+    ]
     assert {c.word for c in menu} == {
         "private",
         "work",
@@ -79,6 +91,8 @@ def test_toggle_leader_is_in_footer_as_toggle() -> None:
         "card-work",
         "card-codex",
         "card-copilot",
+        "card-nix-supervised",
+        "card-nix-tier-a",
     }
     # Exactly one `t…` toggle carries a footer_pos (the leader is shown once, not many times).
     assert len([c for c in menu if c.footer_pos is not None]) == 1
@@ -139,6 +153,28 @@ def test_card_toggle_chords_are_t1_to_t4() -> None:
         assert cmd.explanation  # a real explanation, not blank
 
 
+def test_nixos_overseer_card_chords_are_t5_and_t6() -> None:
+    """`t5`/`t6` toggle the two nixos-overseer cards; each is a pure-menu chord (no footer)."""
+    expected = {
+        "5": "toggle_card_nixos_overseer_supervised",
+        "6": "toggle_card_nixos_overseer_tier_a",
+    }
+    for digit, action in expected.items():
+        cmd = commands.by_action(action)
+        assert cmd.chord == ("t", digit)
+        assert cmd.key == f"t{digit}"
+        assert cmd.key == "".join(cmd.chord)  # registry invariant
+        assert cmd.section == commands.GLOBAL
+        assert cmd.footer_pos is None  # shown only via the `t` leader menu
+        assert cmd.bind is None  # a chord, never a plain binding
+        assert cmd.explanation  # a real explanation, not blank
+    # They collide with no plain binding, alias, or existing chord digit.
+    binds = {c.bind for c in commands.COMMANDS if c.bind}
+    aliases = {a for c in commands.COMMANDS for a in c.aliases}
+    assert binds.isdisjoint({"5", "6"})
+    assert aliases.isdisjoint({"5", "6"})
+
+
 def test_registry_invariants_hold_with_new_chords() -> None:
     """The chord-key and footer-uniqueness invariants still hold after adding t1…t4."""
     for cmd in commands.COMMANDS:
@@ -160,6 +196,7 @@ def test_account_switch_chords_are_tp_and_tw() -> None:
     assert priv.chord == ("t", "p") and priv.key == "tp"
     assert work.chord == ("t", "w") and work.key == "tw"
     for cmd in (priv, work):
+        assert cmd.chord is not None
         assert cmd.key == "".join(cmd.chord)  # registry invariant
         assert cmd.section == commands.PER_SESSION  # acts on the highlighted session
         assert cmd.footer_pos is None  # shown only via the `t` leader menu, like ti/t1…t4
