@@ -2863,7 +2863,7 @@ class CommandCenterApp(App[None]):
                 # first, then that fallback (see _focus_session_task).
                 self.run_worker(
                     self._focus_session_task(
-                        session.iterm_session_id, colors.short_folder(session.cwd)
+                        session.iterm_session_id, sid, colors.short_folder(session.cwd)
                     ),
                     group="jump-toggle",
                     description="focus session tab",
@@ -2875,6 +2875,10 @@ class CommandCenterApp(App[None]):
                     severity="warning",
                     timeout=10,
                 )
+            elif terminal.focus_tmux_window(sid):
+                # Launchd future-sync jobs land in a tmux window (no iterm_session_id) —
+                # locate + surface it rather than dead-ending on "switch to it manually".
+                self.notify("Focused tmux window (attached in iTerm).")
             else:
                 self.notify(
                     "Session is live but its tab can't be located — switch to it manually.",
@@ -2895,17 +2899,22 @@ class CommandCenterApp(App[None]):
         else:
             self.notify(f"Run: c --resume {sid}", severity="warning", timeout=10)
 
-    async def _focus_session_task(self, iterm_session_id: str, label: str) -> None:
+    async def _focus_session_task(self, iterm_session_id: str, session_id: str, label: str) -> None:
         """Bring a live session's iTerm tab forward off the UI loop.
 
         Warm iTerm2 link first (sub-ms), then the AppleScript walk as fallback (slow —
-        why it runs in a worker, not inline in action_resume).
+        why it runs in a worker, not inline in action_resume). If the iTerm tab can't be
+        located at all (a launchd future-sync job whose ``iterm_session_id`` is stale, or
+        one that only ever lived in a tmux window), fall back to locating + surfacing the
+        tmux window hosting *session_id* — also off the UI loop, same worker pattern.
         """
         focused = await self._iterm_link.focus_session(iterm_session_id)
         if not focused:
             focused = await asyncio.to_thread(terminal.focus_iterm_session, iterm_session_id)
         if focused:
             self.notify(f"Focused live tab: {label}")
+        elif await asyncio.to_thread(terminal.focus_tmux_window, session_id):
+            self.notify("Focused tmux window (attached in iTerm).")
         else:
             self.notify(
                 "Session is live but its tab can't be located — switch to it manually.",

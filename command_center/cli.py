@@ -1750,9 +1750,12 @@ def cmd_focus_job(args: argparse.Namespace) -> int:
     if session.iterm_session_id and terminal.focus_iterm_session(session.iterm_session_id):
         print(f"focused live tab: {args.session_id}")
         return 0
+    if terminal.focus_tmux_window(args.session_id):
+        print(f"focused tmux window: {args.session_id}")
+        return 0
     print(
-        f"error: {args.session_id} is live but its iTerm tab can't be located — "
-        "switch to it manually",
+        f"error: {args.session_id} is live but its iTerm tab / tmux window can't be "
+        "located — switch to it manually",
         file=sys.stderr,
     )
     return 1
@@ -1797,9 +1800,12 @@ def cmd_resume_job(args: argparse.Namespace) -> int:  # pylint: disable=too-many
         if session.iterm_session_id and terminal.focus_iterm_session(session.iterm_session_id):
             print(f"focused live tab: {args.session_id}")
             return 0
+        if terminal.focus_tmux_window(args.session_id):
+            print(f"focused tmux window: {args.session_id}")
+            return 0
         print(
-            f"error: {args.session_id} is live but its iTerm tab can't be located — "
-            "switch to it manually",
+            f"error: {args.session_id} is live but its iTerm tab / tmux window can't be "
+            "located — switch to it manually",
             file=sys.stderr,
         )
         return 1

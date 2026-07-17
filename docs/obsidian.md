@@ -85,6 +85,18 @@ persists anywhere, so its suggestions can't offer the one value that matters). A
 flipped to `status: error` by a failed validation stays skipped until you reset its
 status, even with `launch` still ticked.
 
+**Where the job opens.** The launchd watcher cannot AppleScript iTerm (TCC silently
+denies without prompting, and iTerm's Python-API cookies are single-use and mintable
+only via AppleScript — verified 2026-07-17), so watcher-spawned jobs land in a window
+of the persistent tmux session instead. They are still first-class: `ccc focus-job`,
+`ccc resume-job` and the TUI's focus keys locate the tmux window by walking pane PIDs,
+select it, and surface it in iTerm (activating an attached client, or opening a new
+tab running `tmux attach`). Opt-in for direct iTerm tabs from the watcher: root-own
+iTerm's auth-disable file — `sudo chown root:wheel "~/Library/Application
+Support/iTerm2/disable-automation-auth"` (the file must exist first; iTerm honors it
+only when root-owned) — which lets any local process use the iTerm API without
+authentication; the spawn chain then upgrades automatically via its Python-API step.
+
 ## Whole-lifecycle mirrors
 
 With the mirror flags on, every tracked session becomes a markdown note (export-only —

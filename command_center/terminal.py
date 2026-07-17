@@ -213,6 +213,157 @@ def _tmux_window(command: str, cwd: str | None = None) -> bool:
         return False
 
 
+def _tmux_pane_for_session(
+    panes: list[tuple[str, int, str]],
+    children: dict[int, list[tuple[int, str]]],
+    commands: dict[int, str],
+    session_id: str,
+) -> str | None:
+    """The tmux window target (e.g. ``"ccc:2"``) whose pane hosts *session_id*'s claude.
+
+    *panes* rows are ``(window_target, pane_pid, pane_id)`` from ``list-panes``; *children*
+    maps ``ppid -> [(pid, command), ...]`` (the traversal edges from ``ps``) and *commands*
+    maps ``pid -> command`` (every process's own argv). A launchd-spawned job's pane runs
+    ``ccc start-job``, which **execs** claude in place — so the ``--session-id`` argv lives on
+    the *pane_pid itself*, not a child. The walk therefore checks each node's OWN command
+    (starting at pane_pid) before descending. BFS with a visited set defends against a
+    cyclic / duplicated ``ps`` snapshot; the first pane whose tree carries the session's
+    claude wins.
+
+    The needle is matched at a token boundary (end-of-string or whitespace after the id) so a
+    short id like ``abc-123`` never spuriously matches ``--session-id abc-1234`` — a plain
+    scan rather than a regex, which keeps this module free of the heavier ``re``/stub imports.
+    """
+    needle = f"--session-id {session_id}"
+
+    def carries_session(command: str) -> bool:
+        idx = command.find(needle)
+        while idx != -1:
+            end = idx + len(needle)
+            if end == len(command) or command[end].isspace():
+                return True
+            idx = command.find(needle, idx + 1)
+        return False
+
+    for window_target, pane_pid, _pane_id in panes:
+        visited: set[int] = set()
+        queue: list[int] = [pane_pid]  # a plain list is BFS enough for a tiny process tree
+        while queue:
+            pid = queue.pop(0)
+            if pid in visited:
+                continue
+            visited.add(pid)
+            if carries_session(commands.get(pid, "")):
+                return window_target
+            for child_pid, _command in children.get(pid, []):
+                if child_pid not in visited:
+                    queue.append(child_pid)
+    return None
+
+
+def focus_tmux_window(session_id: str) -> bool:
+    """Select + surface the tmux window hosting *session_id* (launchd-spawned jobs).
+
+    ccc jobs fired by the launchd future-sync watcher land in tmux windows of the persistent
+    session (``tmux_session``), not iTerm tabs — so they have no ``iterm_session_id`` and the
+    plain ``focus_iterm_session`` path dead-ends. This locates the window by walking each
+    pane's process tree for the claude carrying ``--session-id <session_id>`` (``ccc start-job``
+    execs claude in place, so it is the pane_pid itself), selects that window, and brings it on
+    screen: if a client is already attached to the session, the selected window is now visible
+    and we just raise iTerm; otherwise a fresh iTerm tab attaches to the session.
+
+    Returns False when tmux is absent, no pane's process tree contains the session's claude, or
+    every surfacing attempt fails.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return False
+    try:
+        listing = subprocess.run(
+            [
+                tmux,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index} #{pane_pid} #{pane_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if listing.returncode != 0 or not listing.stdout.strip():
+            return False
+        panes: list[tuple[str, int, str]] = []
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                panes.append((parts[0], int(parts[1]), parts[2]))
+            except ValueError:
+                continue
+        if not panes:
+            return False
+
+        procs = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if procs.returncode != 0:
+            return False
+        children: dict[int, list[tuple[int, str]]] = {}
+        commands: dict[int, str] = {}
+        for line in procs.stdout.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) < 3:
+                continue
+            try:
+                pid, ppid = int(fields[0]), int(fields[1])
+            except ValueError:
+                continue
+            commands[pid] = fields[2]
+            children.setdefault(ppid, []).append((pid, fields[2]))
+
+        target = _tmux_pane_for_session(panes, children, commands, session_id)
+        if target is None:
+            return False
+
+        if (
+            subprocess.run(
+                [tmux, "select-window", "-t", target],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            return False
+
+        tmux_session = target.split(":", 1)[0]
+        clients = subprocess.run(
+            [tmux, "list-clients", "-t", tmux_session],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if clients.returncode == 0 and clients.stdout.strip():
+            # A terminal is already attached and now shows the selected window — just raise
+            # iTerm. osascript failure is still success: the window IS already selected.
+            _osascript('tell application "iTerm2" to activate')
+            return True
+        # No client attached: open a fresh iTerm tab that attaches to the session. No
+        # _tmux_window fallback here — attaching from inside tmux is nonsense.
+        command = f"tmux attach -t {shlex.quote(tmux_session)}"
+        return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
 def resume_in_new_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
     """Open a new terminal tab (or tmux window) in *cwd* running ``claude --resume <id>``.
 
@@ -227,7 +378,7 @@ def resume_in_new_tab(cwd: str, session_id: str, config_dir: str = "") -> bool:
     if _launcher_mode() == "tmux":
         return _tmux_window(f"{prefix}claude --resume {shlex.quote(session_id)}", cwd=cwd)
     command = f"{prefix}cd {shlex.quote(cwd)} && claude --resume {shlex.quote(session_id)}"
-    return _iterm(command) or _terminal_app(command)
+    return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
 
 
 def resume_halted_in_new_tab(
@@ -261,7 +412,7 @@ def resume_halted_in_new_tab(
     command = (
         f"{prefix}cd {shlex.quote(cwd)} && {shlex.quote(script_path)} {shlex.quote(session_id)} now"
     )
-    return _iterm(command) or _terminal_app(command)
+    return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
 
 
 def start_job_in_new_tab(session_id: str, force: bool = False) -> bool:
@@ -277,11 +428,15 @@ def start_job_in_new_tab(session_id: str, force: bool = False) -> bool:
     command = f"ccc start-job{flag} {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return _tmux_window(command)
-    # tmux is the last-resort fallback even in iterm mode: this path is reached from
-    # headless contexts (the futuresync launch toggle runs under the launchd WatchPaths
-    # agent, where AppleScript/iTerm is blocked by TCC Automation) — a tmux window in
-    # the persistent `ai` session still launches the job and shows up everywhere.
-    return _iterm(command) or _terminal_app(command) or _tmux_window(command)
+    # Under launchd (the WatchPaths agent) osascript is TCC-blocked, so the
+    # Python-API tab is the working path there; tmux stays the last resort for
+    # a Mac with iTerm not running / API disabled — the job still launches.
+    return (
+        _iterm(command)
+        or _iterm_api_tab(command)
+        or _terminal_app(command)
+        or _tmux_window(command)
+    )
 
 
 def focus_iterm_session(iterm_session_id: str) -> bool:
@@ -484,6 +639,46 @@ def _osascript(script: str) -> str | None:
     except (subprocess.SubprocessError, OSError):
         return None
     return result.stdout if result.returncode == 0 else None
+
+
+def _iterm_api_tab(command: str) -> bool:
+    """Create an iTerm tab over the Python-API websocket (no TCC Apple events).
+
+    launchd contexts (the WatchPaths future-sync agent, the daemon) cannot
+    osascript iTerm — TCC Automation silently denies without ever prompting —
+    but iTerm's own API socket is outside TCC, so a phone-launched job still
+    lands in a real, locatable iTerm tab (verified 2026-07-17: cookie-less
+    connect from a non-iTerm env succeeds). Degrades False on anything missing
+    (``iterm2`` package, the API setting, iTerm itself) so callers fall through.
+    """
+    try:
+        import asyncio  # pylint: disable=import-outside-toplevel
+
+        import iterm2  # pylint: disable=import-outside-toplevel
+
+        async def _go() -> bool:
+            conn = await asyncio.wait_for(iterm2.Connection.async_create(), timeout=8)
+            app = await iterm2.async_get_app(conn, create_if_needed=True)
+            if app is None:
+                return False
+            window = app.current_terminal_window
+            if window is None:
+                window = await iterm2.Window.async_create(conn)
+                tab = window.current_tab if window else None
+            else:
+                tab = await window.async_create_tab()
+            if tab is None:
+                return False
+            session = tab.current_session
+            if session is None:
+                return False
+            await session.async_send_text(command + "\n")
+            await app.async_activate()
+            return True
+
+        return bool(asyncio.run(_go()))
+    except Exception:  # pylint: disable=broad-exception-caught
+        return False
 
 
 def _iterm(command: str) -> bool:
