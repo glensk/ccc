@@ -45,6 +45,8 @@ flags. Grouped by what they do:
 - `ccc start-job <id>` / `ccc open-job <id>|--file` — launch a saved job (in place / in a new tab, safe from Obsidian).
 - `ccc done-job` · `ccc delete-job` · `ccc restore-job` · `ccc unlaunch` — the lifecycle: done-without-running / trash / restore / back-to-draft.
 
+Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique prefix), not just the full UUID — exact match wins, an ambiguous prefix errors with the matches listed, matching is case-insensitive.
+
 **Sessions & tabs**
 
 - `ccc resume <id>` — resume a session in this terminal (`execvp`).
@@ -69,6 +71,7 @@ flags. Grouped by what they do:
 - `ccc daemon [--install|--uninstall|--status|--dry-run]` — the background housekeeper (launchd on macOS, systemd `--user` on Linux).
 - `ccc resume-halted [--watch|--dry-run]` — auto-resume rate-limit-halted sessions once the limit resets.
 - `ccc toggle-idle` · `ccc tab-symbol` · `ccc tag` · `ccc copilot-usage` — mute idle popups / per-repo badge / typed @tags / refresh Copilot usage.
+- `ccc restart-tui` — restart the running ccc TUI in its own tab (for automations that changed ccc's code/config).
 
 Inside a Claude Code session the slash commands `/aim` `/next-step` `/done` `/block`
 `/deadline` (plus `/aim-history`, `/subgoal-history`) drive the same actions from the
@@ -163,11 +166,12 @@ turned on. When no TUI is running, the API is off/unavailable, or you pass
 `--no-toggle`, `ccc jump` falls back to the original AppleScript path described above —
 it must work with no TUI at all.
 
-Coordination with the live TUI is four tiny files under
+Coordination with the live TUI is a handful of tiny files under
 `$CLAUDE_HOME/command-center/` (`jumpstate`): the TUI publishes its cursor's session
 (`jump_selected`) and its own identity (`jump_tui`, `pid|iterm_session_id`, enabling the
-fast path), and consumes a cursor-move request (`jump_request`) or the whole-toggle verb
-(`jump_toggle`). Both are polled every **0.1 s**, so the jump feels instant — a ~0.1 ms
+fast path), and consumes a cursor-move request (`jump_request`), the whole-toggle verb
+(`jump_toggle`), or the restart verb (`jump_restart`, see `ccc restart-tui` below). They
+are polled every **0.1 s**, so the jump feels instant — a ~0.1 ms
 file read at 10 Hz is free, and that cadence (not a slow osascript walk) now bounds the
 perceived f+j latency. The frontmost-app check uses `lsappinfo` (no Accessibility
 prompt).
@@ -183,6 +187,20 @@ still provides `s+j → ↓`, so vim-down is not lost. Revert by removing the
 > **The TUI half needs a restart to activate.** `ccc` is installed editable, but the
 > *running* TUI loaded its code at launch — quit (`q`) and relaunch `ccc` once so it
 > starts publishing its selection and polling for jump requests.
+
+#### Restart the TUI in place (`ccc restart-tui`)
+
+`ccc restart-tui` automates that "quit and relaunch" step for **automations** — a Claude
+session (or any script) that just edited ccc's code or config on an editable install and
+needs the running TUI to pick it up. It reuses the jump plumbing: it writes the
+`jump_restart` verb, the live TUI's 0.1 s poll consumes it, exits cleanly, and — once
+Textual has restored the terminal — the process **re-execs itself in place**
+(`os.execv`/`execvp`), so the TUI comes back up in its **own terminal tab** with the new
+code, no new window or manual keystroke. It exits **0** once the TUI has restarted (the
+request was consumed and a live TUI re-registered), and **1** when no TUI is running or
+the restart did not complete within 5 s. It is an internal-style command (no TUI key, no
+footer entry). A leftover restart request is always cleared on TUI startup, so a stale
+file can never loop-restart a freshly launched TUI.
 
 In the TUI, **`d`** marks the selected session done (its in-session `Status:` line
 shows `done` on that session's next render). If the session is still live, `d` then
