@@ -82,8 +82,10 @@ On the **capture pad**, ticking `launch` is enough by itself: a `draft` pad with
 toggle on is treated as `ready` and registers **and** launches in one pass — no status
 edit needed (the mobile Properties `status` field is free text, and `ready` never
 persists anywhere, so its suggestions can't offer the one value that matters). A pad
-flipped to `status: error` by a failed validation stays skipped until you reset its
-status, even with `launch` still ticked.
+flipped to `status: error` by a failed validation keeps retrying while `launch` stays
+ticked: fix the offending field and the next sync pass registers and launches it — no
+status reset, and never delete the error block by hand (ccc owns it; it disappears on
+successful registration).
 
 **Where the job opens.** The launchd watcher cannot AppleScript iTerm (TCC silently
 denies without prompting, and iTerm's Python-API cookies are single-use and mintable
