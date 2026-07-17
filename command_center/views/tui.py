@@ -3813,10 +3813,14 @@ class CommandCenterApp(App[None]):
         card stays hidden), so say why instead of silently doing nothing.
         """
         if not self._has_work_account():
+            # markup=False: the example contains ``[...]`` which Textual would otherwise
+            # parse as console markup (``~/.claude"`` is not a valid tag → MarkupError
+            # crashes the toast render). Render it as literal text instead.
             self.notify(
                 "No `work` account configured. Add it to claude_accounts, e.g. "
                 '["private=~/.claude", "work=~/.claude-work"]',
                 severity="warning",
+                markup=False,
             )
             return
         self._toggle_usage_card("usage_card_work", "Claude Code (work)")
