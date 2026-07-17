@@ -23,6 +23,7 @@ import os
 import re
 import signal
 import subprocess
+import sys
 import threading
 import uuid
 from collections.abc import Callable
@@ -1930,6 +1931,9 @@ class CommandCenterApp(App[None]):
         # Undo stack (the `u` key): most recent last, capped at _UNDO_MAX, this run only.
         self._undo_stack: list[_UndoEntry] = []
         self._undoing = False  # True while action_undo runs an entry — suppresses re-push
+        # Set by the fast poll when `ccc restart-tui` asks us to restart: run() re-execs
+        # the process in place (same tab) once the app has exited and the terminal restored.
+        self.restart_requested = False
 
     # ---- layout (top: table, bottom: detail) ----------------------------
     def compose(self) -> ComposeResult:
@@ -2002,6 +2006,9 @@ class CommandCenterApp(App[None]):
         # dead TUI must not fire on startup.
         jumpstate.set_tui(os.getpid(), os.environ.get("ITERM_SESSION_ID", ""))
         jumpstate.clear_toggle()
+        # Drop any leftover restart request too: a file left by a crashed/killed TUI (or by
+        # the previous instance's own restart) must NOT instantly re-restart this fresh one.
+        jumpstate.clear_restart()
         # Pre-warm the iTerm2 API websocket so the first f+j is already sub-ms — but only
         # under iTerm (a real $ITERM_SESSION_ID). Headless tests / Linux / tmux must never
         # open the socket, so the gate is the env var, not a try/except.
@@ -2606,7 +2613,15 @@ class CommandCenterApp(App[None]):
         tab (the slow no-TUI path) writes that session id; we move the cursor onto its
         row and clear the request. A request for a session not (yet) in the table is
         left pending for a later tick.
+
+        A pending *restart* verb (``ccc restart-tui``) takes precedence: we consume it,
+        flag the app and exit cleanly; run() re-execs the process in place (same tab).
         """
+        if jumpstate.peek_restart():
+            jumpstate.clear_restart()
+            self.restart_requested = True
+            self.exit()
+            return
         if jumpstate.peek_toggle():
             jumpstate.clear_toggle()
             self.run_worker(self._handle_jump_toggle(), exclusive=True, group="jump-toggle")
@@ -4528,7 +4543,37 @@ class CommandCenterApp(App[None]):
             self.query_one("#edit-folder", Button).focus()
 
 
+def _reexec_argv() -> list[str]:
+    """The argv to re-exec ccc in place after a ``restart-tui`` request.
+
+    Prefer the exact same program image (``sys.argv[0]``) when it is an absolute,
+    executable path (the ``ccc`` console entry point) so the identical binary re-runs;
+    otherwise fall back to resolving ``ccc`` on ``$PATH`` (e.g. launched via
+    ``python -m command_center``, whose ``argv[0]`` is a non-executable module path).
+    """
+    argv0 = sys.argv[0]
+    if os.path.isabs(argv0) and os.access(argv0, os.X_OK):
+        return list(sys.argv)
+    return ["ccc", *sys.argv[1:]]
+
+
+def _reexec_in_place() -> None:
+    """Replace this process image to restart the TUI in the same terminal tab.
+
+    Runs only after ``App.run()`` has returned — Textual has restored the terminal by
+    then — so the re-exec'd ccc starts on a clean screen. Does not return on success.
+    """
+    argv = _reexec_argv()
+    if os.path.isabs(argv[0]):
+        os.execv(argv[0], argv)  # exact same program image (path exists)
+    else:
+        os.execvp(argv[0], argv)  # resolve the bare `ccc` on $PATH
+
+
 def run() -> int:
-    """Launch the TUI."""
-    CommandCenterApp().run()
+    """Launch the TUI, re-exec'ing in place if it asked to restart itself."""
+    app = CommandCenterApp()
+    app.run()
+    if app.restart_requested:
+        _reexec_in_place()  # replaces this process — does not return on success
     return 0

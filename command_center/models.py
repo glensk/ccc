@@ -38,7 +38,7 @@ STATUS_ICON: dict[Status, str] = {
     Status.WAITING_INPUT: "⏸",
     Status.HALTED: "||",  # rate-limit halt — rendered red; distinct from the ⏸ pause
     Status.WAITING_CODEX: "😴",  # Codex quota exhausted; waiting for its reset window
-    Status.IDLE: "●",  # green dot — idle/ready, waiting for your input (was the faint "·")
+    Status.IDLE: "❯",  # amber prompt chevron — Claude finished its turn, waiting for YOUR input (distinct from the green running ▶)
     Status.SNOOZED: "💤",  # background task still running while the session itself is idle
     Status.PARKED: "☾",
     Status.DONE: "✓",
@@ -67,7 +67,7 @@ STATUS_HELP: dict[Status, str] = {
     Status.WAITING_INPUT: "live — paused, waiting for your input",
     Status.HALTED: "live — stopped on a Claude rate limit; nothing will revive it",
     Status.WAITING_CODEX: "live — idle, waiting for OpenAI Codex quota reset",
-    Status.IDLE: "live — open tab, idle this moment",
+    Status.IDLE: "live — idle, waiting for your input",
     Status.SNOOZED: "live — idle, waiting on a background task to finish",
     Status.PARKED: "closed — process gone; resume with r",
     Status.DONE: "AIM marked achieved (done)",

@@ -17,6 +17,10 @@ writes never race on a shared blob:
   instead of paying its own ps + osascript walks.
 - **toggle** (``jump_toggle``) — the request verb for that fast path: ``ccc jump`` just
   writes it and returns; the TUI's fast poll consumes it and runs the toggle itself.
+- **restart** (``jump_restart``) — the request verb for ``ccc restart-tui``: an out-of-process
+  caller (an automation that changed ccc's code/config) writes it; the TUI's fast poll
+  consumes it, exits cleanly and re-execs itself in the same tab. The TUI also clears any
+  leftover request on mount so a stale file can never instantly restart a fresh TUI.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ _SELECTED = "jump_selected"
 _REQUEST = "jump_request"
 _TUI = "jump_tui"
 _TOGGLE = "jump_toggle"
+_RESTART = "jump_restart"
 
 
 def _read(name: str) -> str | None:
@@ -109,3 +114,18 @@ def peek_toggle() -> bool:
 def clear_toggle() -> None:
     """Drop the pending toggle (the TUI calls this once it has consumed it)."""
     _write(_TOGGLE, None)
+
+
+def request_restart() -> None:
+    """Ask the live TUI to restart itself in its own tab (``ccc restart-tui`` → TUI)."""
+    _write(_RESTART, "1")
+
+
+def peek_restart() -> bool:
+    """True if a restart is pending (does not clear it)."""
+    return _read(_RESTART) is not None
+
+
+def clear_restart() -> None:
+    """Drop the pending restart (the TUI clears it on consume AND on mount — see module doc)."""
+    _write(_RESTART, None)

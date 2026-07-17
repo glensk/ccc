@@ -2739,3 +2739,108 @@ def test_undo_stack_caps_at_20(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
             assert len(app._undo_stack) == 20
 
     asyncio.run(scenario())
+
+
+# --------------------------------------------------------------------------- #
+# restart-tui: re-exec decision + poll-handler restart flag + stale-request safety
+# --------------------------------------------------------------------------- #
+def test_reexec_argv_uses_same_image_when_argv0_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An absolute, executable argv[0] (the `ccc` entry point) re-runs the same image."""
+    from command_center.views import tui
+
+    exe = "/usr/local/bin/ccc"
+    monkeypatch.setattr(tui.sys, "argv", [exe, "tui"])
+    monkeypatch.setattr(tui.os.path, "isabs", lambda p: p == exe)
+    monkeypatch.setattr(tui.os, "access", lambda p, mode: p == exe)
+
+    assert tui._reexec_argv() == [exe, "tui"]
+
+
+def test_reexec_argv_falls_back_to_ccc_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-executable/module argv[0] (`python -m command_center`) resolves `ccc` on PATH."""
+    from command_center.views import tui
+
+    monkeypatch.setattr(tui.sys, "argv", ["/some/where/__main__.py", "tui"])
+    monkeypatch.setattr(tui.os, "access", lambda p, mode: False)  # argv[0] not +x
+
+    assert tui._reexec_argv() == ["ccc", "tui"]
+
+
+def test_reexec_in_place_execv_for_absolute_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An absolute argv[0] re-execs via os.execv (path exists), never os.execvp."""
+    from command_center.views import tui
+
+    exe = "/usr/local/bin/ccc"
+    monkeypatch.setattr(tui, "_reexec_argv", lambda: [exe, "tui"])
+    execv_calls: list[tuple[str, list[str]]] = []
+    execvp_calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(tui.os, "execv", lambda f, a: execv_calls.append((f, a)))
+    monkeypatch.setattr(tui.os, "execvp", lambda f, a: execvp_calls.append((f, a)))
+
+    tui._reexec_in_place()
+    assert execv_calls == [(exe, [exe, "tui"])]
+    assert execvp_calls == []
+
+
+def test_reexec_in_place_execvp_for_bare_ccc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bare `ccc` argv[0] re-execs via os.execvp so $PATH is searched."""
+    from command_center.views import tui
+
+    monkeypatch.setattr(tui, "_reexec_argv", lambda: ["ccc", "tui"])
+    execv_calls: list[tuple[str, list[str]]] = []
+    execvp_calls: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(tui.os, "execv", lambda f, a: execv_calls.append((f, a)))
+    monkeypatch.setattr(tui.os, "execvp", lambda f, a: execvp_calls.append((f, a)))
+
+    tui._reexec_in_place()
+    assert execvp_calls == [("ccc", ["ccc", "tui"])]
+    assert execv_calls == []
+
+
+def test_tui_clears_a_stale_restart_request_on_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A leftover restart request (crashed prior TUI) must NOT self-restart a fresh TUI."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center import jumpstate
+    from command_center.views.tui import CommandCenterApp
+
+    jumpstate.request_restart()  # a stale request already on disk before we mount
+    assert jumpstate.peek_restart() is True
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            # on_mount cleared it before wiring the poll → no instant self-restart.
+            assert jumpstate.peek_restart() is False
+            assert app.restart_requested is False
+
+    asyncio.run(scenario())
+
+
+def test_poll_honours_a_restart_request_and_flags_the_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart request arriving while live → the poll consumes it, flags + exits the app."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed(tmp_path)
+
+    from command_center import jumpstate
+    from command_center.views.tui import CommandCenterApp
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            assert app.restart_requested is False
+            jumpstate.request_restart()  # ccc restart-tui writes it while we run
+            app._poll_jump_request()  # the fast poll would fire this every 0.1 s
+            assert app.restart_requested is True
+            assert jumpstate.peek_restart() is False  # consumed by the handler
+
+    asyncio.run(scenario())

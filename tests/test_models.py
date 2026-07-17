@@ -241,8 +241,7 @@ def test_done_bar_parts() -> None:
 
 
 def test_empty_track_tint_and_xterm_rgb() -> None:
-    # xterm-256 → RGB: colour cube (84 = idle spring green, matches TUI #5fff87),
-    # grayscale ramp, classic 16.
+    # xterm-256 → RGB: colour cube (84 = spring green), grayscale ramp, classic 16.
     assert xterm_rgb(84) == (95, 255, 135)
     assert xterm_rgb(196) == (255, 0, 0)
     assert xterm_rgb(231) == (255, 255, 255)

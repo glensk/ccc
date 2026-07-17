@@ -141,7 +141,10 @@ keys, the future-job files, the daemon — lives in
 (the zero-setup, fake-data command center) and `ccc doctor` (a read-only health check of
 your install and environment). Inside a Claude Code session, the slash commands `/aim`
 `/next-step` `/done` `/block` `/deadline` (installed by `ccc init`) drive the same
-actions from the prompt.
+actions from the prompt. For automations that just changed ccc's own code or config (an
+editable install), `ccc restart-tui` bounces the running TUI in its **own** terminal tab
+so the new code loads — no manual keystroke; it exits 0 once the TUI is back, 1 if none
+is running.
 
 In the TUI, the `t` leader chord shows/hides the usage cards: `t1`…`t4` for the
 Claude/Codex/Copilot subscription cards, and `to`/`ta` for two optional cards fed by an

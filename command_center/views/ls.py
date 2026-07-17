@@ -46,7 +46,7 @@ _STATUS_COLOR: dict[Status, int] = {
     Status.WAITING_INPUT: 214,
     Status.HALTED: 196,  # rate-limit halt — red ||
     Status.WAITING_CODEX: 214,  # Codex quota exhausted — amber sleeping face
-    Status.IDLE: 84,  # idle/ready green ● — bright spring green, matches TUI #5fff87
+    Status.IDLE: 214,  # amber ❯ — waiting for your input, matches TUI #ffaf00
     Status.SNOOZED: 40,  # background task running while the session itself is idle
     Status.PARKED: 244,
     Status.DONE: 35,

@@ -1178,9 +1178,7 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
             return 1
         args.session_id = resolved  # full UUID from here on (store ops + --session-id argv)
         session = store.get(resolved)
-        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
-            print(f"error: no such job {args.session_id}", file=sys.stderr)
-            return 1
+        assert session is not None  # resolve_job_id only ever returns a real id
         # (0) Guards (decision 13): only a live draft is launchable — refuse BEFORE any
         # state mutation (or the targeted file import) so a bad call changes nothing.
         if not session.draft:
@@ -1429,9 +1427,7 @@ def cmd_done_job(args: argparse.Namespace) -> int:
             return 1
         session_id = resolved
         session = store.get(session_id)
-        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
-            print(f"error: no such job {session_id}", file=sys.stderr)
-            return 1
+        assert session is not None  # resolve_job_id only ever returns a real id
         if not session.draft or session.archived:
             print(
                 f"error: {session_id} is not a live future job — "
@@ -1475,9 +1471,7 @@ def cmd_delete_job(args: argparse.Namespace) -> int:
             return 1
         session_id = resolved
         session = store.get(session_id)
-        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
-            print(f"error: no such job {session_id}", file=sys.stderr)
-            return 1
+        assert session is not None  # resolve_job_id only ever returns a real id
         if not session.draft or session.archived:
             print(
                 f"error: {session_id} is not a live future job — "
@@ -1606,9 +1600,7 @@ def cmd_open_job(args: argparse.Namespace) -> int:
             return 1
         session_id = resolved
         session = store.get(session_id)
-    if session is None:  # pragma: no cover — resolve_job_id only returns a real id
-        print(f"error: no such job {session_id}", file=sys.stderr)
-        return 1
+        assert session is not None  # resolve_job_id only ever returns a real id
     if session.archived:
         print(f"error: job {session_id} is archived — cannot open", file=sys.stderr)
         return 1
@@ -2560,6 +2552,59 @@ def cmd_jump(args: argparse.Namespace) -> int:
     return jump.run(args)
 
 
+_RESTART_POLL_SEC = 0.1
+_RESTART_TIMEOUT_SEC = 5.0
+
+
+def cmd_restart_tui(args: argparse.Namespace) -> int:
+    """Restart the running ccc TUI in its own terminal tab (for automations).
+
+    An automation that just changed ccc's code/config (editable install) runs this to
+    bounce the live TUI so the new code is loaded — same tab, no manual keystroke. It
+    asks the TUI (via the ``restart`` jumpstate verb) to exit and re-exec itself in place.
+
+    Exit 0 once the TUI has come back up (the request was consumed and a live TUI
+    identity is re-registered — a same-pid ``execv`` restart after a teardown gap, or a
+    fresh pid); exit 1 when no TUI is running, or the restart did not complete in 5 s.
+    """
+    import time
+
+    from . import jumpstate
+
+    tui = jumpstate.get_tui()
+    if tui is None:
+        print("no running ccc TUI", file=sys.stderr)
+        return 1
+    old_pid = tui[0]
+    jumpstate.request_restart()
+    saw_consumed = False  # the TUI acknowledged (cleared) the request
+    saw_gone = False  # its identity was cleared on unmount → restart is genuinely in flight
+    deadline = time.monotonic() + _RESTART_TIMEOUT_SEC
+    while time.monotonic() < deadline:
+        time.sleep(_RESTART_POLL_SEC)
+        if not saw_consumed and not jumpstate.peek_restart():
+            saw_consumed = True
+        current = jumpstate.get_tui()
+        if current is None:
+            if saw_consumed:
+                saw_gone = True
+            continue
+        new_pid = current[0]
+        if new_pid != old_pid:  # a fresh process registered — unambiguous restart
+            print(f"restarted ccc TUI (pid {old_pid} → {new_pid})")
+            return 0
+        if saw_consumed and saw_gone:  # same pid re-registered after the gap (execv in place)
+            print(f"restarted ccc TUI (pid {old_pid} → {new_pid})")
+            return 0
+    jumpstate.clear_restart()  # stale-request safety: don't let it restart a TUI started later
+    print(
+        "error: ccc TUI did not restart within 5s — is it wedged? "
+        "check the tab (or start it with `ccc tui`)",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def cmd_tab_symbol(args: argparse.Namespace) -> int:
     """Claim/read this iTerm tab's badge, or print a path's deterministic repo symbol.
 
@@ -2675,6 +2720,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-j", "--json", action="store_true", help="dump the cached snapshot as JSON (no fetch)"
     )
     p_cop.set_defaults(func=cmd_copilot_usage)
+
+    sub.add_parser(
+        "restart-tui",
+        help="internal: restart the running ccc TUI in its own tab (for automations)",
+    ).set_defaults(func=cmd_restart_tui)
 
     p_clu = sub.add_parser(
         "claude-usage",

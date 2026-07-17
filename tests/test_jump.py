@@ -216,6 +216,15 @@ def test_toggle_roundtrip(_home: Path) -> None:
     assert jumpstate.peek_toggle() is False
 
 
+def test_restart_roundtrip(_home: Path) -> None:
+    assert jumpstate.peek_restart() is False
+    jumpstate.request_restart()
+    assert jumpstate.peek_restart() is True  # peek does NOT consume
+    assert jumpstate.peek_restart() is True
+    jumpstate.clear_restart()
+    assert jumpstate.peek_restart() is False
+
+
 # --------------------------------------------------------------------------- #
 # iterm_api — graceful degrade when the iterm2 package / API is unavailable
 # --------------------------------------------------------------------------- #

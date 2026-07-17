@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from command_center.models import LiveSession
-from command_center.store import Store
+from command_center.store import AmbiguousJobId, Store, resolve_job_id
 
 
 def _store(tmp_path: Path) -> Store:
@@ -93,6 +95,54 @@ def test_archived_excluded(tmp_path: Path) -> None:
     ids = {s.session_id for s in store.list_sessions()}
     assert ids == {"a"}
     assert len(store.list_sessions(include_archived=True)) == 2
+
+
+_UUID_A = "ad2096c4-0000-4000-8000-000000000001"
+_UUID_B = "ad2096c4-0000-4000-8000-000000000002"  # shares A's 8-char display prefix
+_UUID_C = "be317d55-0000-4000-8000-000000000003"
+
+
+def test_resolve_job_id_exact_wins_over_shared_prefix(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft(_UUID_A, "/repo", "A")
+    store.create_draft(_UUID_B, "/repo", "B")
+    # A full id is returned even though B shares its whole 8-char prefix.
+    assert resolve_job_id(store, _UUID_A) == _UUID_A
+    assert resolve_job_id(store, _UUID_B.upper()) == _UUID_B  # case-insensitive exact
+
+
+def test_resolve_job_id_unique_prefix(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft(_UUID_A, "/repo", "A")
+    store.create_draft(_UUID_C, "/repo", "C")
+    assert resolve_job_id(store, "be317d55") == _UUID_C  # unique 8-char prefix
+    assert resolve_job_id(store, "BE317") == _UUID_C  # case-insensitive prefix
+
+
+def test_resolve_job_id_ambiguous_raises(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft(_UUID_A, "/repo", "A")
+    store.create_draft(_UUID_B, "/repo", "B")
+    with pytest.raises(AmbiguousJobId) as excinfo:
+        resolve_job_id(store, "ad2096")
+    assert set(excinfo.value.matches) == {_UUID_A, _UUID_B}
+    assert "ambiguous job id ad2096" in str(excinfo.value)
+
+
+def test_resolve_job_id_no_match_returns_none(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft(_UUID_A, "/repo", "A")
+    assert resolve_job_id(store, "ffffffff") is None
+    assert resolve_job_id(store, "") is None
+
+
+def test_resolve_job_id_includes_archived_and_accepts_id_iterable(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    store.create_draft(_UUID_A, "/repo", "A")
+    store.update_fields(_UUID_A, archived=True)  # deleted/archived job still resolvable
+    assert resolve_job_id(store, "ad2096c4") == _UUID_A
+    # The resolver also accepts a plain iterable of ids (not just a Store).
+    assert resolve_job_id([_UUID_A, _UUID_C], "be31") == _UUID_C
 
 
 def test_subgoals_and_progress(tmp_path: Path) -> None:

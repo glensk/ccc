@@ -626,6 +626,110 @@ def test_open_job_file_missing_path_rejected(
     assert "cannot read" in capsys.readouterr().err
 
 
+# --------------------------------------------------------------------------- #
+# unique-prefix job-id resolution (`ccc start-job ad2096c4` where ad2096c4 is the
+# 8-char id shown by `ccc jobs`) — routed through the shared store.resolve_job_id.
+# --------------------------------------------------------------------------- #
+_UUID_A = "ad2096c4-0000-4000-8000-000000000001"
+_UUID_B = "ad2096c4-0000-4000-8000-000000000002"  # shares the 8-char display prefix with A
+_UUID_C = "be317d55-0000-4000-8000-000000000003"
+
+
+def test_open_job_resolves_a_unique_id_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(_UUID_C, "/Users/x/repo", "Only one with this prefix")
+    store.close()
+    calls = _stub_open_tab(monkeypatch)
+
+    # `be317d55` is a unique prefix → resolves to the full UUID and opens its tab.
+    assert cmd_open_job(argparse.Namespace(session_id="be317d55")) == 0
+    assert calls == [_UUID_C]  # the tab opened for the full id, not the prefix
+    assert "opening future job" in capsys.readouterr().out
+
+
+def test_open_job_exact_full_id_still_works(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(_UUID_A, "/Users/x/repo", "Job A")
+    store.create_draft(_UUID_B, "/Users/x/repo", "Job B")  # shares A's 8-char prefix
+    store.close()
+    calls = _stub_open_tab(monkeypatch)
+
+    # An exact full id wins outright even though B shares its 8-char display prefix.
+    assert cmd_open_job(argparse.Namespace(session_id=_UUID_A)) == 0
+    assert calls == [_UUID_A]
+    assert "opening future job" in capsys.readouterr().out
+
+
+def test_open_job_ambiguous_prefix_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(_UUID_A, "/Users/x/repo", "Job A")
+    store.create_draft(_UUID_B, "/Users/x/repo", "Job B")
+    store.close()
+    calls = _stub_open_tab(monkeypatch)
+
+    # `ad2096` is a prefix of BOTH A and B → ambiguous, no tab opened.
+    assert cmd_open_job(argparse.Namespace(session_id="ad2096")) == 1
+    assert calls == []
+    assert "ambiguous job id ad2096" in capsys.readouterr().err
+
+
+def test_open_job_unknown_prefix_reports_no_such_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center.cli import cmd_open_job
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(_UUID_A, "/Users/x/repo", "Job A")
+    store.close()
+    calls = _stub_open_tab(monkeypatch)
+
+    assert cmd_open_job(argparse.Namespace(session_id="ffffffff")) == 1
+    assert calls == []
+    assert "no such job" in capsys.readouterr().err
+
+
+def test_start_job_resolves_a_unique_id_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reported bug: `ccc start-job <8-char>` must launch, not error 'no such job'."""
+    from command_center.cli import cmd_start_job
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached ccc sync-mirrors spawn
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(_UUID_C, "/no/such/dir", "Do the thing", prompt="run it")
+    store.close()
+
+    captured: dict[str, list[str]] = {}
+
+    def _capture(_file: str, argv: list[str]) -> None:
+        captured["argv"] = argv
+        raise _StopExec
+
+    monkeypatch.setattr("command_center.cli.os.execvp", _capture)
+    with pytest.raises(_StopExec):
+        cmd_start_job(argparse.Namespace(session_id="be317d55"))
+    # The full UUID (not the prefix) reaches the `claude --session-id` argv.
+    assert _UUID_C in captured["argv"]
+    assert "be317d55" not in captured["argv"]
+
+
 def _make_scheduled_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, start_date: str) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_INTERNAL", "1")  # suppress the detached ccc sync-mirrors spawn
@@ -1021,3 +1125,22 @@ def test_capture_usage_skips_write_when_account_none(
     assert usage.read_usage("work") is None
     # Nothing was written at all.
     assert list(config.app_home().glob("usage*.json")) == []
+
+
+# ---- restart-tui ------------------------------------------------------------
+def test_restart_tui_with_no_running_tui_exits_1(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from command_center import jumpstate
+    from command_center.cli import cmd_restart_tui
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    (tmp_path / "command-center").mkdir(parents=True)
+    assert jumpstate.get_tui() is None  # no TUI registered
+
+    requested: list[bool] = []
+    monkeypatch.setattr(jumpstate, "request_restart", lambda: requested.append(True))
+
+    assert cmd_restart_tui(argparse.Namespace()) == 1
+    assert requested == []  # never even asked for a restart
+    assert "no running ccc TUI" in capsys.readouterr().err
