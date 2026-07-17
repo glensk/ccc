@@ -961,7 +961,7 @@ forces every `Status` to carry an icon and a help line):
 | `\|\|▶` | `halted`     | live — rate-limit halt; **auto-resumes** when that account's limit resets |
 | `\|\|` | `halted`        | live — rate-limit halt; **nothing will revive it** (resume it yourself with `r`) |
 | `😴` | `waiting_codex` | live — idle, waiting for Codex quota reset |
-| `●`  | `idle`          | live — open tab, idle this moment         |
+| `❯`  | `idle`          | live — idle, waiting for your input (amber) |
 | `💤` | `snoozed`       | live — idle, waiting on a background task |
 | `☾`  | `parked`        | closed — process gone; resume with `r`    |
 | `✓`  | `done`          | AIM marked achieved (done)                |
@@ -995,7 +995,7 @@ A **snoozed** (`💤`) session is idle *and* has a background task it spawned st
 running (e.g. a `run_in_background` shell that will re-invoke the agent when it
 finishes). It is derived live from the process tree each refresh — purely
 deterministic, with no stored flag — so the instant that task exits the row
-reverts to plain `●` idle. (The idle reaper leaves snoozed sessions alone.)
+reverts to plain `❯` idle. (The idle reaper leaves snoozed sessions alone.)
 
 A **closed** session is exactly a **parked** (`☾`) one — there is no separate
 "closed" status. Accordingly the footer's close hint renders as **`☾lose`**, the
