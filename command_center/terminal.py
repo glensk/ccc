@@ -218,17 +218,18 @@ def _tmux_pane_for_session(
     children: dict[int, list[tuple[int, str]]],
     commands: dict[int, str],
     session_id: str,
-) -> str | None:
-    """The tmux window target (e.g. ``"ccc:2"``) whose pane hosts *session_id*'s claude.
+) -> tuple[str, str] | None:
+    """The ``(window_target, pane_id)`` whose pane hosts *session_id*'s claude.
 
-    *panes* rows are ``(window_target, pane_pid, pane_id)`` from ``list-panes``; *children*
-    maps ``ppid -> [(pid, command), ...]`` (the traversal edges from ``ps``) and *commands*
-    maps ``pid -> command`` (every process's own argv). A launchd-spawned job's pane runs
-    ``ccc start-job``, which **execs** claude in place — so the ``--session-id`` argv lives on
-    the *pane_pid itself*, not a child. The walk therefore checks each node's OWN command
-    (starting at pane_pid) before descending. BFS with a visited set defends against a
-    cyclic / duplicated ``ps`` snapshot; the first pane whose tree carries the session's
-    claude wins.
+    *window_target* is e.g. ``"ccc:2"`` (select-window handle) and *pane_id* is e.g.
+    ``"%3"`` (kill-pane handle). *panes* rows are ``(window_target, pane_pid, pane_id)``
+    from ``list-panes``; *children* maps ``ppid -> [(pid, command), ...]`` (the traversal
+    edges from ``ps``) and *commands* maps ``pid -> command`` (every process's own argv). A
+    launchd-spawned job's pane runs ``ccc start-job``, which **execs** claude in place — so
+    the ``--session-id`` argv lives on the *pane_pid itself*, not a child. The walk therefore
+    checks each node's OWN command (starting at pane_pid) before descending. BFS with a
+    visited set defends against a cyclic / duplicated ``ps`` snapshot; the first pane whose
+    tree carries the session's claude wins.
 
     The needle is matched at a token boundary (end-of-string or whitespace after the id) so a
     short id like ``abc-123`` never spuriously matches ``--session-id abc-1234`` — a plain
@@ -245,7 +246,7 @@ def _tmux_pane_for_session(
             idx = command.find(needle, idx + 1)
         return False
 
-    for window_target, pane_pid, _pane_id in panes:
+    for window_target, pane_pid, pane_id in panes:
         visited: set[int] = set()
         queue: list[int] = [pane_pid]  # a plain list is BFS enough for a tiny process tree
         while queue:
@@ -254,11 +255,92 @@ def _tmux_pane_for_session(
                 continue
             visited.add(pid)
             if carries_session(commands.get(pid, "")):
-                return window_target
+                return window_target, pane_id
             for child_pid, _command in children.get(pid, []):
                 if child_pid not in visited:
                     queue.append(child_pid)
     return None
+
+
+def _tmux_process_tree() -> (
+    tuple[list[tuple[str, int, str]], dict[int, list[tuple[int, str]]], dict[int, str]] | None
+):
+    """Gather ``(panes, children, commands)`` for the pane locator, or ``None`` on failure.
+
+    Shells out to ``tmux list-panes -a`` (``(window_target, pane_pid, pane_id)`` rows) and
+    ``ps -axo pid=,ppid=,command=`` (the process tree). Returns ``None`` when tmux is
+    missing, lists no panes, or either command errors — callers then degrade (no focus / no
+    close). Shared by :func:`focus_tmux_window` and :func:`tmux_pane_for_session`.
+    """
+    tmux = shutil.which("tmux")
+    if tmux is None:
+        return None
+    try:
+        listing = subprocess.run(
+            [
+                tmux,
+                "list-panes",
+                "-a",
+                "-F",
+                "#{session_name}:#{window_index} #{pane_pid} #{pane_id}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if listing.returncode != 0 or not listing.stdout.strip():
+            return None
+        panes: list[tuple[str, int, str]] = []
+        for line in listing.stdout.splitlines():
+            parts = line.split()
+            if len(parts) < 3:
+                continue
+            try:
+                panes.append((parts[0], int(parts[1]), parts[2]))
+            except ValueError:
+                continue
+        if not panes:
+            return None
+
+        procs = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        if procs.returncode != 0:
+            return None
+        children: dict[int, list[tuple[int, str]]] = {}
+        commands: dict[int, str] = {}
+        for line in procs.stdout.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) < 3:
+                continue
+            try:
+                pid, ppid = int(fields[0]), int(fields[1])
+            except ValueError:
+                continue
+            commands[pid] = fields[2]
+            children.setdefault(ppid, []).append((pid, fields[2]))
+        return panes, children, commands
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+
+def tmux_pane_for_session(session_id: str) -> tuple[str, str] | None:
+    """Locate the live tmux ``(window_target, pane_id)`` hosting *session_id*'s claude.
+
+    Best-effort: scans ``tmux``/``ps`` (see :func:`_tmux_process_tree`) and walks each pane's
+    process tree for the claude carrying ``--session-id <session_id>``. Returns ``None`` when
+    tmux is absent or no pane hosts the session. Used by ``ccc close-now`` to ``kill-pane``.
+    """
+    gathered = _tmux_process_tree()
+    if gathered is None:
+        return None
+    panes, children, commands = gathered
+    return _tmux_pane_for_session(panes, children, commands, session_id)
 
 
 def focus_tmux_window(session_id: str) -> bool:
@@ -278,60 +360,15 @@ def focus_tmux_window(session_id: str) -> bool:
     tmux = shutil.which("tmux")
     if tmux is None:
         return False
+    gathered = _tmux_process_tree()
+    if gathered is None:
+        return False
+    panes, children, commands = gathered
+    located = _tmux_pane_for_session(panes, children, commands, session_id)
+    if located is None:
+        return False
+    target, _pane_id = located
     try:
-        listing = subprocess.run(
-            [
-                tmux,
-                "list-panes",
-                "-a",
-                "-F",
-                "#{session_name}:#{window_index} #{pane_pid} #{pane_id}",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if listing.returncode != 0 or not listing.stdout.strip():
-            return False
-        panes: list[tuple[str, int, str]] = []
-        for line in listing.stdout.splitlines():
-            parts = line.split()
-            if len(parts) < 3:
-                continue
-            try:
-                panes.append((parts[0], int(parts[1]), parts[2]))
-            except ValueError:
-                continue
-        if not panes:
-            return False
-
-        procs = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,command="],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        if procs.returncode != 0:
-            return False
-        children: dict[int, list[tuple[int, str]]] = {}
-        commands: dict[int, str] = {}
-        for line in procs.stdout.splitlines():
-            fields = line.split(None, 2)
-            if len(fields) < 3:
-                continue
-            try:
-                pid, ppid = int(fields[0]), int(fields[1])
-            except ValueError:
-                continue
-            commands[pid] = fields[2]
-            children.setdefault(ppid, []).append((pid, fields[2]))
-
-        target = _tmux_pane_for_session(panes, children, commands, session_id)
-        if target is None:
-            return False
-
         if (
             subprocess.run(
                 [tmux, "select-window", "-t", target],

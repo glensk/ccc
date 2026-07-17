@@ -105,6 +105,11 @@ _HANDOFF_NUDGE = (
 
 _LOCK_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
+# How long a `mark-done --close` close-after-turn request stays claimable (10 min). A
+# stamp older than this is cleared but never fired — so a stale arm can't survive into a
+# resumed session (see store.claim_close_request).
+CLOSE_REQUEST_TTL_MS = 10 * 60 * 1000
+
 
 def _sharpen_context(session: Session, sid: str, threshold: int) -> str:
     """The vague-AIM nudge, filled with the session's current score + checker reason."""
@@ -504,11 +509,29 @@ def handle_release_locks(payload: dict[str, Any]) -> int:
 
     Wired as the final Stop hook, *after* the auto-commit, so the session's files are already
     committed + pushed before their locks drop. A parked / idle session therefore holds none.
+
+    A ``mark-done --close`` may also have armed a one-shot close-after-turn request: claim it
+    atomically (at most one caller ever wins) and, on success, spawn the detached closer.
+    Running last means the SIGTERM + pane/tab close happen only after auto-commit committed
+    this turn's work. Kept fast and never-raising (dispatch swallows too, but we mirror the
+    defensive neighbours).
     """
     sid = _session_id(payload)
     if sid:
         with Store() as store:
             store.release_all_file_locks(sid)
+            if store.claim_close_request(sid, now_ms(), CLOSE_REQUEST_TTL_MS):
+                from . import spawn  # lazy, like _maybe_grade_after_turn
+
+                spawn.spawn_ccc(
+                    [
+                        "close-now",
+                        "--session",
+                        sid,
+                        "--iterm",
+                        os.environ.get("ITERM_SESSION_ID", ""),
+                    ]
+                )
     return 0
 
 

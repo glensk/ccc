@@ -110,7 +110,50 @@ def _section_wiring() -> Section:
         )
     else:
         section.checks.append(Check(FAIL, "statusline wired", "none — run ccc install-statusline"))
+    section.checks.append(_stop_order_check(settings))
     return section
+
+
+def _stop_hook_commands(settings: dict) -> list[str]:
+    """The Stop event's hook commands, flattened in wired order (empty if none)."""
+    hooks = settings.get("hooks")
+    stop = hooks.get("Stop") if isinstance(hooks, dict) else None
+    if not isinstance(stop, list):
+        return []
+    commands: list[str] = []
+    for group in stop:
+        if not isinstance(group, dict):
+            continue
+        for entry in group.get("hooks", []) or []:
+            if isinstance(entry, dict):
+                commands.append(str(entry.get("command", "")))
+    return commands
+
+
+def _stop_order_check(settings: dict) -> Check:
+    """WARN when ccc's ``release-locks`` Stop hook is not the LAST Stop entry.
+
+    close-after-done + lock-release must run AFTER foreign Stop hooks (e.g. the user's
+    auto-commit) so this turn's work is committed before the pane/tab closes and the locks
+    drop. Install enforces this; a later foreign append can break it — this guards that.
+    Recognised via the same matcher install.py uses for ccc-owned entries.
+    """
+    commands = _stop_hook_commands(settings)
+    positions = [
+        i
+        for i, cmd in enumerate(commands)
+        if install._ccc_hook_arg(cmd) == "release-locks"  # pylint: disable=protected-access
+    ]
+    if not positions:
+        return Check(NA, "Stop-hook order", "ccc release-locks not wired")
+    if positions[-1] == len(commands) - 1:
+        return Check(OK, "Stop-hook order", "release-locks runs last (after foreign Stop hooks)")
+    return Check(
+        FAIL,
+        "Stop-hook order",
+        "release-locks not last — close-after-done & lock-release must run after foreign "
+        "Stop hooks like auto-commit (ccc install-hooks)",
+    )
 
 
 def _section_daemon() -> Section:

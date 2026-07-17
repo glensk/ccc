@@ -32,6 +32,9 @@ CORE_COMMANDS: tuple[str, ...] = (
     "subgoal-history",
 )
 
+#: Core skill directory names, installed ALWAYS (not behind --codex).
+CORE_SKILLS: tuple[str, ...] = ("ccc-mark-done-and-close",)
+
 #: Skill directory name for the optional codex asset.
 _CODEX_SKILL = "codex-implement-task-and-claude-review"
 _CODEX_COMMAND = "codex-implement-task-and-claude-review.md"
@@ -69,6 +72,16 @@ def build_plan(claude_home: Path, *, codex: bool) -> list[Item]:
         )
         for stem in CORE_COMMANDS
     ]
+    # Core skills ship by default (not behind --codex) so `ccc-mark-done-and-close` is
+    # always available inside a session.
+    items.extend(
+        Item(
+            dest=claude_home / "skills" / name / "SKILL.md",
+            content=_read_asset("skills", name, "SKILL.md"),
+            label=f"skills/{name}/SKILL.md",
+        )
+        for name in CORE_SKILLS
+    )
     if codex:
         items.append(
             Item(
@@ -177,6 +190,8 @@ def run(  # pylint: disable=too-many-branches
             f"{tag}ccc {verb}-commands: written={written} skipped(up-to-date)={skipped} "
             f"backups={backed_up}  → {home / 'commands'}"
         )
+        for name in CORE_SKILLS:
+            print(f"{tag}  + skill (skills/{name})")
         if codex:
             print(f"{tag}  + codex command & skill (skills/{_CODEX_SKILL})")
     return 0

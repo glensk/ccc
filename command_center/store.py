@@ -79,6 +79,7 @@ _SESSION_COLUMNS = (
     "prompt_count",
     "last_response_at",
     "closed_at",
+    "close_requested_at",
     "last_seen_pid",
     "keep",
     "auto_closed",
@@ -161,6 +162,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     prompt_count      INTEGER NOT NULL DEFAULT 0,
     last_response_at  INTEGER NOT NULL DEFAULT 0,
     closed_at         INTEGER NOT NULL DEFAULT 0,
+    close_requested_at INTEGER NOT NULL DEFAULT 0,
     last_seen_pid     INTEGER,
     keep              INTEGER NOT NULL DEFAULT 0,
     auto_closed       INTEGER NOT NULL DEFAULT 0,
@@ -316,6 +318,8 @@ class Store:  # pylint: disable=too-many-public-methods
         "drift_ack_at": "INTEGER NOT NULL DEFAULT 0",
         # When reconcile first saw the process gone (0 = alive / closed pre-feature).
         "closed_at": "INTEGER NOT NULL DEFAULT 0",
+        # Epoch-ms a `mark-done --close` armed a close-after-turn request (0 = unarmed).
+        "close_requested_at": "INTEGER NOT NULL DEFAULT 0",
     }
     # Same, for the subgoals table (auto-progress marks its rows source='auto').
     _ADDED_SUBGOAL_COLUMNS = {
@@ -535,6 +539,31 @@ class Store:  # pylint: disable=too-many-public-methods
             f"UPDATE sessions SET {assignments}, updated_at = ? WHERE session_id = ?", values
         )
         self.conn.commit()
+
+    def claim_close_request(self, session_id: str, now: int, ttl_ms: int) -> bool:
+        """One-shot atomic claim of a pending close-after-turn request for *session_id*.
+
+        Returns ``True`` exactly once for a FRESH request (armed within *ttl_ms*): the
+        claiming ``UPDATE`` clears the stamp so no later caller can re-fire it, and
+        ``rowcount == 1`` means this caller won. An expired stamp (older than the TTL) is
+        never claimed (``False``) but is still cleared so it can't linger into a resumed
+        session; an unarmed row (``close_requested_at == 0``) returns ``False``. At most
+        one caller ever wins the fresh-request race.
+        """
+        cur = self.conn.execute(
+            "UPDATE sessions SET close_requested_at = 0 "
+            "WHERE session_id = ? AND close_requested_at != 0 AND close_requested_at > ?",
+            (session_id, now - ttl_ms),
+        )
+        claimed = cur.rowcount == 1
+        # Clear any remaining non-zero-but-expired stamp for this session (never claimed).
+        self.conn.execute(
+            "UPDATE sessions SET close_requested_at = 0 "
+            "WHERE session_id = ? AND close_requested_at != 0",
+            (session_id,),
+        )
+        self.conn.commit()
+        return claimed
 
     def upsert_from_live(self, live: LiveSession) -> None:
         """Reconcile a live registry entry, preserving user-authored fields."""

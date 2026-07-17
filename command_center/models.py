@@ -38,7 +38,7 @@ STATUS_ICON: dict[Status, str] = {
     Status.WAITING_INPUT: "⏸",
     Status.HALTED: "||",  # rate-limit halt — rendered red; distinct from the ⏸ pause
     Status.WAITING_CODEX: "😴",  # Codex quota exhausted; waiting for its reset window
-    Status.IDLE: "❯",  # amber prompt chevron — Claude finished its turn, waiting for YOUR input (distinct from the green running ▶)
+    Status.IDLE: "❯",  # amber prompt chevron — turn done, awaiting YOUR input (not running ▶)
     Status.SNOOZED: "💤",  # background task still running while the session itself is idle
     Status.PARKED: "☾",
     Status.DONE: "✓",
@@ -332,6 +332,9 @@ class Session:
     # closed before this field existed — display falls back to last_response_at then).
     # Cleared back to 0 the moment the session is observed live again (resume/reopen).
     closed_at: int = 0
+    # Epoch-ms when a close-after-turn was requested (`mark-done --close`); 0 = none.
+    # The release-locks Stop hook atomically claims it and spawns the detached closer.
+    close_requested_at: int = 0
     last_seen_pid: int | None = None
     keep: bool = False  # exempt from the idle reaper
     auto_closed: bool = False
