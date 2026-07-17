@@ -1112,7 +1112,12 @@ class SettingsScreen(ModalScreen[bool]):
         cfg.autoprogress = self.query_one("#autoprogress", Checkbox).value
         cfg.reap = self.query_one("#reap", Checkbox).value
         cfg.done_max_age_days = max(0, self._int("donedays", cfg.done_max_age_days))
-        config.save_config(cfg)
+        try:
+            config.save_config(cfg)
+        except RuntimeError as err:
+            self.notify(str(err), severity="error")
+            self.dismiss(False)
+            return
         terminal.set_tab(cfg.tab_title or None, terminal.color_rgb(cfg.tab_color))
         if self.query_one("#daemon", Checkbox).value:
             launchd.install()  # writes the plist with the new interval and (re)loads it
@@ -3790,7 +3795,11 @@ class CommandCenterApp(App[None]):
         setattr(cfg, key, new_value)
         if also is not None:
             setattr(cfg, also, new_value)
-        config.save_config(cfg)
+        try:
+            config.save_config(cfg)
+        except RuntimeError as err:
+            self.notify(str(err), severity="error")
+            return
         self.cfg = cfg
         self._update_usage()
 

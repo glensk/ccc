@@ -1197,6 +1197,16 @@ when every session is parked, and over `ccc serve` in the browser:
 > `claude_usage_refresh_active_sec` 200 s while any job works) and runs out-of-band —
 > the daemon per configured account, plus a detached TUI spawn when the snapshot is
 > stale. Off by default (fresh-install inert: a keychain read + network call).
+>
+> **429 backoff & stale marking.** The endpoint has started answering HTTP 429 with a
+> large `Retry-After` (observed 3357 s). Rather than keep hammering it every few minutes,
+> such a 429 persists `oauth_backoff_until` (= now + the server-given wait, capped at 2 h)
+> into the account's usage cache; while that time is in the future `claude_usage_stale`
+> reports the cache fresh, so neither the daemon nor the TUI re-attempts the fetch until it
+> passes (a successful fetch clears the field). Because a backed-off fetch means the number
+> can freeze, the Claude card marks it: when the last *successful* OAuth fetch is more than
+> 1 h old the Fable row is embossed `Fable: stale <age>` (e.g. `Fable: stale 6h 25m`)
+> instead of `Fable: Resets …`, so a stale figure is never shown as if it were live.
 
 ```commands
 echo "$input" | ccc statusline --session "$sid" --capture-usage

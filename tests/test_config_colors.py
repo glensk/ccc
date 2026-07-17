@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,83 @@ def test_claude_config_dirs_parses_validates_and_skips_malformed(
     # If every entry is malformed, fall back to the single private default.
     monkeypatch.setattr(config, "load_config", lambda: _cfg_with(["nope", "Bad=/x"]))
     assert _real_claude_config_dirs() == {"private": config.claude_home()}
+
+
+def test_unparsable_config_is_never_clobbered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.toml that fails to parse loads as fail-closed and can't be overwritten.
+
+    Reproduces the root cause of the real-config wipe: an existing but invalid
+    config.toml must load to DEFAULTS with ``loaded_from_disk is False``, and
+    ``save_config`` on that Config must raise (leaving the on-disk bytes untouched)
+    rather than persist defaults over the broken-but-recoverable file.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    cfg_file = config.config_path()
+    cfg_file.parent.mkdir(parents=True, exist_ok=True)
+    bad = "foo = [unclosed\n"
+    cfg_file.write_text(bad, encoding="utf-8")
+
+    loaded = config.load_config()
+    assert loaded.loaded_from_disk is False
+    assert loaded.idle_timeout_min == config.DEFAULTS["idle_timeout_min"]  # fell back to defaults
+
+    with pytest.raises(RuntimeError):
+        config.save_config(loaded)
+    # The unparsable file is left exactly as-is (fix-by-hand contract).
+    assert cfg_file.read_text(encoding="utf-8") == bad
+
+
+def test_save_config_backs_up_prior_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Overwriting a valid config copies the prior bytes to config.toml.bak."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    cfg = config.load_config()
+    cfg.idle_timeout_min = 42
+    config.save_config(cfg)
+    original = config.config_path().read_bytes()
+    bak = config.config_path().with_name("config.toml.bak")
+    assert not bak.exists()  # first write of a fresh install: nothing to back up
+
+    reloaded = config.load_config()
+    assert reloaded.loaded_from_disk is True
+    reloaded.idle_timeout_min = 99
+    config.save_config(reloaded)
+
+    # The backup holds the EXACT prior content; the live file holds the change.
+    assert bak.read_bytes() == original
+    assert config.load_config().idle_timeout_min == 99
+
+
+def test_fresh_install_saves_without_backup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No file yet ⇒ loaded_from_disk True, save writes fine, no .bak created."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    assert not config.config_path().exists()
+    cfg = config.load_config()
+    assert cfg.loaded_from_disk is True
+    config.save_config(cfg)
+    assert config.config_path().exists()
+    assert not config.config_path().with_name("config.toml.bak").exists()
+
+
+def test_loaded_from_disk_never_serialized(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fail-closed sentinel must never leak into the saved TOML.
+
+    Parse the written file and inspect the TOML KEYS rather than substring-matching the
+    raw text — a tmp path can itself contain the string ``loaded_from_disk`` (the vault
+    dirs the conftest injects embed the test name).
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    cfg = config.load_config()
+    config.save_config(cfg)
+    with config.config_path().open("rb") as handle:
+        written = tomllib.load(handle)
+    assert "loaded_from_disk" not in written
+    assert "loaded_from_disk" not in config.DEFAULTS
 
 
 def test_short_folder(monkeypatch: pytest.MonkeyPatch) -> None:

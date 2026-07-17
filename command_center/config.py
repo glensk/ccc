@@ -7,8 +7,10 @@ in ``~/.claude/command-center/config.toml`` and fall back to ``DEFAULTS``.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import re
+import tempfile
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -383,23 +385,60 @@ class Config:
     launchd_label: str = "com.claude-command-center"
     tmux_session: str = "ccc"
     folder_order: list[str] = field(default_factory=lambda: ["home", "infra", "llms", "sdsc"])
+    # Fail-closed sentinel — DELIBERATELY absent from ``DEFAULTS`` so it is never
+    # serialized (``save_config`` iterates ``DEFAULTS`` keys). ``load_config`` sets it
+    # False when an EXISTING config.toml failed to read/parse and we fell back to pure
+    # defaults; ``save_config`` then refuses to overwrite that file (see both docstrings).
+    loaded_from_disk: bool = True
 
 
 def load_config() -> Config:
-    """Load config from TOML, layered over ``DEFAULTS``."""
+    """Load config from TOML, layered over ``DEFAULTS``.
+
+    Fail-closed guard against the "failed load → save defaults" clobber that once
+    silently wiped a real config: when an EXISTING config.toml cannot be read or parsed
+    (OSError / ``tomllib.TOMLDecodeError``) we still return the DEFAULTS-populated Config
+    as before, but flag it ``loaded_from_disk=False``. :func:`save_config` refuses to
+    persist such a Config over the existing file. A MISSING file (fresh install) keeps
+    ``loaded_from_disk=True`` — saving defaults there is expected and safe.
+    """
     data: dict[str, object] = dict(DEFAULTS)
     path = config_path()
+    loaded_from_disk = True
     if path.exists():
         try:
             with path.open("rb") as handle:
                 data.update(tomllib.load(handle))
         except (OSError, tomllib.TOMLDecodeError):
-            pass
-    return Config(**{key: data[key] for key in DEFAULTS if key in data})  # type: ignore[arg-type]
+            loaded_from_disk = False
+    cfg = Config(**{key: data[key] for key in DEFAULTS if key in data})  # type: ignore[arg-type]
+    cfg.loaded_from_disk = loaded_from_disk
+    return cfg
 
 
-def save_config(cfg: Config) -> None:
-    """Write the config back to the TOML file (flat key = value)."""
+def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
+    """Write the config back to the TOML file (flat key = value).
+
+    Fail-closed guard: if config.toml already exists but *cfg* is flagged
+    ``loaded_from_disk=False`` (its :func:`load_config` hit an OSError /
+    TOMLDecodeError and fell back to pure DEFAULTS), raise ``RuntimeError`` instead of
+    overwriting the file with those defaults — the exact path that once wiped a real
+    config. The user must fix or delete the unparsable file by hand first.
+
+    The write is atomic and keeps a one-deep backup: before replacing an existing,
+    non-empty file whose content differs from the new text, the current bytes are copied
+    to ``config.toml.bak`` (same directory); the new text is written to a unique
+    ``tempfile.mkstemp`` file in that directory and swapped in with ``os.replace``, so a
+    concurrent reader never observes a truncated/empty file. There is no lock —
+    concurrent whole-file saves are last-wins; the atomicity only guarantees no partial
+    read.
+    """
+    path = config_path()
+    if path.exists() and cfg.loaded_from_disk is False:
+        raise RuntimeError(
+            "refusing to overwrite existing config.toml: it could not be parsed when "
+            "loaded; fix it by hand or delete it first"
+        )
     app_home().mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     for key in DEFAULTS:
@@ -421,4 +460,25 @@ def save_config(cfg: Config) -> None:
                 lines.append(f"{key} = {{}}")
         else:
             lines.append(f'{key} = "{value}"')
-    config_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
+    text = "\n".join(lines) + "\n"
+
+    # One-deep backup: preserve the prior content before an overwrite that changes it.
+    if path.exists():
+        try:
+            current = path.read_bytes()
+        except OSError:
+            current = b""
+        if current and current != text.encode("utf-8"):
+            with contextlib.suppress(OSError):
+                path.with_name(path.name + ".bak").write_bytes(current)
+
+    # Atomic replace: write to a unique temp in the same dir, then os.replace into place.
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise

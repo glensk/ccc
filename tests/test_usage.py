@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from datetime import UTC, datetime
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -972,6 +973,189 @@ def test_render_shows_fable_row_iff_present() -> None:
     assert "Fable:" not in usage.render_usage(without, now=_NOW).plain
     # The Codex card shares _render_card and must stay two rows.
     assert "Fable:" not in usage.render_codex_usage(without, now=_NOW).plain
+
+
+def _oauth_hdrs(retry_after: str) -> Message:
+    """A minimal headers object with a ``retry-after`` field (like HTTPError.headers)."""
+    hdrs = Message()
+    hdrs["retry-after"] = retry_after
+    return hdrs
+
+
+class _FakeOAuthResp:
+    """A minimal ``urlopen()`` context-manager stand-in returning a fixed body."""
+
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    def __enter__(self) -> _FakeOAuthResp:
+        return self
+
+    def __exit__(self, *_a: object) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return self._body
+
+
+def test_get_oauth_usage_body_large_retry_after_returns_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 with a large Retry-After surfaces ``(None, retry_after)`` to the caller."""
+
+    def _raise(*_a: object, **_k: object) -> object:
+        raise usage.urllib.error.HTTPError(
+            usage._OAUTH_USAGE_URL, 429, "Too Many Requests", _oauth_hdrs("3357"), None
+        )
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _raise)
+    body, retry = usage._get_oauth_usage_body("tok")
+    assert body is None
+    assert retry == 3357
+
+
+def test_get_oauth_usage_body_small_retry_after_sleeps_and_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A small (≤10 s) Retry-After is slept off and retried ONCE → ``(body, 0)``."""
+    calls = {"n": 0}
+
+    def _urlopen(*_a: object, **_k: object) -> object:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise usage.urllib.error.HTTPError(
+                usage._OAUTH_USAGE_URL, 429, "rate", _oauth_hdrs("2"), None
+            )
+        return _FakeOAuthResp(b'{"ok": true}')
+
+    monkeypatch.setattr(usage.urllib.request, "urlopen", _urlopen)
+    monkeypatch.setattr(usage.time, "sleep", lambda _s: None)  # never actually sleep
+    body, retry = usage._get_oauth_usage_body("tok")
+    assert body == '{"ok": true}'
+    assert retry == 0
+    assert calls["n"] == 2  # retried once after the small backoff
+
+
+def test_fetch_claude_usage_429_backoff_persists_and_preserves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A large-Retry-After 429 returns None and stamps oauth_backoff_until, keeping fields."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed_snapshot(
+        "private",
+        {
+            "captured_at": _NOW,
+            "five_hour": {"used_percentage": 10, "resets_at": _NOW + 3600},
+            "seven_day": {"used_percentage": 20, "resets_at": _NOW + 5 * 86400},
+            "fable_week": {"used_percentage": 42, "resets_at": _NOW + 9 * 86400},
+            "oauth_fetched_at": _NOW,
+        },
+    )
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda _account: "tok")
+    monkeypatch.setattr(usage, "_get_oauth_usage_body", lambda _token: (None, 3357))
+    assert usage.fetch_claude_usage("private", now=_NOW + 100) is None
+    data = json.loads(usage._usage_path("private").read_text(encoding="utf-8"))
+    # The backoff is now + retry_after (uncapped here), and every other field survived.
+    assert data["oauth_backoff_until"] == _NOW + 100 + 3357
+    assert data["five_hour"]["used_percentage"] == 10
+    assert data["seven_day"]["used_percentage"] == 20
+    assert data["fable_week"]["used_percentage"] == 42
+    assert data["oauth_fetched_at"] == _NOW
+    assert data["captured_at"] == _NOW
+    assert usage.oauth_backoff_until() == _NOW + 100 + 3357
+
+
+def test_fetch_claude_usage_backoff_capped(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A huge Retry-After is capped at now + _OAUTH_BACKOFF_CAP_SEC (writes a fresh cache)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda _account: "tok")
+    monkeypatch.setattr(usage, "_get_oauth_usage_body", lambda _token: (None, 999999))
+    assert usage.fetch_claude_usage("private", now=_NOW) is None
+    assert usage.oauth_backoff_until() == _NOW + usage._OAUTH_BACKOFF_CAP_SEC
+    assert usage._OAUTH_BACKOFF_CAP_SEC == 7200
+
+
+def test_fetch_claude_usage_success_clears_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A successful fetch writes a payload with no backoff key → the backoff is cleared."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed_snapshot("private", {"captured_at": _NOW, "oauth_backoff_until": _NOW + 3600})
+    monkeypatch.setattr(usage, "_keychain_oauth_token", lambda _account: "tok")
+    monkeypatch.setattr(
+        usage, "_get_oauth_usage_body", lambda _token: (json.dumps(_OAUTH_USAGE), 0)
+    )
+    snap = usage.fetch_claude_usage("private", now=_NOW + 50)
+    assert snap is not None
+    assert snap.oauth_fetched_at == _NOW + 50  # the snapshot carries the fetch time
+    assert usage.oauth_backoff_until() == 0  # cleared by the authoritative replace
+
+
+def test_claude_usage_stale_false_during_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A future backoff suppresses staleness even when the last fetch is ancient."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _seed_snapshot(
+        "private",
+        {
+            "captured_at": _NOW,
+            "five_hour": {"used_percentage": 3, "resets_at": _NOW + 3600},
+            "oauth_fetched_at": _NOW - 100000,  # ancient — normally very stale
+            "oauth_backoff_until": _NOW + 3600,
+        },
+    )
+    assert usage.claude_usage_stale("private", 600, now=_NOW) is False  # backoff wins
+    # Once the backoff passes, the ancient fetch makes it stale again.
+    assert usage.claude_usage_stale("private", 600, now=_NOW + 3601) is True
+
+
+def test_write_usage_preserves_backoff(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A statusline merge write preserves a persisted oauth_backoff_until verbatim."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    reset_week = _NOW + 5 * 86400
+    _seed_snapshot(
+        "private",
+        {
+            "captured_at": _NOW,
+            "five_hour": {"used_percentage": 10, "resets_at": _NOW + 3600},
+            "seven_day": {"used_percentage": 20, "resets_at": reset_week},
+            "oauth_backoff_until": _NOW + 3600,
+        },
+    )
+    statusline = {
+        "five_hour": {"used_percentage": 12, "resets_at": _NOW + 3600},
+        "seven_day": {"used_percentage": 25, "resets_at": reset_week},
+    }
+    assert usage.write_usage(statusline, now=_NOW + 5) is True
+    assert usage.oauth_backoff_until() == _NOW + 3600  # survived the merge
+
+
+def test_render_fable_stale_marks_label() -> None:
+    """A >1h-old OAuth fetch embosses ``Fable: stale <age>``; a fresh one shows Resets."""
+    stale = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(3, _NOW + 3600),
+        seven_day=usage.Window(3, _NOW + 5 * 86400),
+        fable_week=usage.Window(42, _NOW + 9 * 86400),
+        oauth_fetched_at=_NOW - 2 * 3600,  # 2h old
+    )
+    stale_plain = usage.render_usage(stale, now=_NOW).plain
+    assert "Fable: stale" in stale_plain
+    assert "Fable: Resets" not in stale_plain
+    for line in stale_plain.splitlines():
+        assert len(line) == usage._CARD_INNER_WIDTH
+
+    fresh = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(3, _NOW + 3600),
+        seven_day=usage.Window(3, _NOW + 5 * 86400),
+        fable_week=usage.Window(42, _NOW + 9 * 86400),
+        oauth_fetched_at=_NOW,  # just fetched
+    )
+    fresh_plain = usage.render_usage(fresh, now=_NOW).plain
+    assert "Fable: Resets" in fresh_plain
+    assert "Fable: stale" not in fresh_plain
 
 
 def test_adaptive_interval_picks_active_only_when_shorter_and_working() -> None:

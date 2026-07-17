@@ -123,6 +123,17 @@ _OAUTH_BETA_HEADER = "oauth-2025-04-20"
 # short enough that the periodic fetch keeps re-asserting authority.
 _OAUTH_AUTHORITY_SEC = 3600
 
+# Ceiling on a persisted 429 backoff. The OAuth usage endpoint has been seen to answer a
+# 429 with a very large ``Retry-After`` (observed 3357 s, and it can be larger); we honour
+# the server's wait but never longer than this, so a bogus/huge value cannot wedge the
+# fetch for hours. See :func:`fetch_claude_usage` + :func:`claude_usage_stale`.
+_OAUTH_BACKOFF_CAP_SEC = 7200
+
+# After this long without a *successful* OAuth fetch the Fable weekly figure is stale
+# enough that the card marks it (``Fable: stale <age>`` instead of ``Fable: Resets …``) —
+# a frozen number (e.g. a persistent 429 backoff) is then never shown as if it were live.
+_FABLE_STALE_AFTER_SEC = 3600
+
 
 @dataclass
 class Window:
@@ -143,6 +154,10 @@ class Usage:
     # line never carries it). Defaulted None: it only exists on a snapshot healed by an
     # OAuth fetch, and never on its own without a main window in practice.
     fable_week: Window | None = None
+    # Epoch seconds of the last *successful* OAuth fetch that produced this snapshot (0 on
+    # status-line captures and Codex snapshots). Drives the ``Fable: stale <age>`` marker in
+    # the render path — see :data:`_FABLE_STALE_AFTER_SEC` and :func:`_render_card`.
+    oauth_fetched_at: int = 0
 
     def is_empty(self) -> bool:
         return self.five_hour is None and self.seven_day is None
@@ -324,12 +339,12 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
     can refuse a snapshot left by a different config dir under the same label. Returns
     ``False`` when nothing live survives the merge. Never raises.
 
-    The OAuth-only fields (``fable_week`` + ``oauth_fetched_at``) are PRESERVED verbatim
-    from the stored snapshot: status-line payloads never carry them, so clobbering them to
-    None/0 on every 3-second status-line write would erase what :func:`fetch_claude_usage`
-    fetched. While the stored ``oauth_fetched_at`` is fresh (within
-    :data:`_OAUTH_AUTHORITY_SEC`) the merge treats the stored windows as authoritative —
-    see :func:`_merge_window`'s re-pin guard.
+    The OAuth-only fields (``fable_week`` + ``oauth_fetched_at`` + ``oauth_backoff_until``)
+    are PRESERVED verbatim from the stored snapshot: status-line payloads never carry them,
+    so clobbering them to None/0 on every 3-second status-line write would erase what
+    :func:`fetch_claude_usage` fetched (or the 429 backoff it recorded). While the stored
+    ``oauth_fetched_at`` is fresh (within :data:`_OAUTH_AUTHORITY_SEC`) the merge treats the
+    stored windows as authoritative — see :func:`_merge_window`'s re-pin guard.
     """
     if not isinstance(rate_limits, dict):
         return False
@@ -377,6 +392,7 @@ def write_usage(rate_limits: object, *, account: str = "private", now: int | Non
                 # OAuth-only fields preserved verbatim (status line never carries them).
                 "fable_week": _window_dict(prev_fable),
                 "oauth_fetched_at": prev_oauth,
+                "oauth_backoff_until": _int_field(prev, "oauth_backoff_until") if prev else 0,
             }
             _atomic_write_json(path, payload)
     except OSError:
@@ -437,6 +453,7 @@ def read_usage(account: str = "private") -> Usage | None:
         five_hour=_window(data.get("five_hour")),
         seven_day=_window(data.get("seven_day")),
         fable_week=_window(data.get("fable_week")),
+        oauth_fetched_at=_int_field(data, "oauth_fetched_at"),
     )
 
 
@@ -447,6 +464,17 @@ def oauth_fetched_at(account: str = "private") -> int:
     fetch staleness must track the OAuth fetch alone — see :func:`claude_usage_stale`.
     """
     return _int_field(_read_validated(account), "oauth_fetched_at")
+
+
+def oauth_backoff_until(account: str = "private") -> int:
+    """Epoch seconds until which *account*'s OAuth fetch is backing off (0 = none).
+
+    Persisted by :func:`fetch_claude_usage` when a fetch fails with a large-``Retry-After``
+    429, and cleared on the next successful fetch. While ``now`` is before this value
+    :func:`claude_usage_stale` reports the cache as *fresh*, so neither the daemon nor the
+    TUI re-attempts a rate-limited endpoint until the server-given time has passed.
+    """
+    return _int_field(_read_validated(account), "oauth_backoff_until")
 
 
 # --- Claude OAuth usage endpoint (the /usage numbers, incl. the Fable weekly window) ---
@@ -570,13 +598,15 @@ def _keychain_oauth_token(account: str) -> str | None:  # pylint: disable=too-ma
     return token
 
 
-def _get_oauth_usage_body(token: str) -> str | None:
-    """GET the OAuth usage endpoint body, or ``None`` on any error (never raises).
+def _get_oauth_usage_body(token: str) -> tuple[str | None, int]:
+    """GET the OAuth usage endpoint body as ``(body, retry_after)`` (never raises).
 
-    A 429 whose ``Retry-After`` is small (≤ 10 s) is slept off and retried ONCE — the
-    endpoint rate-limits tightly enough that fetching two accounts back-to-back can trip
-    it (observed ``retry-after: 2``); anything else fails straight to ``None`` and the
-    caller's throttle owns the next attempt.
+    Returns ``(body, 0)`` on success. A 429 whose ``Retry-After`` is small (≤ 10 s) is
+    slept off and retried ONCE — the endpoint rate-limits tightly enough that fetching two
+    accounts back-to-back can trip it (observed ``retry-after: 2``). A 429 carrying a
+    parseable ``Retry-After`` > 10 s returns ``(None, retry_after)`` so the caller can
+    persist a backoff instead of hammering; every other failure returns ``(None, 0)`` and
+    the caller's throttle owns the next attempt.
     """
     req = urllib.request.Request(  # noqa: S310  # fixed https:// endpoint
         _OAUTH_USAGE_URL,
@@ -585,20 +615,43 @@ def _get_oauth_usage_body(token: str) -> str | None:
     for attempt in range(2):
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  # fixed https://
-                return resp.read().decode("utf-8")
+                return resp.read().decode("utf-8"), 0
         except urllib.error.HTTPError as err:
-            if attempt == 0 and err.code == 429:
+            if err.code == 429:
                 try:
                     retry_after = int(err.headers.get("retry-after", ""))
                 except (TypeError, ValueError):
-                    return None
-                if 0 <= retry_after <= 10:
+                    return None, 0
+                if attempt == 0 and 0 <= retry_after <= 10:
                     time.sleep(retry_after or 1)
                     continue
-            return None
+                return (None, retry_after) if retry_after > 10 else (None, 0)
+            return None, 0
         except (urllib.error.URLError, OSError, ValueError):
-            return None
-    return None
+            return None, 0
+    return None, 0
+
+
+def _persist_oauth_backoff(account: str, until: int) -> None:
+    """Persist ``oauth_backoff_until`` into *account*'s cache, preserving every other field.
+
+    Called when a fetch fails with a large-``Retry-After`` 429: it records the server-given
+    wake time (see :func:`claude_usage_stale`) while leaving every other stored field
+    verbatim (windows, ``fable_week``, ``captured_at``, ``oauth_fetched_at``,
+    ``config_dir_hash``). When the cache file does not exist yet a minimal payload (the
+    account's ``config_dir_hash`` + the backoff) is written. Runs under the same per-account
+    ``flock`` :func:`write_usage` uses; never raises.
+    """
+    path = _usage_path(account)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with _flock(path.with_name(path.name + ".lock")):
+            payload = dict(_read_validated(account) or {})
+            payload["config_dir_hash"] = _account_hash(account)
+            payload["oauth_backoff_until"] = until
+            _atomic_write_json(path, payload)
+    except OSError:
+        pass
 
 
 def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
@@ -621,13 +674,24 @@ def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
     write, so callers degrade to the last cache. The endpoint rate-limits tightly
     (observed HTTP 429 with ``retry-after: 2`` when two accounts fetch back-to-back), so
     a 429 carrying a small ``Retry-After`` is retried ONCE after sleeping it off.
+
+    A 429 carrying a *large* ``Retry-After`` (observed 3357 s) persists
+    ``oauth_backoff_until = now + min(Retry-After, _OAUTH_BACKOFF_CAP_SEC)`` into the cache
+    (preserving every other field) before returning ``None``, so :func:`claude_usage_stale`
+    suppresses re-attempts machine-wide until the server-given time. A successful fetch
+    writes a fresh payload WITHOUT that key, clearing the backoff.
     """
     now = int(time.time()) if now is None else now
     token = _keychain_oauth_token(account)
     if not token:
         return None
-    raw = _get_oauth_usage_body(token)
+    raw, retry_after_sec = _get_oauth_usage_body(token)
     if raw is None:
+        # A 429 with a large Retry-After: persist a backoff so claude_usage_stale reports
+        # the cache fresh until the server-given time (capped), instead of the daemon + TUI
+        # re-attempting a rate-limited endpoint every few minutes all day.
+        if retry_after_sec > 0:
+            _persist_oauth_backoff(account, now + min(retry_after_sec, _OAUTH_BACKOFF_CAP_SEC))
         return None
     try:
         data = json.loads(raw)
@@ -636,7 +700,10 @@ def fetch_claude_usage(account: str, now: int | None = None) -> Usage | None:
     snap = _parse_oauth_usage(data, now)
     if snap is None:
         return None
+    snap.oauth_fetched_at = now
     path = _usage_path(account)
+    # Authoritative replace: a fresh payload with NO ``oauth_backoff_until`` key, which
+    # clears any backoff a prior 429 recorded (the fetch just succeeded).
     payload = {
         "captured_at": now,
         "config_dir_hash": _account_hash(account),
@@ -661,8 +728,15 @@ def claude_usage_stale(account: str, refresh_sec: float, now: int | None = None)
     ``captured_at`` every few seconds, so keying on it would mask fetch staleness. The
     call sites choose *refresh_sec* via :func:`adaptive_interval` (idle vs active), exactly
     like the Copilot card.
+
+    **429 backoff:** while ``now`` is before a persisted ``oauth_backoff_until`` (set by
+    :func:`fetch_claude_usage` on a large-``Retry-After`` 429) this returns ``False`` —
+    reporting the cache "fresh" — so the daemon and TUI, which both gate their fetch spawn
+    on this one function, stop re-attempting a rate-limited endpoint until it passes.
     """
     now = int(time.time()) if now is None else now
+    if now < oauth_backoff_until(account):
+        return False
     fetched = oauth_fetched_at(account)
     if fetched <= 0:
         return True
@@ -796,6 +870,23 @@ def format_reset(resets_at: int, now: int | None = None) -> str:
     return f"in {minutes}m"
 
 
+def _format_age(seconds: int) -> str:
+    """Compact elapsed duration (minute precision): ``6h 25m`` / ``2d 3h`` / ``45m``.
+
+    Mirrors :func:`format_reset`'s day/hour/minute arithmetic but for an already-elapsed
+    span and with no ``in`` prefix — used for the ``Fable: stale <age>`` marker.
+    """
+    seconds = max(0, seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
+
+
 def _bar(
     pct: float,
     fill_color: str = _FILL_COLOR,
@@ -842,17 +933,21 @@ def _append_pct(text: Text, pct: float) -> None:
     text.append(" " * pad + pct_str + "\n", style=_PCT_STYLE)
 
 
-def _section(
+def _section(  # pylint: disable=too-many-arguments
     prefix: str,
     win: Window | None,
     now: int,
     fill_color: str = _FILL_COLOR,
     label_color: str = _RESET_STYLE,
+    *,
+    label: str | None = None,
 ) -> Text:
     """One window as a single bar row: ``<prefix>Resets …`` embossed, percentage right.
 
     *prefix* names the window inside the bar (``"Session: "`` / ``"Week: "``) — the
-    standalone title line above the bar was dropped so each window is just one row.
+    standalone title line above the bar was dropped so each window is just one row. Pass
+    *label* to override the default ``<prefix>Resets …`` emboss (used for the stale-Fable
+    marker), keeping the same bar/percentage rendering.
     """
     text = Text()
     if win is None:
@@ -860,8 +955,8 @@ def _section(
         return text
     # Reset time is embossed onto the bar (not appended after it) so the row stays
     # short — one line per window, and the card no longer grows wider than the bar.
-    reset = f"{prefix}Resets {format_reset(win.resets_at, now)}"
-    text.append_text(_bar(win.used_percentage, fill_color, label=reset, label_color=label_color))
+    embossed = label if label is not None else f"{prefix}Resets {format_reset(win.resets_at, now)}"
+    text.append_text(_bar(win.used_percentage, fill_color, label=embossed, label_color=label_color))
     _append_pct(text, win.used_percentage)
     return text
 
@@ -872,14 +967,21 @@ def _render_card(usage: Usage, now: int, *, fill_color: str, label_color: str) -
     A third ``Fable:`` row is appended ONLY when :attr:`Usage.fable_week` is set — the
     Codex card (which shares this renderer) and Claude cards before their first OAuth
     fetch both stay two rows. ``Fable: `` is shorter than ``Session: ``, so it fits the
-    bar's embossed-label width.
+    bar's embossed-label width. When the last successful OAuth fetch is older than
+    :data:`_FABLE_STALE_AFTER_SEC` the Fable row is embossed ``Fable: stale <age>`` instead
+    of ``Fable: Resets …`` so a frozen figure (e.g. under a 429 backoff) is visibly marked.
     """
     text = Text()
     text.append_text(_section("Session: ", usage.five_hour, now, fill_color, label_color))
     # No blank line between the windows — keeps the card tight.
     text.append_text(_section("Week: ", usage.seven_day, now, fill_color, label_color))
     if usage.fable_week is not None:
-        text.append_text(_section("Fable: ", usage.fable_week, now, fill_color, label_color))
+        fable_label: str | None = None
+        if usage.oauth_fetched_at > 0 and now - usage.oauth_fetched_at > _FABLE_STALE_AFTER_SEC:
+            fable_label = f"Fable: stale {_format_age(now - usage.oauth_fetched_at)}"
+        text.append_text(
+            _section("Fable: ", usage.fable_week, now, fill_color, label_color, label=fable_label)
+        )
     text.rstrip()
     return text
 

@@ -31,6 +31,28 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def _pin_claude_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin ``CLAUDE_HOME`` under ``tmp_path`` so NO test can touch the real ``~/.claude``.
+
+    ``CLAUDE_HOME`` anchors everything ccc reads and writes: the SQLite store
+    (``db_path``), the usage caches, and — critically — the user config
+    (``config_path`` → ``~/.claude/command-center/config.toml``). Any test that reached
+    ``config.load_config()`` / ``config.save_config()`` without setting ``CLAUDE_HOME``
+    itself would read AND potentially overwrite the developer's REAL config. That is not
+    hypothetical: the real ``config.toml`` was once silently wiped to defaults by a
+    reload-modify-save path (a failed parse fell back to DEFAULTS, which a subsequent
+    ``save_config`` then persisted). Individual tests already pin ``CLAUDE_HOME`` per the
+    module convention, but a single one that forgot was enough to clobber the real home.
+
+    Making the pin autouse closes that hole globally: every test defaults to a throwaway
+    ``tmp_path/claude-home``. Tests that set ``CLAUDE_HOME`` themselves simply re-override
+    this default (monkeypatch is last-wins within a test), so the existing per-test pins
+    keep working unchanged.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "claude-home"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_tab_symbol_side_effects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep every test off the real badge cache and the real iTerm session."""
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
