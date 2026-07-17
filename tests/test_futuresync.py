@@ -381,6 +381,50 @@ def test_pad_draft_with_launch_ticked_registers_and_launches(
     assert padjob.status == "draft" and padjob.aim == ""  # pad reset after consuming
 
 
+def test_pad_error_with_launch_ticked_retries_after_fix(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An error pad keeps retrying while launch is ticked: fixing the field is enough."""
+    calls: list[str] = []
+
+    def fake_spawn(session_id: str) -> bool:
+        calls.append(session_id)
+        return True
+
+    monkeypatch.setattr(futuresync, "_spawn_launch", fake_spawn)
+    env.pad.parent.mkdir(parents=True, exist_ok=True)
+    env.pad.write_text(
+        serialize(session_id="", aim="Fixed pad task", status="error", repo="home/ccc").replace(
+            "launch: false", "launch: true"
+        ),
+        encoding="utf-8",
+    )
+    report = futuresync.run_sync(env.store, env.cfg)
+
+    assert len(report.registered) == 1
+    assert report.launched == report.registered == calls
+    padjob = parse_job_file(env.pad.read_text(encoding="utf-8"))
+    assert padjob.status == "draft" and padjob.aim == ""  # pad reset after consuming
+
+
+def test_pad_error_with_launch_still_invalid_no_churn(env: Env) -> None:
+    """A still-invalid error pad rewrites an identical block — no retrigger loop."""
+    env.pad.parent.mkdir(parents=True, exist_ok=True)
+    env.pad.write_text(
+        serialize(
+            session_id="", aim="Broken pad task", status="error", repo="home/does-not-exist"
+        ).replace("launch: false", "launch: true"),
+        encoding="utf-8",
+    )
+    report = futuresync.run_sync(env.store, env.cfg)
+    assert report.registered == [] and report.errors
+
+    mtime = env.pad.stat().st_mtime_ns
+    futuresync.run_sync(env.store, env.cfg)
+    assert env.pad.stat().st_mtime_ns == mtime  # idempotent — no mtime churn
+    assert [s for s in env.store.list_sessions() if s.draft] == []
+
+
 def test_registration_keeps_the_files_llm_choices(env: Env) -> None:
     """The pad's/file's llm_overseer + llm_exec land in the DB row (not DEFAULT_LLM)."""
     env.pad.parent.mkdir(parents=True, exist_ok=True)

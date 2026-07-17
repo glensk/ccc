@@ -695,8 +695,10 @@ def _handle_pad(  # pylint: disable=too-many-arguments,too-many-positional-argum
     job = parse_job_file(text)
     # A ticked launch toggle on a draft pad implies "ready": the phone flow is
     # write AIM/prompt + tap the launch checkbox — no status edit needed. An
-    # "error" pad stays skipped until the user resets its status.
-    if job.status != "ready" and not (job.status == "draft" and launch_requested(job)):
+    # "error" pad with launch still ticked retries the same way, so fixing the
+    # offending field is enough — no status reset. Retrigger-safe: a still-
+    # invalid pad rewrites an identical error block (idempotent, no mtime churn).
+    if job.status != "ready" and not (job.status in ("draft", "error") and launch_requested(job)):
         return  # draft / blank pad — nothing to register
     padjob = dataclasses.replace(job, session_id=_fresh_uuid(taken), status="ready")
     errors = validate(padjob, git_base)
