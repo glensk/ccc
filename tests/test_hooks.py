@@ -388,3 +388,36 @@ def test_user_prompt_clears_aim_transition(home: Path) -> None:
     hooks.handle_user_prompt({"session_id": "s1", "cwd": "/repo"})
     refreshed = store.get("s1")
     assert refreshed is not None and refreshed.aim_prev is None
+
+
+def test_release_locks_claims_armed_close_and_spawns_once(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An armed close request is claimed once → one detached close-now spawn with the fresh env
+    iterm id; a second invocation claims nothing and spawns nothing."""
+    from command_center.models import now_ms
+
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:LIVE-UUID")
+    store = Store()
+    store.ensure("s1", cwd="/repo")
+    store.update_fields("s1", close_requested_at=now_ms())  # mark-done --close armed it
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert calls == [["close-now", "--session", "s1", "--iterm", "w0t1p0:LIVE-UUID"]]
+    assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # claimed & cleared
+
+    # The one-shot request cannot re-fire on a later Stop.
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert len(calls) == 1
+
+
+def test_release_locks_unarmed_never_spawns(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A session with no armed close request never spawns the closer."""
+    store = Store()
+    store.ensure("s1", cwd="/repo")  # close_requested_at defaults to 0 (unarmed)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", _recorder(calls))
+    hooks.handle_release_locks({"session_id": "s1", "cwd": "/repo"})
+    assert calls == []

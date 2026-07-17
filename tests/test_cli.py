@@ -1144,3 +1144,151 @@ def test_restart_tui_with_no_running_tui_exits_1(
     assert cmd_restart_tui(argparse.Namespace()) == 1
     assert requested == []  # never even asked for a restart
     assert "no running ccc TUI" in capsys.readouterr().err
+
+
+# ---- mark-done --close / --quiet -------------------------------------------
+def test_mark_done_close_arms_close_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`mark-done --close` stamps close_requested_at (> 0) alongside marking done."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.delenv("CCC_INTERNAL", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_ENTRYPOINT", raising=False)
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)  # never fork a real ccc
+    assert cli.main(["mark-done", "--session", "s1", "--close"]) == 0
+    with Store() as store:
+        got = store.get("s1")
+    assert got is not None and got.done is True and got.close_requested_at > 0
+
+
+def test_mark_done_close_is_noop_under_ccc_internal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Under a headless/SDK entrypoint (CCC_INTERNAL) arming is skipped but mark-done still wins."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_INTERNAL", "1")
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    assert cli.main(["mark-done", "--session", "s1", "--close"]) == 0
+    with Store() as store:
+        got = store.get("s1")
+    assert got is not None and got.done is True
+    assert got.close_requested_at == 0  # arming no-op'd
+    assert "--close ignored" in capsys.readouterr().err
+
+
+def test_mark_done_undo_clears_armed_close(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`mark-done --undo` disarms any pending close so a resumed session won't self-close."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", close_requested_at=1_234_567)  # previously armed
+    assert cli.main(["mark-done", "--session", "s1", "--undo"]) == 0
+    with Store() as store:
+        got = store.get("s1")
+    assert got is not None and got.done is False and got.close_requested_at == 0
+
+
+def test_mark_done_close_and_undo_is_argparse_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--close` and `--undo` are mutually exclusive — argparse rejects them together."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    with pytest.raises(SystemExit):
+        cli.main(["mark-done", "--session", "s1", "--close", "--undo"])
+
+
+def test_mark_done_quiet_produces_no_stdout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`-q` suppresses the human summary — stdout stays empty on success."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_spawn_sync_mirrors", lambda _cfg: None)
+    assert cli.main(["mark-done", "--session", "s1", "-q"]) == 0
+    assert capsys.readouterr().out == ""
+
+
+# ---- close-now -------------------------------------------------------------
+def _no_settle(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cli, "_CLOSE_NOW_SETTLE_SEC", 0.0)  # don't actually sleep
+
+
+def test_close_now_sigterms_a_fresh_live_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fresh, matching, alive Claude PID is SIGTERM'd."""
+    import signal
+
+    from command_center.models import LiveSession
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _no_settle(monkeypatch)
+    live = LiveSession(pid=4321, session_id="s1", cwd="/repo", alive=True)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [live])
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(cli.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    monkeypatch.setattr(
+        "command_center.terminal.close_iterm_session", lambda _x: (_ for _ in ()).throw(OSError)
+    )
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="")) == 0
+    assert killed == [(4321, signal.SIGTERM)]
+
+
+def test_close_now_no_pid_no_iterm_leaves_stale_tab_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stored stale iterm id + no live PID + no --iterm → never close (stale-evidence guard)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _no_settle(monkeypatch)
+    with Store() as store:
+        store.ensure("s1", cwd="/repo")
+        store.update_fields("s1", iterm_session_id="w0t1p0:STALE")
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])  # no live PID
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="")) == 0
+    assert closed == []  # never close on a store-only (stale) id
+
+
+def test_close_now_iterm_flag_closes_even_without_a_pid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hook-supplied fresh --iterm id closes the tab even when no live PID is found."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _no_settle(monkeypatch)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    monkeypatch.setattr("command_center.terminal.tmux_pane_for_session", lambda _sid: None)
+    closed: list[str] = []
+    monkeypatch.setattr("command_center.terminal.close_iterm_session", closed.append)
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:FRESH")) == 0
+    assert closed == ["w0t1p0:FRESH"]
+
+
+def test_close_now_tmux_kills_only_the_matched_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A matching tmux pane → only that pane id is passed to kill-pane (iTerm untouched)."""
+    import subprocess
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    _no_settle(monkeypatch)
+    monkeypatch.setattr(cli.ClaudeAdapter, "discover", lambda _self: [])
+    # A two-pane window where only %5 hosts this session's claude.
+    monkeypatch.setattr(
+        "command_center.terminal.tmux_pane_for_session", lambda _sid: ("ccc:3", "%5")
+    )
+    runs: list[list[str]] = []
+
+    def _fake_run(argv: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+        runs.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    monkeypatch.setattr(
+        "command_center.terminal.close_iterm_session", lambda _x: (_ for _ in ()).throw(OSError)
+    )
+    # tmux matched first → iTerm must NOT be touched even though --iterm was supplied.
+    assert cli.cmd_close_now(argparse.Namespace(session="s1", iterm="w0t1p0:X")) == 0
+    assert runs == [["tmux", "kill-pane", "-t", "%5"]]

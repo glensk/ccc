@@ -27,9 +27,12 @@ def test_fresh_install_writes_seven_core_commands(_claude_home: Path) -> None:
     assert install_commands.run() == 0
     for stem in install_commands.CORE_COMMANDS:
         assert (_commands(_claude_home) / f"{stem}.md").is_file()
+    # The core skill IS installed by default (not behind --codex).
+    for name in install_commands.CORE_SKILLS:
+        assert (_claude_home / "skills" / name / "SKILL.md").is_file()
     # The codex pair is NOT installed without --codex.
     assert not (_commands(_claude_home) / "codex-implement-task-and-claude-review.md").exists()
-    assert not (_claude_home / "skills").exists()
+    assert not (_claude_home / "skills" / "codex-implement-task-and-claude-review").exists()
 
 
 def test_codex_flag_adds_command_and_skill(_claude_home: Path) -> None:
@@ -96,6 +99,38 @@ def test_build_plan_covers_expected_targets(_claude_home: Path) -> None:
     plan = install_commands.build_plan(_claude_home, codex=True)
     labels = {item.label for item in plan}
     assert "commands/aim.md" in labels
+    assert "skills/ccc-mark-done-and-close/SKILL.md" in labels  # core skill, always
     assert "commands/codex-implement-task-and-claude-review.md" in labels
     assert "skills/codex-implement-task-and-claude-review/SKILL.md" in labels
-    assert len(plan) == len(install_commands.CORE_COMMANDS) + 2
+    # core commands + core skills + the two codex items.
+    assert len(plan) == len(install_commands.CORE_COMMANDS) + len(install_commands.CORE_SKILLS) + 2
+
+
+def test_default_plan_ships_the_core_skill(_claude_home: Path) -> None:
+    """`build_plan(codex=False)` already carries the ccc-mark-done-and-close skill item."""
+    plan = install_commands.build_plan(_claude_home, codex=False)
+    skill = next(i for i in plan if i.label == "skills/ccc-mark-done-and-close/SKILL.md")
+    assert skill.dest == _claude_home / "skills" / "ccc-mark-done-and-close" / "SKILL.md"
+    # The shipped asset is real markdown with YAML frontmatter.
+    content = install_commands._read_asset("skills", "ccc-mark-done-and-close", "SKILL.md")
+    assert content.startswith("---")
+    assert content == skill.content
+
+
+def test_shipped_assets_carry_no_private_markers() -> None:
+    """No asset leaks a personal path, home-LAN IP, or email-like token (public-tree safe)."""
+    import re
+    from importlib.resources import files
+
+    email_re = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
+    assets_root = files("command_center") / "assets"
+    seen = 0
+    for path in Path(str(assets_root)).rglob("*"):
+        if not path.is_file():
+            continue
+        seen += 1
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        assert "/Users/" not in text, path
+        assert "192.168.178." not in text, path
+        assert not email_re.search(text), path
+    assert seen > 0  # the walk actually scanned files

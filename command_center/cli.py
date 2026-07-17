@@ -48,9 +48,25 @@ from .models import (
 )
 from .store import Store
 
+# Seconds `ccc close-now` waits before reaping/closing, so the render + the rest of the
+# Stop-hook chain (auto-commit) settle first. Module-level so tests can monkeypatch it.
+_CLOSE_NOW_SETTLE_SEC = 2.0
+
 
 def _adapter() -> ClaudeAdapter:
     return ClaudeAdapter()
+
+
+def _close_arming_suppressed() -> bool:
+    """True when ``mark-done --close`` must NOT arm a close (headless / SDK entrypoint).
+
+    Mirrors ``hooks._is_headless``: a ``claude -p`` run (``CCC_INTERNAL`` set, or
+    ``CLAUDE_CODE_ENTRYPOINT`` starting with ``sdk``) is not a real interactive tab to
+    close, so arming is a no-op there (a stderr note; mark-done still succeeds).
+    """
+    return bool(os.environ.get("CCC_INTERNAL")) or os.environ.get(
+        "CLAUDE_CODE_ENTRYPOINT", ""
+    ).startswith("sdk")
 
 
 def resolve_session_id(adapter: ClaudeAdapter, explicit: str | None, cwd: str | None) -> str | None:
@@ -794,6 +810,8 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
     if not session_id:
         print("error: could not resolve a session (pass --session <id>)", file=sys.stderr)
         return 1
+    close = getattr(args, "close", False)
+    quiet = getattr(args, "quiet", False)
     ticked = 0
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
@@ -817,20 +835,107 @@ def cmd_mark_done(args: argparse.Namespace) -> int:
                 if session.future_file:
                     futuresync.archive_file(store, cfg, session, "archived")
                 store.update_fields(session_id, archived=True)
-        elif session is not None and session.draft and session.archived:
-            # Un-doing a future-job draft: clear the archived flag and re-export its
-            # mirror file so it reappears in both ccc's FUTURE list and the Obsidian
-            # folder (inverse of the done-draft archive above).
-            from . import futuresync
+            # --close: arm a one-shot close-after-turn request the release-locks Stop
+            # hook claims + fires (SIGTERM + pane/tab close). A headless/SDK run has no
+            # real tab to close, so arming there is a no-op (stderr note; still done).
+            if close:
+                if _close_arming_suppressed():
+                    print(
+                        "note: --close ignored under a headless/SDK entrypoint "
+                        "(CCC_INTERNAL / sdk) — nothing armed",
+                        file=sys.stderr,
+                    )
+                else:
+                    store.update_fields(session_id, close_requested_at=now_ms())
+        else:
+            # Reopening disarms any pending close request so a resumed session never
+            # self-closes on a stale arm.
+            store.update_fields(session_id, close_requested_at=0)
+            if session is not None and session.draft and session.archived:
+                # Un-doing a future-job draft: clear the archived flag and re-export its
+                # mirror file so it reappears in both ccc's FUTURE list and the Obsidian
+                # folder (inverse of the done-draft archive above).
+                from . import futuresync
 
-            cfg = config.load_config()
-            store.update_fields(session_id, archived=False)
-            refreshed = store.get(session_id)
-            if refreshed is not None:
-                futuresync.unarchive_file(store, cfg, refreshed)
-    suffix = f" (ticked {ticked} remaining sub-goal{'s' if ticked != 1 else ''})" if ticked else ""
-    print(f"{session_id} marked {'not done' if args.undo else 'done'}{suffix}")
+                cfg = config.load_config()
+                store.update_fields(session_id, archived=False)
+                refreshed = store.get(session_id)
+                if refreshed is not None:
+                    futuresync.unarchive_file(store, cfg, refreshed)
+    if not quiet:
+        suffix = (
+            f" (ticked {ticked} remaining sub-goal{'s' if ticked != 1 else ''})" if ticked else ""
+        )
+        print(f"{session_id} marked {'not done' if args.undo else 'done'}{suffix}")
     _spawn_sync_mirrors(config.load_config())  # done⇄running mirror move
+    return 0
+
+
+def cmd_close_now(args: argparse.Namespace) -> int:
+    """Internal: SIGTERM the session's Claude process, then close its terminal pane/tab.
+
+    Spawned detached by the ``release-locks`` Stop hook once a ``mark-done --close`` request
+    is claimed. Best-effort at every step and NEVER raises: it settles briefly (so the
+    render + the rest of the Stop chain, incl. auto-commit, finish), reaps a FRESH matching
+    Claude PID, then closes the hosting tmux pane (first match) or the iTerm pane/tab — the
+    latter only on fresh evidence (a hook-supplied ``--iterm`` id, or a live PID reaped this
+    run), never on stale-store-only evidence.
+    """
+    import signal
+    import subprocess
+    import time
+
+    from . import terminal
+
+    session_id = args.session
+    if not session_id:
+        return 0
+    time.sleep(_CLOSE_NOW_SETTLE_SEC)
+    reaped_pid = False
+    # (1) Reap a fresh, matching, non-conflicting live Claude PID.
+    try:
+        for live in _adapter().discover():
+            if live.session_id != session_id or not live.alive or live.conflict:
+                continue
+            if live.pid > 0:
+                try:
+                    os.kill(live.pid, signal.SIGTERM)
+                    reaped_pid = True
+                except OSError:
+                    pass
+            break
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        pass
+    with Store() as store:
+        session = store.get(session_id)
+    # (2) Terminal close, first match wins. (a) tmux pane.
+    try:
+        located = terminal.tmux_pane_for_session(session_id)
+    except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+        located = None
+    if located is not None:
+        _window_target, pane_id = located
+        try:
+            subprocess.run(
+                ["tmux", "kill-pane", "-t", pane_id],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return 0
+    # (b) iTerm: the hook-supplied fresh id, else the stored id ONLY when a live PID was
+    # reaped this run (stale-evidence guard — never close on a store-only id).
+    iterm = (getattr(args, "iterm", "") or "").strip()
+    target = iterm or (
+        session.iterm_session_id if reaped_pid and session and session.iterm_session_id else ""
+    )
+    if target:
+        try:
+            terminal.close_iterm_session(target)
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            pass
     return 0
 
 
@@ -2838,8 +2943,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_done = sub.add_parser("mark-done", help="mark a session done (--undo to reopen)")
     p_done.add_argument("--session")
-    p_done.add_argument("--undo", action="store_true")
+    p_done.add_argument("-q", "--quiet", action="store_true", help="suppress the summary print")
+    # --close arms a close-after-turn; --undo reopens. The two are mutually exclusive (an
+    # argparse error rejects `--close --undo` together, e.g. `ccc mark-done -c -q`).
+    p_done_ex = p_done.add_mutually_exclusive_group()
+    p_done_ex.add_argument(
+        "-c",
+        "--close",
+        action="store_true",
+        help="also close the session's pane/tab after the turn",
+    )
+    p_done_ex.add_argument("-u", "--undo", action="store_true", help="reopen a session marked done")
     p_done.set_defaults(func=cmd_mark_done)
+
+    p_closenow = sub.add_parser(
+        "close-now",
+        help="internal: SIGTERM + close the session's tab after a mark-done --close (spawned)",
+    )
+    p_closenow.add_argument("-s", "--session", help="the session id to close")
+    p_closenow.add_argument(
+        "-i", "--iterm", default="", help="the fresh $ITERM_SESSION_ID to close (hook-supplied)"
+    )
+    p_closenow.set_defaults(func=cmd_close_now)
 
     p_keep = sub.add_parser("keep", help="exempt a session from the idle reaper (--off to clear)")
     p_keep.add_argument("--session")

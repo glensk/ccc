@@ -31,7 +31,7 @@ flags. Grouped by what they do:
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
 - `ccc check <N>` (`--uncheck`) · `ccc subgoal-check <N> "<cmd>"` — tick an item / attach a shell predicate.
-- `ccc mark-done` (`--undo`) · `ccc keep` (`--off`) — finish / exempt a session from the idle reaper.
+- `ccc mark-done` (`--undo`, `-c/--close`, `-q/--quiet`) · `ccc keep` (`--off`) — finish / exempt a session from the idle reaper. `--close` also closes the session's pane/tab after the turn ends (see the `ccc-mark-done-and-close` skill); `--quiet` suppresses the summary print.
 - `ccc todos` — a session's live TodoWrite/Task list; `ccc ack-drift` — acknowledge a flagged drift.
 - `ccc subgoal-history` — the checklist's evolution + drift verdicts.
 - Internal LLM checkers, spawned automatically (rarely run by hand): `ccc score-aim`, `ccc short-aim`, `ccc check-drift`, `ccc assess-aim`, `ccc autoprogress`.
@@ -75,7 +75,16 @@ Every `<id>` above accepts the **8-char id `ccc jobs` prints** (or any unique pr
 
 Inside a Claude Code session the slash commands `/aim` `/next-step` `/done` `/block`
 `/deadline` (plus `/aim-history`, `/subgoal-history`) drive the same actions from the
-prompt; they are installed by `ccc init` / `ccc install-commands`.
+prompt; they are installed by `ccc init` / `ccc install-commands`. The same installer
+also ships the **`ccc-mark-done-and-close`** skill (by default): when the user asks to
+finish AND close the whole job — "mark this session as done", "we're done here — close
+it" — it runs `ccc mark-done --close -q`, which marks the session done and then, after
+the turn's Stop-hook chain (auto-commit included) completes, SIGTERMs the Claude process
+and closes its terminal pane/tab. The wiring is the internal `ccc close-now --session
+<id> [--iterm <id>]` command, spawned by the final `release-locks` Stop hook once the
+close request is atomically claimed. `ccc doctor` warns when that `release-locks` hook is
+not the LAST Stop entry (it must run after foreign Stop hooks like auto-commit). Undo a
+mistaken close with `ccc mark-done --undo --session <id>`, then `ccc resume <id>`.
 
 ### Peek — "what have I asked here?" (`ccc peek`)
 

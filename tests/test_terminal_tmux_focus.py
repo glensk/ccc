@@ -3,7 +3,8 @@
 Only the matcher is unit-tested — the surrounding ``focus_tmux_window`` shells out to
 ``tmux``/``ps``/osascript and is environment-bound. Each case feeds a synthetic process
 tree (mirroring ``ps -axo pid=,ppid=,command=``) plus a ``list-panes`` row set and asserts
-which window target (if any) the walk resolves.
+which ``(window_target, pane_id)`` pair (if any) the walk resolves — the pane id feeds
+``ccc close-now``'s ``tmux kill-pane``.
 """
 
 from __future__ import annotations
@@ -36,15 +37,16 @@ def test_match_via_two_level_descendant_chain() -> None:
         ]
     )
     panes = [("ccc:1", 100, "%0")]
-    assert terminal._tmux_pane_for_session(panes, children, commands, "abc-123") == "ccc:1"
+    # Returns (window_target, pane_id) — the pane id is what close-now kills.
+    assert terminal._tmux_pane_for_session(panes, children, commands, "abc-123") == ("ccc:1", "%0")
 
 
 def test_match_on_pane_pid_own_command_no_children() -> None:
     # `ccc start-job` execs claude in place, so the claude argv is the pane_pid ITSELF and
-    # there are no descendants to walk — the matcher must still resolve the window.
+    # there are no descendants to walk — the matcher must still resolve the window + pane id.
     children, commands = _build_tree([(75005, 1, "claude --model x --session-id 459c2ef3 prompt")])
     panes = [("ccc:2", 75005, "%3")]
-    assert terminal._tmux_pane_for_session(panes, children, commands, "459c2ef3") == "ccc:2"
+    assert terminal._tmux_pane_for_session(panes, children, commands, "459c2ef3") == ("ccc:2", "%3")
 
 
 def test_no_match_returns_none() -> None:

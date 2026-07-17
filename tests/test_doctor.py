@@ -189,6 +189,29 @@ def test_daemon_section_na_on_other_platform(monkeypatch: pytest.MonkeyPatch) ->
     assert statuses["daemon service"] == doctor.NA
 
 
+# ------------------------------ Stop-hook order guard ------------------------------ #
+def _stop_settings(*commands: str) -> dict:
+    """A settings dict whose Stop event lists *commands*, one per group, in order."""
+    return {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": c}]} for c in commands]}}
+
+
+def test_stop_order_ok_when_release_locks_last() -> None:
+    settings = _stop_settings("/my/commit.sh", "/opt/ccc hook stop", "/opt/ccc hook release-locks")
+    assert doctor._stop_order_check(settings).status == doctor.OK
+
+
+def test_stop_order_warns_when_foreign_hook_after_release_locks() -> None:
+    settings = _stop_settings(
+        "/opt/ccc hook stop", "/opt/ccc hook release-locks", "/late/foreign.sh"
+    )
+    assert doctor._stop_order_check(settings).status == doctor.FAIL
+
+
+def test_stop_order_na_when_release_locks_not_wired() -> None:
+    assert doctor._stop_order_check({}).status == doctor.NA
+    assert doctor._stop_order_check(_stop_settings("/only/foreign.sh")).status == doctor.NA
+
+
 def test_exit_code_zero_when_no_failures() -> None:
     healthy = doctor.Report(
         [doctor.Section("x", [doctor.Check(doctor.OK, "a"), doctor.Check(doctor.NA, "b")])]

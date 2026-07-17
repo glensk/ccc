@@ -638,3 +638,60 @@ def test_depends_on_column_migrates_onto_existing_db(tmp_path: Path) -> None:
         store.update_fields("old", depends_on="parent-uuid")
         got = store.get("old")
         assert got is not None and got.depends_on == "parent-uuid"
+
+
+def test_close_requested_at_column_migrates_and_roundtrips(tmp_path: Path) -> None:
+    # Guards the _SESSION_COLUMNS whitelist + the ALTER-in-place migration for the new
+    # close_requested_at column: a pre-migration DB gains it (default 0) and it survives a
+    # round-trip through Session.
+    import sqlite3
+
+    from command_center import store as store_mod
+
+    db = tmp_path / "legacy.db"
+    legacy_schema = store_mod._SCHEMA.replace(
+        "    close_requested_at INTEGER NOT NULL DEFAULT 0,\n", ""
+    )
+    conn = sqlite3.connect(db)
+    conn.executescript(legacy_schema)
+    conn.execute("INSERT INTO sessions (session_id, cwd) VALUES ('old', '/repo/old')")
+    conn.commit()
+    conn.close()
+    with Store(db) as store:  # opening runs _ensure_columns → ALTER adds close_requested_at
+        row = store.get("old")
+        assert row is not None
+        assert row.close_requested_at == 0  # NOT NULL default after the migration
+        store.update_fields("old", close_requested_at=1234567890)
+        got = store.get("old")
+        assert got is not None and got.close_requested_at == 1234567890
+
+
+def test_claim_close_request_fires_at_most_once(tmp_path: Path) -> None:
+    """A fresh armed request is claimed exactly once; the second claim returns False."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    now = 1_000_000
+    ttl = 10 * 60 * 1000
+    store.update_fields("s1", close_requested_at=now)  # arm
+    assert store.claim_close_request("s1", now, ttl) is True  # first caller wins
+    assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # cleared
+    assert store.claim_close_request("s1", now, ttl) is False  # already claimed → no re-fire
+
+
+def test_claim_close_request_expired_is_cleared_not_claimed(tmp_path: Path) -> None:
+    """A stamp older than the TTL is never claimed (False) but is cleared so it can't linger."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    ttl = 10 * 60 * 1000
+    armed_at = 1_000_000
+    store.update_fields("s1", close_requested_at=armed_at)
+    now = armed_at + ttl + 1  # one ms past the TTL → expired
+    assert store.claim_close_request("s1", now, ttl) is False
+    assert store.get("s1").close_requested_at == 0  # type: ignore[union-attr]  # still cleared
+
+
+def test_claim_close_request_unarmed_is_false(tmp_path: Path) -> None:
+    """An unarmed session (close_requested_at == 0) is never claimed."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    assert store.claim_close_request("s1", 1_000_000, 10 * 60 * 1000) is False

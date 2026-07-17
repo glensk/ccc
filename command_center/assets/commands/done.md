@@ -12,3 +12,7 @@ Then confirm in one short line that the session is marked done. It will show as 
 `ccc` / `ccc ls` and is exempt from the idle reaper's stale-goal alerts.
 
 (To reopen a session marked done by mistake: `ccc mark-done --undo`.)
+
+`ccc mark-done --close` additionally closes the session's terminal pane/tab after the
+turn ends (used by the `ccc-mark-done-and-close` skill when the user asks to finish AND
+close the whole job).

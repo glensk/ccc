@@ -44,6 +44,8 @@ def test_wheel_ships_entrypoints_and_assets(tmp_path: Path) -> None:  # pylint: 
     assert "command_center/assets/commands/aim.md" in names
     skill = "command_center/assets/codex/skills/codex-implement-task-and-claude-review/SKILL.md"
     assert skill in names
+    # The core skill shipped by default (install-commands) must survive a non-editable install.
+    assert "command_center/assets/skills/ccc-mark-done-and-close/SKILL.md" in names
     assert "command_center/assets/obsidian/future.md.tmpl" in names
     assert "command_center/assets/obsidian/plugins.json" in names
     assert "command_center/assets/karabiner/peek-s-p.json" in names
