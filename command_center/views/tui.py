@@ -2216,11 +2216,15 @@ class CommandCenterApp(App[None]):
         # one cheap query and NEVER raises (a sentinel → placeholder on any failure), so
         # it is safe on this render tick. A "" nixos_overseer_dir short-circuits before
         # any disk touch.
-        nixos_supervised_panel.update(
-            nixos_overseer.render_supervised(nixos_overseer.read_supervised(self.cfg))
+        nixos_supervised = nixos_overseer.read_supervised(self.cfg)
+        nixos_supervised_panel.update(nixos_overseer.render_supervised(nixos_supervised))
+        nixos_supervised_panel.border_title = nixos_overseer.card_title(
+            nixos_supervised, "nixos overseer supervised"
         )
-        nixos_tier_a_panel.update(
-            nixos_overseer.render_tier_a(nixos_overseer.read_tier_a(self.cfg))
+        nixos_tier_a = nixos_overseer.read_tier_a(self.cfg)
+        nixos_tier_a_panel.update(nixos_overseer.render_tier_a(nixos_tier_a))
+        nixos_tier_a_panel.border_title = nixos_overseer.card_title(
+            nixos_tier_a, "nixos overseer tier_a"
         )
         # Render gates: each card is shown/hidden by its own config flag. The Copilot
         # RENDER gate is `usage_card_copilot` ALONE; its network FETCH stays gated on

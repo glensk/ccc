@@ -1116,7 +1116,10 @@ box.
 future jobs) and are OFF until you point `nixos_overseer_dir` at that daemon's
 directory (its SQLite DB is read **read-only** at `<dir>/state/overseer.sqlite`,
 one cheap query per render tick, never blocking — every failure collapses to a
-one-line placeholder). The **supervised** card (`to`, orange, shown by default)
+one-line placeholder). Both card titles carry a live count — e.g. `nixos
+overseer supervised (6)` — of every incident in the category (the tier_a count
+includes rows folded into the `… +N more` tail); a broken/unset source shows no
+count. The **supervised** card (`to`, orange, shown by default)
 lists incidents awaiting a human decision (`<id> <status> <fingerprint> <age>`,
 newest first) with an `approve: …` hint, and prepends a red `⛔ dispatch disabled`
 line when the daemon is halted; zero rows is the good `— none —` state. The

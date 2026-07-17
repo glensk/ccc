@@ -199,6 +199,19 @@ def read_tier_a(cfg: Config, now: int | None = None) -> OverseerResult:
     return OverseerResult(STATE_OK, rows=rows[:_TIER_A_CAP], more=more)
 
 
+def card_title(result: OverseerResult, base: str) -> str:
+    """Border title with a live count — ``base (N)`` — when the read succeeded.
+
+    N counts every incident in the category: the supervised read is uncapped
+    (``more`` is always 0) and the tier_a count includes the rows folded into
+    the ``… +N more`` tail. Sentinel states (dir unset / db missing / error)
+    render the bare *base* so a broken source never shows a misleading ``(0)``.
+    """
+    if result.state != STATE_OK:
+        return base
+    return f"{base} ({len(result.rows) + result.more})"
+
+
 def _humanize_age(epoch_sec: int, now: int) -> str:
     """Compact age from a Unix-seconds timestamp: ``45s``/``12m``/``3h``/``5d``/``2w``."""
     if not epoch_sec:

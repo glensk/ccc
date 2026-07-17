@@ -372,3 +372,47 @@ def test_humanize_age_buckets() -> None:
     assert fn(_NOW - 3 * 86400, _NOW) == "3d"
     assert fn(_NOW - 14 * 86400, _NOW) == "2w"
     assert fn(_NOW + 100, _NOW) == "0s"  # future timestamp clamps to 0
+
+
+# --------------------------------------------------------------------------- #
+# card_title — live count in the card border title
+# --------------------------------------------------------------------------- #
+def _ok_result(n_rows: int, more: int = 0) -> nixos_overseer.OverseerResult:
+    rows = tuple(
+        nixos_overseer.OverseerRow(
+            id=f"inc-{i:03d}",
+            status="proposed_tier_b",
+            fingerprint="fp",
+            first_seen=_NOW,
+            last_seen=_NOW,
+        )
+        for i in range(n_rows)
+    )
+    return nixos_overseer.OverseerResult(nixos_overseer.STATE_OK, rows=rows, more=more)
+
+
+def test_card_title_counts_rows() -> None:
+    assert nixos_overseer.card_title(_ok_result(6), "nixos overseer supervised") == (
+        "nixos overseer supervised (6)"
+    )
+
+
+def test_card_title_zero_is_explicit() -> None:
+    assert nixos_overseer.card_title(_ok_result(0), "x") == "x (0)"
+
+
+def test_card_title_includes_more_tail() -> None:
+    # tier_a caps rows at 10 and folds the rest into `more` — the title counts ALL.
+    assert nixos_overseer.card_title(_ok_result(10, more=4), "nixos overseer tier_a") == (
+        "nixos overseer tier_a (14)"
+    )
+
+
+def test_card_title_sentinel_has_no_count() -> None:
+    for state in (
+        nixos_overseer.STATE_DIR_UNSET,
+        nixos_overseer.STATE_DB_MISSING,
+        nixos_overseer.STATE_ERROR,
+    ):
+        result = nixos_overseer.OverseerResult(state)
+        assert nixos_overseer.card_title(result, "base") == "base"
