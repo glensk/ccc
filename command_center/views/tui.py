@@ -181,7 +181,7 @@ _STATUS_STYLE: dict[Status, str] = {
     Status.WAITING_INPUT: "bold red",  # input required — stands out red (the ⏸ icon + status)
     Status.HALTED: "bold red",  # rate-limit halt — red || icon + status
     Status.WAITING_CODEX: "bold yellow",  # Codex quota exhausted — amber 😴
-    Status.IDLE: "#5fff87",  # idle/ready green ● — bright spring green, visible & distinct from ▶/✓
+    Status.IDLE: "bold #ffaf00",  # amber ❯ — waiting for you; not green (vs running ▶ / done ✓)
     Status.SNOOZED: "bold green",  # background task running while the session itself is idle
     Status.PARKED: "grey62",
     Status.DONE: "green3",
@@ -1132,6 +1132,7 @@ _HELP_PROSE = """[b]Named parts[/b] (so each can be referred to by name)
 
 [b]Columns[/b] (named by the [b]head:[/b] line)
   ▶ (1st)  the session is running — working, or awaiting another agent/subagent
+  running rows gray out whole-line (not actionable); ❯ (amber) = Claude is waiting for your input
   importance (!/!!/!!!) · ver = Claude Code version (the [b]head:[/b]-labelled column) ·
   folder (tab-coloured) · aim (gold) · next-step (@tags) · age ·
   ⎇ git (✓clean ↑ahead ↓behind ⇅diverged ●dirty) · progress (sub-goals done)
@@ -2580,6 +2581,14 @@ class CommandCenterApp(App[None]):
             progress = Text("  " + progress_bar(frac, 8) + pct, style=base)
         if drift_unresolved(session):  # impartial checker flagged sub-goal drift (unresolved)
             progress.append(" ●", style="#5fafff")
+        # A running session (green ▶) isn't actionable, so the whole line recedes to gray;
+        # only the green ▶ keeps its colour ("running, hands off"). Covers Status.WORKING plus
+        # the has_subagent branch (both paint ▶); marked (red-dep) rows are excluded so their
+        # dependency marker stays untouched. stylize() appends an overriding span by design.
+        running = not session.draft and not marked and icon_glyph == STATUS_ICON[Status.WORKING]
+        if running:
+            for cell in (imp, ver, folder, sid, model_cell, aim, nxt, age, git_cell, progress):
+                cell.stylize("not bold grey42")
         table.add_row(
             icon,
             imp,

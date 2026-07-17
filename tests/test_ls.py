@@ -349,21 +349,21 @@ def test_render_row_shows_red_done_when_aim_met() -> None:
     line = ls_view._render_row(
         Row(session, None, Status.IDLE, 3, 4), enabled=True, warn_days=2, aim_threshold=50
     )[0]
-    # 3/4 → the bar under DONE is all filled: every letter is red on the SAME palette entry
-    # (48;5;84) the solid █ glyphs use as foreground — letter cells and bar cells render
+    # 3/4 → the bar under DONE is all filled: every letter is black on the SAME palette entry
+    # (48;5;214, amber) the solid █ glyphs use as foreground — letter cells and bar cells render
     # pixel-identically, no seam.
-    on_fill = "".join(f"\x1b[1;38;5;196;48;5;84m{ch}\x1b[0m" for ch in "DONE")
+    on_fill = "".join(f"\x1b[1;38;5;16;48;5;214m{ch}\x1b[0m" for ch in "DONE")
     assert on_fill in line
     assert "75%" in line  # the exact sub-goal progress is still shown alongside
     assert "█" in line and "▓" not in line  # DONE bar fill is solid, not the dotted shade
 
     # 2/4 → fill 5 of 10 cells: "DO" sits on filled cells (bg = the fill palette entry),
-    # "NE" on empty cells (25 % tint of 84 → rgb 24,64,34 — the ░ track's average).
+    # "NE" on empty cells (25 % tint of 214 → rgb 64,44,0 — the ░ track's average).
     half = ls_view._render_row(
         Row(session, None, Status.IDLE, 2, 4), enabled=True, warn_days=2, aim_threshold=50
     )[0]
-    mixed = "".join(f"\x1b[1;38;5;196;48;5;84m{ch}\x1b[0m" for ch in "DO") + "".join(
-        f"\x1b[1;38;5;196;48;2;24;64;34m{ch}\x1b[0m" for ch in "NE"
+    mixed = "".join(f"\x1b[1;38;5;16;48;5;214m{ch}\x1b[0m" for ch in "DO") + "".join(
+        f"\x1b[1;38;5;196;48;2;64;44;0m{ch}\x1b[0m" for ch in "NE"
     )
     assert mixed in half
 
