@@ -29,6 +29,7 @@ from .models import (
     Subgoal,
     SubgoalRevision,
     now_ms,
+    short_id,
 )
 
 _JOB_TYPES = frozenset(JOB_TYPES)
@@ -1019,3 +1020,47 @@ class Store:  # pylint: disable=too-many-public-methods
             (session_id,),
         ).fetchone()
         return (int(row["done"]), int(row["total"]))
+
+
+class AmbiguousJobId(Exception):
+    """A job-id prefix that matches more than one session id.
+
+    Carries the offending *given* prefix and every full id it matched; ``str(exc)``
+    is the ready-to-print ``error: ambiguous job id …`` message (8-char short forms).
+    """
+
+    def __init__(self, given: str, matches: list[str]) -> None:
+        self.given = given
+        self.matches = matches
+        shorts = " ".join(short_id(m).strip() for m in matches)
+        super().__init__(f"error: ambiguous job id {given}: matches {shorts}")
+
+
+def _resolve_job_ids(store_or_jobs: Store | Iterable[Session | str]) -> list[str]:
+    """The candidate session ids from a :class:`Store` (all rows, incl. archived) or an
+    iterable of :class:`Session`/str ids."""
+    if isinstance(store_or_jobs, Store):
+        return [s.session_id for s in store_or_jobs.list_sessions(include_archived=True)]
+    return [item if isinstance(item, str) else item.session_id for item in store_or_jobs]
+
+
+def resolve_job_id(store_or_jobs: Store | Iterable[Session | str], given: str) -> str | None:
+    """Resolve *given* — a full session id or a unique id prefix — to a full session id.
+
+    Case-insensitive. An exact match wins outright; otherwise the ids whose start
+    matches *given*: exactly one → that id; several (and no exact hit) → raise
+    :class:`AmbiguousJobId`; none → ``None`` (the caller emits its own "no such job").
+    """
+    needle = (given or "").strip().lower()
+    if not needle:
+        return None
+    ids = _resolve_job_ids(store_or_jobs)
+    for sid in ids:
+        if sid.lower() == needle:
+            return sid
+    prefixed = [sid for sid in ids if sid.lower().startswith(needle)]
+    if len(prefixed) == 1:
+        return prefixed[0]
+    if len(prefixed) > 1:
+        raise AmbiguousJobId(given, prefixed)
+    return None

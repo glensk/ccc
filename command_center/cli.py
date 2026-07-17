@@ -1173,8 +1173,12 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
 
     cfg = config.load_config()
     with Store() as store:
-        session = store.get(args.session_id)
-        if session is None:
+        resolved = _resolve_job_or_report(store, args.session_id)
+        if resolved is None:
+            return 1
+        args.session_id = resolved  # full UUID from here on (store ops + --session-id argv)
+        session = store.get(resolved)
+        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
             print(f"error: no such job {args.session_id}", file=sys.stderr)
             return 1
         # (0) Guards (decision 13): only a live draft is launchable — refuse BEFORE any
@@ -1348,6 +1352,26 @@ def _cwd_transcript_exists(cwd: str, session_id: str, config_dir: str = "") -> b
     return (base / "projects" / encoded / f"{session_id}.jsonl").exists()
 
 
+def _resolve_job_or_report(store: Store, given: str) -> str | None:
+    """Resolve *given* (full id or unique id prefix) to a full job id, reporting on failure.
+
+    Wraps :func:`store.resolve_job_id`: on an ambiguous prefix prints the ``ambiguous job
+    id`` line, on no match prints the standard ``no such job`` line — both to stderr — and
+    returns ``None`` so the caller just ``return 1``. Otherwise returns the resolved id.
+    """
+    from .store import AmbiguousJobId, resolve_job_id
+
+    try:
+        resolved = resolve_job_id(store, given)
+    except AmbiguousJobId as exc:
+        print(str(exc), file=sys.stderr)
+        return None
+    if resolved is None:
+        print(f"error: no such job {given}", file=sys.stderr)
+        return None
+    return resolved
+
+
 def _job_target_id(args: argparse.Namespace) -> str:
     """The job UUID from a positional ``session_id`` or ``-f/--file`` (exactly one).
 
@@ -1400,8 +1424,12 @@ def cmd_done_job(args: argparse.Namespace) -> int:
         return 1
     cfg = config.load_config()
     with Store() as store:
+        resolved = _resolve_job_or_report(store, session_id)
+        if resolved is None:
+            return 1
+        session_id = resolved
         session = store.get(session_id)
-        if session is None:
+        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
             print(f"error: no such job {session_id}", file=sys.stderr)
             return 1
         if not session.draft or session.archived:
@@ -1442,8 +1470,12 @@ def cmd_delete_job(args: argparse.Namespace) -> int:
         return 1
     cfg = config.load_config()
     with Store() as store:
+        resolved = _resolve_job_or_report(store, session_id)
+        if resolved is None:
+            return 1
+        session_id = resolved
         session = store.get(session_id)
-        if session is None:
+        if session is None:  # pragma: no cover — resolve_job_id only returns a real id
             print(f"error: no such job {session_id}", file=sys.stderr)
             return 1
         if not session.draft or session.archived:
@@ -1469,6 +1501,7 @@ def cmd_restore_job(args: argparse.Namespace) -> int:
     """
     from . import futuresync, repos
     from .future_files import repo_to_cwd, validate
+    from .store import AmbiguousJobId, resolve_job_id
 
     session_id = _job_target_id(args)
     if not session_id:
@@ -1476,6 +1509,15 @@ def cmd_restore_job(args: argparse.Namespace) -> int:
     cfg = config.load_config()
     file_arg = getattr(args, "file", None)
     with Store() as store:
+        # Resolve a unique id prefix (e.g. from `ccc jobs`) to the full UUID; a no-match
+        # leaves session_id as-is so it flows to the re-register-from-file path below.
+        try:
+            resolved = resolve_job_id(store, session_id)
+        except AmbiguousJobId as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if resolved is not None:
+            session_id = resolved
         session = store.get(session_id)
         if session is not None and session.draft and not session.archived:
             print(f"error: {session_id} is already a live future job", file=sys.stderr)
@@ -1559,8 +1601,12 @@ def cmd_open_job(args: argparse.Namespace) -> int:
         return 1
 
     with Store() as store:
+        resolved = _resolve_job_or_report(store, session_id)
+        if resolved is None:
+            return 1
+        session_id = resolved
         session = store.get(session_id)
-    if session is None:
+    if session is None:  # pragma: no cover — resolve_job_id only returns a real id
         print(f"error: no such job {session_id}", file=sys.stderr)
         return 1
     if session.archived:
