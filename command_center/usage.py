@@ -42,7 +42,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,17 +76,24 @@ def adaptive_interval(idle_sec: float, active_sec: float, *, active: bool) -> fl
     return idle_sec
 
 
-# Bar look — matches the native /usage card: light periwinkle "used" portion on a
-# dark slate track, the relative reset embossed inside the bar, percentage flush-right.
-# The bar is wide enough to hold the longest embossed label ("Week: Resets in 6d 23h
-# 59m" = 26 chars); the percentage is then right-aligned to _CARD_INNER_WIDTH so it
-# sits flush at the card's inner edge (no dead space before the border).
+# Bar look — a "used" portion on a dark slate track, the relative reset embossed inside
+# the bar, percentage flush-right. The two Claude cards colour each bar from *its own*
+# usage (green/orange/red thresholds, see _fill_for_pct); Codex and Copilot keep a single
+# flat brand fill. The bar is wide enough to hold the longest embossed label ("Week:
+# Resets in 6d 23h 59m" = 26 chars); the percentage is then right-aligned to
+# _CARD_INNER_WIDTH so it sits flush at the card's inner edge (no dead space before the
+# border).
 _BAR_WIDTH = 27
 # Content width inside a usage card: the CSS min-width is 38, minus the round border
 # (1 each side) and the 0 1 padding (1 each side) = 34. Keep in sync with the #usage*
 # rules in views/tui.py.
 _CARD_INNER_WIDTH = 34
-_FILL_COLOR = "#b3b0f0"  # Claude "used" portion (light periwinkle)
+_FILL_COLOR = "#b3b0f0"  # legacy flat Claude fill (light periwinkle) — kept as the _bar/
+# _section default; the Claude cards now colour per-bar via _fill_for_pct (below).
+# Per-bar Claude fills, chosen from each bar's own usage percentage (see _fill_for_pct):
+_FILL_GREEN = "#3fb950"  # 0–65% used (healthy)
+_FILL_ORANGE = "#d29922"  # 66–85% used (warning)
+_FILL_RED = "#f85149"  # 86–100% used (critical)
 _CODEX_FILL = "#19c37d"  # Codex "used" portion (OpenAI green) — distinguishes the two cards
 _COPILOT_FILL = "#a371f7"  # GitHub Copilot accent (violet) — third card's border + figure
 _TRACK_COLOR = "#3b3f5c"  # remaining (dark slate)
@@ -887,6 +894,19 @@ def _format_age(seconds: int) -> str:
     return f"{minutes}m"
 
 
+def _fill_for_pct(pct: float) -> str:
+    """Pick a Claude bar fill from its own usage: green ≤65%, orange ≤85%, else red.
+
+    Thresholds are inclusive at their upper bound: ``pct <= 65`` → green, ``pct <= 85``
+    → orange, otherwise red. *pct* may be a float and need not be pre-clamped.
+    """
+    if pct <= 65:
+        return _FILL_GREEN
+    if pct <= 85:
+        return _FILL_ORANGE
+    return _FILL_RED
+
+
 def _bar(
     pct: float,
     fill_color: str = _FILL_COLOR,
@@ -961,7 +981,14 @@ def _section(  # pylint: disable=too-many-arguments
     return text
 
 
-def _render_card(usage: Usage, now: int, *, fill_color: str, label_color: str) -> Text:
+def _render_card(
+    usage: Usage,
+    now: int,
+    *,
+    fill_color: str,
+    label_color: str,
+    fill_for_pct: Callable[[float], str] | None = None,
+) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
     A third ``Fable:`` row is appended ONLY when :attr:`Usage.fable_week` is set — the
@@ -970,17 +997,37 @@ def _render_card(usage: Usage, now: int, *, fill_color: str, label_color: str) -
     bar's embossed-label width. When the last successful OAuth fetch is older than
     :data:`_FABLE_STALE_AFTER_SEC` the Fable row is embossed ``Fable: stale <age>`` instead
     of ``Fable: Resets …`` so a frozen figure (e.g. under a 429 backoff) is visibly marked.
+
+    When *fill_for_pct* is given, each bar's fill is chosen from *its own* usage
+    percentage (:func:`_fill_for_pct` for the Claude cards' green/orange/red thresholds);
+    when None the single flat *fill_color* is used for every bar (Codex/Copilot behaviour,
+    exactly as before).
     """
+
+    def _fill(win: Window | None) -> str:
+        if fill_for_pct is not None and win is not None:
+            return fill_for_pct(win.used_percentage)
+        return fill_color
+
     text = Text()
-    text.append_text(_section("Session: ", usage.five_hour, now, fill_color, label_color))
+    text.append_text(
+        _section("Session: ", usage.five_hour, now, _fill(usage.five_hour), label_color)
+    )
     # No blank line between the windows — keeps the card tight.
-    text.append_text(_section("Week: ", usage.seven_day, now, fill_color, label_color))
+    text.append_text(_section("Week: ", usage.seven_day, now, _fill(usage.seven_day), label_color))
     if usage.fable_week is not None:
         fable_label: str | None = None
         if usage.oauth_fetched_at > 0 and now - usage.oauth_fetched_at > _FABLE_STALE_AFTER_SEC:
             fable_label = f"Fable: stale {_format_age(now - usage.oauth_fetched_at)}"
         text.append_text(
-            _section("Fable: ", usage.fable_week, now, fill_color, label_color, label=fable_label)
+            _section(
+                "Fable: ",
+                usage.fable_week,
+                now,
+                _fill(usage.fable_week),
+                label_color,
+                label=fable_label,
+            )
         )
     text.rstrip()
     return text
@@ -993,12 +1040,15 @@ def render_usage(
 
     *accent* colours the embossed reset labels so the two Claude cards read apart —
     private gold (:data:`_CLAUDE_ACCENT`), work blue (:data:`_CLAUDE_WORK_ACCENT`).
-    Both keep the periwinkle :data:`_FILL_COLOR`: they are the same product.
+    Both colour each bar from its own usage via :func:`_fill_for_pct`
+    (green ≤65% / orange ≤85% / red otherwise): same product, per-bar health colour.
     """
     now = int(time.time()) if now is None else now
     if usage is None or usage.is_empty():
         return Text("—\n(start a turn to populate)", style="grey50")
-    return _render_card(usage, now, fill_color=_FILL_COLOR, label_color=accent)
+    return _render_card(
+        usage, now, fill_color=_FILL_COLOR, label_color=accent, fill_for_pct=_fill_for_pct
+    )
 
 
 def render_work_usage(usage: Usage | None, now: int | None = None) -> Text:

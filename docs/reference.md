@@ -1101,7 +1101,7 @@ trigger.
 
 The TUI's detail pane (bottom half) shows your subscription usage in the top-right,
 as **stacked, border-titled cards** so the providers are never confused —
-`Claude Code (private)` (gold border, periwinkle bars) on top, `Claude Code (work)`
+`Claude Code (private)` (gold border, per-bar green/orange/red usage bars) on top, `Claude Code (work)`
 (blue border — shown only when a second `work` account is configured, see
 *Multi-account* below), `OpenAI Codex` (green border, green bars), and
 `<copilot_card_title> <copilot_model>` (violet border) below — the Copilot title

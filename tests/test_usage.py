@@ -403,15 +403,48 @@ def test_render_usage_accent_distinguishes_private_and_work() -> None:
     private = usage.render_usage(snap, now=_NOW)  # default gold accent
     work = usage.render_usage(snap, now=_NOW, accent=usage._CLAUDE_WORK_ACCENT)
     # The gold accent appears in the private card and not the work card (and vice versa),
-    # while the shared periwinkle fill (_FILL_COLOR) is present in both.
+    # while the per-bar usage fills (27% session → green, 93% week → red) are in both.
     assert any(usage._CLAUDE_ACCENT in s for s in accent_styles(private))
     assert not any(usage._CLAUDE_ACCENT in s for s in accent_styles(work))
     assert any(usage._CLAUDE_WORK_ACCENT in s for s in accent_styles(work))
-    assert any(usage._FILL_COLOR in s for s in accent_styles(private))
-    assert any(usage._FILL_COLOR in s for s in accent_styles(work))
+    assert any(usage._FILL_GREEN in s for s in accent_styles(private))
+    assert any(usage._FILL_RED in s for s in accent_styles(private))
+    assert any(usage._FILL_GREEN in s for s in accent_styles(work))
+    assert any(usage._FILL_RED in s for s in accent_styles(work))
     # The render_work_usage convenience wrapper is exactly render_usage with the work accent.
     assert usage.render_work_usage(snap, now=_NOW).plain == work.plain
     assert accent_styles(usage.render_work_usage(snap, now=_NOW)) == accent_styles(work)
+
+
+def test_fill_for_pct_thresholds() -> None:
+    """green ≤65, orange 66–85, red ≥86 — inclusive at each upper boundary."""
+    assert usage._fill_for_pct(0) == usage._FILL_GREEN
+    assert usage._fill_for_pct(65) == usage._FILL_GREEN
+    assert usage._fill_for_pct(66) == usage._FILL_ORANGE
+    assert usage._fill_for_pct(85) == usage._FILL_ORANGE
+    assert usage._fill_for_pct(86) == usage._FILL_RED
+    assert usage._fill_for_pct(100) == usage._FILL_RED
+
+
+def test_claude_card_high_usage_is_red_while_codex_keeps_its_fill() -> None:
+    """A high-usage Claude bar turns red; the Codex card keeps its flat brand fill."""
+    snap = usage.Usage(
+        captured_at=_NOW,
+        five_hour=usage.Window(95, 1782320400),
+        seven_day=usage.Window(97, 1782338400),
+    )
+
+    def fills(text: object) -> set[str]:
+        return {str(span.style) for span in text.spans}  # type: ignore[attr-defined]
+
+    claude = usage.render_usage(snap, now=_NOW)
+    codex = usage.render_codex_usage(snap, now=_NOW)
+    # Both Claude bars are ≥86% → red, and never fall back to the flat periwinkle fill.
+    assert any(usage._FILL_RED in s for s in fills(claude))
+    assert not any(usage._FILL_COLOR in s for s in fills(claude))
+    # The Codex card is unchanged: flat _CODEX_FILL, no threshold colours.
+    assert any(usage._CODEX_FILL in s for s in fills(codex))
+    assert not any(usage._FILL_RED in s for s in fills(codex))
 
 
 def test_statusline_capture_usage_reads_stdin(
