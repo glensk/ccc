@@ -1207,6 +1207,15 @@ when every session is parked, and over `ccc serve` in the browser:
 > can freeze, the Claude card marks it: when the last *successful* OAuth fetch is more than
 > 1 h old the Fable row is embossed `Fable: stale <age>` (e.g. `Fable: stale 6h 25m`)
 > instead of `Fable: Resets …`, so a stale figure is never shown as if it were live.
+>
+> **Session/Week staleness (bare `?%`, no bar).** The same "never show a frozen number
+> as if it were live" rule applies to the two main bars, not just Fable: once
+> `now - captured_at` exceeds the window's own lifetime — 5 h for `Session:`, 7 d for
+> `Week:` — that row drops its coloured bar for a bare `Session: ?%` / `Week: ?%`
+> instead, since no session has talked to the API recently enough for the figure to
+> mean anything. Each row is gated independently off the one shared `captured_at`
+> clock. Codex and Copilot are unaffected (their own sources are already "as fresh as
+> the last event").
 
 ```commands
 echo "$input" | ccc statusline --session "$sid" --capture-usage
@@ -1297,6 +1306,27 @@ filenames); malformed entries are skipped.
   card; a statusline write is routed by the session's `CLAUDE_CONFIG_DIR` and skipped
   entirely for an unknown account, so two accounts' windows can never merge into one
   bar.
+- **Identity hard-link (`claude_account_emails`) — surviving a drifted login.** WHICH
+  config dir a label points at is a path; WHICH Claude account is actually logged
+  into that dir can drift (a bare `/login` in a shell with the wrong, or unset,
+  `CLAUDE_CONFIG_DIR` silently overwrites it — the dir named `work` can end up
+  holding the private account, or vice-versa, with no visible cause). Configure an
+  expected email per label, same `"label=email"` shape as `claude_accounts`:
+  ```toml
+  claude_account_emails = ["work=you@company.com", "private=you@personal.example"]
+  ```
+  Before rendering, `accounts.resolve_card_label(label)` reads every configured
+  account's **current** identity — `oauthAccount.emailAddress` from Claude Code's own
+  `.claude.json` (the DEFAULT account's lives at `$HOME/.claude.json`, a sibling of
+  `~/.claude/`, not inside it; any other account's lives at `<config_dir>/.claude.json`
+  — the same field `/status` prints as `Email:`) — and swaps in whichever account's
+  cache actually matches, so e.g. the "work" card always shows the SDSC/company
+  account's numbers regardless of which physical dir currently holds them. A label
+  with no hard link configured passes through unchanged (today's pure path-based
+  behaviour, zero extra reads); one WITH a hard link but no current match renders
+  **empty** rather than falling back to a path-based guess that could be wrong again.
+  Empty (the default) ⇒ no hard link for any label — single-account installs and
+  anyone who hasn't hit this drift are completely unaffected.
 - **Per-job account.** A future job carries the account it will launch (bill) under:
   `ccc new-job -A <label>`, the TUI's new-job/`e`-form account selects, and the job
   file's `account` frontmatter + control — all shown **only when more than one
