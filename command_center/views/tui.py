@@ -2003,10 +2003,16 @@ class CommandCenterApp(App[None]):
             "↑/↓ to jump between items): [/white]"
         )
         # Border titles distinguish the four stacked usage cards. The two Claude cards
-        # name their account (the refresh cadence is no longer in the title); the
-        # Copilot card names the model it delegates to (the `copilot_model` config).
-        self.query_one("#usage", Static).border_title = "Claude Code (private)"
-        self.query_one("#usage-work", Static).border_title = "Claude Code (work)"
+        # name their account (the refresh cadence is no longer in the title) and carry
+        # the same 🏠/💼 glyph as the statusline (accounts.card_glyph) so the two
+        # surfaces read as the same convention; the Copilot card names the model it
+        # delegates to (the `copilot_model` config).
+        self.query_one(
+            "#usage", Static
+        ).border_title = f"Claude Code (private) {accounts.card_glyph('private')}"
+        self.query_one(
+            "#usage-work", Static
+        ).border_title = f"Claude Code (work) {accounts.card_glyph('work')}"
         self.query_one("#usage-codex", Static).border_title = "OpenAI Codex"
         self.query_one(
             "#usage-copilot", Static

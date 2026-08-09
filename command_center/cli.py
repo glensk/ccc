@@ -2392,7 +2392,18 @@ def cmd_statusline(args: argparse.Namespace) -> int:
 
     ANSI is always emitted (Claude Code renders it). Kept to a single fast SQLite
     lookup plus one registry scan so it is safe to call ~once per second.
+
+    ``--print-glyph`` is a DISTINCT, standalone mode: it prints only the current
+    shell's account badge (:func:`accounts.current_account_glyph`) and returns
+    immediately, before any Store/adapter access — cheaper than the main path, and
+    meant to be called separately/early (e.g. before building the statusline's badge
+    segment) rather than combined with ``--capture-usage``.
     """
+    if getattr(args, "print_glyph", False):
+        from . import accounts
+
+        print(accounts.current_account_glyph(), end="")
+        return 0
     from .models import (
         derive_status,
         loads_todos,
@@ -2790,6 +2801,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture-usage",
         action="store_true",
         help="also persist the account /usage snapshot from the status-line JSON on stdin",
+    )
+    p_sl.add_argument(
+        "--print-glyph",
+        action="store_true",
+        help="print only the current account's badge glyph (🏠/💼) and exit",
     )
     p_sl.set_defaults(func=cmd_statusline)
 

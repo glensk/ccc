@@ -92,6 +92,60 @@ def account_label(config_dir: str) -> str:
     return Path(config_dir).name or config_dir
 
 
+def effective_account_label(config_dir: str) -> str:
+    """The label *config_dir* should present as, honoring the identity hard-link.
+
+    :func:`account_label` alone is purely path-based, so it shows the WRONG
+    label/glyph after the exact drift :func:`resolve_card_label` guards against (a
+    bare ``/login`` in the wrong shell silently swaps which account a config dir
+    holds) — this is that same correction, but dir → label instead of label → dir.
+    When a hard link (``claude_account_emails``) is configured, this reads
+    *config_dir*'s CURRENT identity (:func:`account_email`) and returns whichever
+    label's hard-linked email matches it. Falls back to the plain path-based
+    :func:`account_label` when no hard link is configured, the identity cannot be
+    read, or it matches nothing configured — never worse than today's behaviour for
+    a single-account or non-hard-linked setup.
+
+    Meant for a single per-invocation query (e.g. the statusline's own badge, or one
+    row's marker) — each call costs one ``.claude.json`` read, so a per-row loop over
+    many sessions should resolve labels once per configured account up front instead.
+    """
+    emails = config.claude_account_email_map()
+    if not emails:
+        return account_label(config_dir)
+    actual = account_email(config_dir)
+    if actual is None:
+        return account_label(config_dir)
+    for label, email in emails.items():
+        if email == actual:
+            return label
+    return account_label(config_dir)
+
+
+def current_account_glyph() -> str:
+    """Bare glyph (no trailing space) for the CURRENT shell's account, or ``""``.
+
+    ``🏠`` for ``private``, ``💼`` for ``work``, ``""`` for any other/unresolved
+    account or in single-account mode (matching :func:`home_marker`'s "no signal"
+    rule) — honors the identity hard-link via :func:`effective_account_label`, so
+    this reflects who is ACTUALLY logged into the current ``CLAUDE_CONFIG_DIR``
+    rather than which dir it happens to be. The statusline's ``ccc statusline
+    --print-glyph`` prints exactly this.
+    """
+    if len(config.claude_config_dirs()) <= 1:
+        return ""
+    return card_glyph(effective_account_label(env_config_dir()))
+
+
+def card_glyph(label: str) -> str:
+    """Bare glyph (no trailing space) for account *label* — ``🏠`` private / ``💼``
+    work / ``""`` for anything else. The one PUBLIC accessor for the private
+    ``_HOME_GLYPH``/``_WORK_GLYPH`` table-column constants, for callers outside this
+    module (e.g. the TUI's static usage-card titles) that want the bare glyph.
+    """
+    return {"private": _HOME_GLYPH, "work": _WORK_GLYPH}.get(label, "").strip()
+
+
 def _claude_json_path(config_dir: str | Path) -> Path:
     """Where Claude Code's own account/profile JSON lives for *config_dir*.
 

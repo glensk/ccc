@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import cli
+from command_center import accounts, cli, config
 from command_center.models import dumps_todos
 from command_center.store import Store
 
@@ -300,3 +300,33 @@ def test_capture_effort_from_payload_persists_on_change(
 
     # Unknown session id → silently ignored (never raises).
     cli._capture_effort_from_payload({"session_id": "nope", "effort": "high"})
+
+
+def test_statusline_print_glyph_returns_immediately_without_a_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--print-glyph` is a standalone mode: no Store/session needed, prints nothing
+    but the bare glyph (single-account here, so an empty string), exit 0."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    assert cli.cmd_statusline(Namespace(print_glyph=True, session=None)) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_statusline_print_glyph_reflects_the_identity_hard_link(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """The exact bug report: a config dir named "private" whose CURRENT identity is
+    "work" must print 💼, not 🏠 — `--print-glyph` reads `accounts.current_account_glyph`."""
+    private_dir, work_dir = tmp_path / "private", tmp_path / "work"
+    private_dir.mkdir()
+    work_dir.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_HOME", str(private_dir))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(
+        config, "claude_config_dirs", lambda: {"private": private_dir, "work": work_dir}
+    )
+    (tmp_path / ".claude.json").write_text('{"oauthAccount": {"emailAddress": "work@example.com"}}')
+    monkeypatch.setattr(config, "claude_account_email_map", lambda: {"work": "work@example.com"})
+    assert cli.cmd_statusline(Namespace(print_glyph=True, session=None)) == 0
+    assert capsys.readouterr().out == accounts._WORK_GLYPH.strip()

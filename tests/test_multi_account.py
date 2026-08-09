@@ -301,6 +301,80 @@ def test_home_marker_single_account_is_empty(monkeypatch: pytest.MonkeyPatch) ->
     assert accounts.home_marker("") == ""
 
 
+def test_effective_account_label_passthrough_when_no_hard_link(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No hard link configured → identical to the plain path-based `account_label`."""
+    monkeypatch.setattr(config, "claude_account_email_map", lambda: {})
+    assert accounts.effective_account_label(str(two_accounts["private"])) == "private"
+    assert accounts.effective_account_label(str(two_accounts["work"])) == "work"
+
+
+def test_effective_account_label_corrects_a_drifted_swap(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The dir->label inverse of `resolve_card_label`: a `.claude.json` identity that
+    doesn't match its OWN label's hard link resolves to whichever label DOES match."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work_dir = two_accounts["work"]
+    # Drift: the "private"-named (default) dir now holds the "work" identity.
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    (work_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "private@example.com"}})
+    )
+    monkeypatch.setattr(
+        config,
+        "claude_account_email_map",
+        lambda: {"work": "work@example.com", "private": "private@example.com"},
+    )
+    assert accounts.effective_account_label(str(two_accounts["private"])) == "work"
+    assert accounts.effective_account_label(str(work_dir)) == "private"
+
+
+def test_effective_account_label_falls_back_when_identity_unreadable_or_unmatched(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hard link configured but the identity can't be read, or matches nothing
+    configured, falls back to the plain path-based label — never worse than today."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # no .claude.json written -> unreadable
+    monkeypatch.setattr(
+        config, "claude_account_email_map", lambda: {"private": "someone@example.com"}
+    )
+    assert accounts.effective_account_label(str(two_accounts["private"])) == "private"
+
+
+def test_current_account_glyph_honors_the_hard_link(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The statusline's own badge (`ccc statusline --print-glyph`) reads this: it must
+    show the drift-corrected glyph, not the raw-path one — the exact bug report this
+    guards against (a private-named dir showing 🏠 while actually running `work`)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)  # this shell -> default -> "private" dir
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    monkeypatch.setattr(config, "claude_account_email_map", lambda: {"work": "work@example.com"})
+    assert accounts.current_account_glyph() == "💼"  # NOT 🏠, despite the "private" dir
+
+
+def test_current_account_glyph_empty_in_single_account_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "claude_config_dirs", lambda: {"private": Path("/x/.claude")})
+    assert accounts.current_account_glyph() == ""
+
+
+def test_card_glyph_is_the_public_accessor_for_the_table_column_glyphs() -> None:
+    """`card_glyph` is the one non-underscore way to get a bare 🏠/💼 — used by the
+    TUI's static usage-card titles, which must never reach into `_HOME_GLYPH` directly."""
+    assert accounts.card_glyph("private") == accounts._HOME_GLYPH.strip() == "🏠"
+    assert accounts.card_glyph("work") == accounts._WORK_GLYPH.strip() == "💼"
+    assert accounts.card_glyph("other") == ""
+
+
 # ---------------------------------------------------------------------------
 # launch_env
 # ---------------------------------------------------------------------------
