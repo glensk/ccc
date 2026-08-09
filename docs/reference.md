@@ -1336,12 +1336,18 @@ filenames); malformed entries are skipped.
   `ccc ls`), each row is prefixed with a little per-account glyph: **🏠** for the
   **`private` (cpriv)** account, **💼** for the **`work` (cwork)** account — so you can see
   at a glance which sessions are personal vs work; any other (unknown) account gets an
-  equal-width blank so the model text stays aligned. The same 🏠 / 💼 also appears in the
-  **statusline** right after the model name (`Model: Opus 4.8 🏠 | xhigh | …`) — driven in
-  `dotfiles/claude/.claude/statusline-command.sh` off the session's `CLAUDE_CONFIG_DIR`;
-  keep its glyphs in sync with `accounts._HOME_GLYPH` / `_WORK_GLYPH`. The glyph only
-  shows in multi-account mode (with one account it would sit on every row and mean
-  nothing). To change a row's account fast, without opening the `e` form: highlight it
+  equal-width blank so the model text stays aligned. The same 🏠 / 💼 also appears on the
+  two Claude usage-card titles and in the **statusline** right after the model name
+  (`Model: Opus 4.8 🏠 | xhigh | …`) — the statusline (`dotfiles/claude/.claude/
+  statusline-command.sh`) calls `ccc statusline --print-glyph`, a standalone
+  Store-free fast path that prints `accounts.current_account_glyph()`: the session's
+  `CLAUDE_CONFIG_DIR`, corrected by the identity hard-link
+  (`accounts.effective_account_label`) when `claude_account_emails` is configured, so
+  the badge survives a drifted login rather than just trusting the path. Falls back
+  to a plain path check when `ccc` is unavailable. Keep the glyphs in sync with
+  `accounts._HOME_GLYPH` / `_WORK_GLYPH` (public accessor: `accounts.card_glyph`).
+  The glyph only shows in multi-account mode (with one account it would sit on every
+  row and mean nothing). To change a row's account fast, without opening the `e` form: highlight it
   and press **`tp`** (type `t` then `p`) for **private** or **`tw`** for **work**. Both
   are per-session `t…` chords, listed in the `t` leader menu. They flip a **FUTURE job**
   (draft) freely (it never ran); on a **PARKED** session they re-stamp the account **only
