@@ -1307,6 +1307,10 @@ _HELP_TOPICS: dict[str, str] = {
         "  accounts' windows are never merged into one bar. The Fable row shows only\n"
         "  after the first OAuth fetch. The work card is hidden unless a `work` account\n"
         "  is listed in claude_accounts.\n"
+        "  Session/Week each go stale (bare '?%', no bar) once their snapshot is older\n"
+        "  than the window's own lifetime (5h / 7d) — see claude_account_emails below\n"
+        "  for the identity hard-link that keeps this from ever reading the wrong\n"
+        "  account's numbers.\n"
         "[b]OpenAI Codex[/b]  Session (5h) + Week (7d) bars.\n"
         "  Source: a cheap, mtime-cached read of the newest ~/.codex rollout file's\n"
         "  rate_limits block — as fresh as the last Codex token_count event.\n"
@@ -1340,7 +1344,12 @@ _HELP_TOPICS: dict[str, str] = {
         "  claude_usage_refresh_sec           idle Claude OAuth-fetch throttle (600)\n"
         "  claude_usage_refresh_active_sec    active-work Claude throttle (200; 0=off)\n"
         "  usage_card_private/_work/_codex/_copilot   the four t1..t4 toggles\n"
-        "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n\n"
+        "  claude_accounts                    ['private=~/.claude', 'work=~/.claude-work']\n"
+        "  claude_account_emails    identity hard-link, e.g. ['work=you@company.com'] —\n"
+        "                           the card shows whichever configured account is\n"
+        "                           CURRENTLY logged in as that email, even if a bare\n"
+        "                           /login swapped which physical dir holds it. Empty\n"
+        "                           (default) = no hard link, path-based as before.\n\n"
         "[b]Freshness vs `claude` /usage[/b]\n"
         "  The Claude cards now track `claude`'s own /usage: `ccc claude-usage` fetches\n"
         "  each account's OAuth /usage endpoint (the daemon + a detached TUI spawn, both\n"
@@ -2197,18 +2206,20 @@ class CommandCenterApp(App[None]):
         except OSError:
             pass
 
-    def _update_usage(self) -> None:
+    def _update_usage(self) -> None:  # pylint: disable=too-many-locals
         """Refresh all four account-usage cards (top-right of the detail pane).
 
         Account-global and independent of the selected row; reset times are relative,
         so re-rendering each ``usage_refresh_sec`` tick makes them count down. The two
         Claude cards read their per-account snapshot (``read_usage`` / ``read_usage
-        ("work")``, private gold vs work blue accent); Codex's is a cheap cached read of
-        its newest session rollout file (``read_codex_usage``); Copilot's is the cached
-        ``gh`` figure (``read_copilot_usage``) — all reads are cheap. Each card's
-        visibility follows its own ``usage_card_*`` render gate. Only Copilot's *fetch*
-        hits the network, gated separately on ``copilot_usage`` and throttled
-        (adaptively: tighter while a job works).
+        ("work")``, private gold vs work blue accent) — WHICH account label backs each
+        card is first resolved by :func:`accounts.resolve_card_label` (a no-op unless
+        ``claude_account_emails`` hard-links that card to an email); Codex's is a cheap
+        cached read of its newest session rollout file (``read_codex_usage``);
+        Copilot's is the cached ``gh`` figure (``read_copilot_usage``) — all reads are
+        cheap. Each card's visibility follows its own ``usage_card_*`` render gate.
+        Only Copilot's *fetch* hits the network, gated separately on ``copilot_usage``
+        and throttled (adaptively: tighter while a job works).
         """
         try:
             private_panel = self.query_one("#usage", Static)
@@ -2221,8 +2232,21 @@ class CommandCenterApp(App[None]):
             return
         # Render all four cards from their (cheap) caches; the Copilot cache read is
         # cheap too — only its FETCH hits the network (gated separately below).
-        private_panel.update(usage.render_usage(usage.read_usage()))
-        work_panel.update(usage.render_work_usage(usage.read_usage("work")))
+        # accounts.resolve_card_label swaps in whichever configured account's cache
+        # actually matches this card's hard-linked email (claude_account_emails), so a
+        # drifted CLAUDE_CONFIG_DIR login never mislabels which account's numbers show
+        # under "Claude Code (private)" vs "(work)". A label with no hard link
+        # configured passes through unchanged (today's pure path-based behaviour); one
+        # WITH a hard link but no current match resolves to None → the card renders
+        # empty rather than a stale/wrong-account guess.
+        private_label = accounts.resolve_card_label("private")
+        work_label = accounts.resolve_card_label("work")
+        private_panel.update(
+            usage.render_usage(usage.read_usage(private_label) if private_label else None)
+        )
+        work_panel.update(
+            usage.render_work_usage(usage.read_usage(work_label) if work_label else None)
+        )
         codex_panel.update(usage.render_codex_usage(usage.read_codex_usage()))
         copilot_panel.update(usage.render_copilot_usage(usage.read_copilot_usage()))
         # The two nixos-overseer cards read an EXTERNAL sqlite DB read-only; each read is
@@ -2281,8 +2305,8 @@ class CommandCenterApp(App[None]):
                 self.cfg.claude_usage_refresh_active_sec,
                 active=active,
             )
-            accounts = config.parse_claude_accounts(self.cfg.claude_accounts)
-            stale = any(usage.claude_usage_stale(label, throttle) for label in accounts)
+            account_dirs = config.parse_claude_accounts(self.cfg.claude_accounts)
+            stale = any(usage.claude_usage_stale(label, throttle) for label in account_dirs)
             if (
                 stale
                 and (monotonic() - self._last_claude_usage_spawn) >= _CLAUDE_USAGE_SPAWN_MIN_SEC

@@ -724,3 +724,113 @@ def test_jump_resume_selected_refuses_on_live_conflict(
         store.update_fields("dup", config_dir=str(two_accounts["private"]))
     assert jump._resume_selected() == 1
     assert "two Claude accounts" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# identity hard-link: `accounts.account_email` + `accounts.resolve_card_label`
+# ---------------------------------------------------------------------------
+def test_account_email_default_dir_reads_home_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DEFAULT account's identity lives at ``$HOME/.claude.json`` — a SIBLING of
+    ``~/.claude/``, NOT inside it (mirrors Claude Code's own file placement)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".claude").mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_HOME", str(home / ".claude"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    (home / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "default@example.com"}})
+    )
+    assert accounts.account_email(str(home / ".claude")) == "default@example.com"
+
+
+def test_account_email_nondefault_dir_reads_its_own_claude_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-default account's identity lives INSIDE its own config dir."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "private"))
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    assert accounts.account_email(str(work)) == "work@example.com"
+
+
+def test_account_email_missing_or_malformed_is_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best-effort: a missing file, bad JSON, or no active OAuth account → None."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path / "private"))
+    assert accounts.account_email(str(tmp_path / "missing")) is None
+
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    (bad / ".claude.json").write_text("not json")
+    assert accounts.account_email(str(bad)) is None
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    (empty / ".claude.json").write_text(json.dumps({"oauthAccount": {}}))
+    assert accounts.account_email(str(empty)) is None
+
+
+def test_resolve_card_label_passthrough_when_no_hard_link(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No hard link configured for this card → unchanged passthrough (today's pure
+    path-based behaviour) — the default for every fresh install."""
+    monkeypatch.setattr(config, "claude_account_email_map", lambda: {})
+    assert accounts.resolve_card_label("private") == "private"
+    assert accounts.resolve_card_label("work") == "work"
+
+
+def test_resolve_card_label_follows_identity_across_a_drifted_swap(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The label<->dir mapping can drift (a bare ``/login`` in the wrong shell); a
+    hard-linked email follows the ACTUAL logged-in identity, not the configured path —
+    this is the exact bug this feature exists to survive."""
+    monkeypatch.setenv("HOME", str(tmp_path))  # keeps the default account's identity
+    # file under tmp_path, never the real machine's ~/.claude.json
+    work_dir = two_accounts["work"]
+    # Drift: the "private"-named (default) dir now holds the "work" identity and
+    # vice-versa — exactly the swap `resolve_card_label` must see through.
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    (work_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "private@example.com"}})
+    )
+    monkeypatch.setattr(
+        config,
+        "claude_account_email_map",
+        lambda: {"work": "work@example.com", "private": "private@example.com"},
+    )
+    # "work"'s card must read the "private"-named dir's cache (it holds work's identity)…
+    assert accounts.resolve_card_label("work") == "private"
+    # …and vice-versa.
+    assert accounts.resolve_card_label("private") == "work"
+
+
+def test_resolve_card_label_none_when_hard_link_has_no_current_match(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A hard link with NO matching logged-in account resolves to ``None`` — never a
+    path-based guess that could show the wrong account's numbers again."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work_dir = two_accounts["work"]
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "someone-else@example.com"}})
+    )
+    (work_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "someone-else@example.com"}})
+    )
+    monkeypatch.setattr(
+        config, "claude_account_email_map", lambda: {"private": "not-logged-in@example.com"}
+    )
+    assert accounts.resolve_card_label("private") is None
+    # "work" has no hard link configured → passthrough, unaffected by the missing match.
+    assert accounts.resolve_card_label("work") == "work"

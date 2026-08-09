@@ -315,3 +315,26 @@ def test_parse_claude_accounts_is_pure_and_shares_semantics_with_claude_config_d
     # Malformed entries are skipped, not fatal; an all-malformed list falls back.
     assert set(config.parse_claude_accounts(["nosep", "BAD=/x", "=/y", "ok="])) == {"private"}
     assert config.parse_claude_accounts([]) == {"private": config.claude_home()}
+
+
+def test_parse_claude_account_emails_is_pure_and_tolerant() -> None:
+    """`parse_claude_account_emails` — the identity hard-link behind `resolve_card_label`.
+
+    Mirrors `parse_claude_accounts`'s tolerance for malformed entries, but with NO
+    non-empty fallback: an absent/all-malformed list means "no hard link", not "assume
+    private" (an unconfigured card must resolve as a plain passthrough, never a guess).
+    """
+    entries = ["work=albert@epfl.ch", "private=albert@gmail.com"]
+    assert config.parse_claude_account_emails(entries) == {
+        "work": "albert@epfl.ch",
+        "private": "albert@gmail.com",
+    }
+    # Malformed entries (no "=", bad label, no "@" in the value) are skipped, not fatal.
+    assert (
+        config.parse_claude_account_emails(
+            ["nosep", "BAD=x@y.com", "work=notanemail", "=x@y.com", "ok="]
+        )
+        == {}
+    )
+    # Unlike claude_accounts, empty stays empty — no default-private fallback.
+    assert config.parse_claude_account_emails([]) == {}

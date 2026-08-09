@@ -416,6 +416,63 @@ def test_render_usage_accent_distinguishes_private_and_work() -> None:
     assert accent_styles(usage.render_work_usage(snap, now=_NOW)) == accent_styles(work)
 
 
+def test_render_usage_session_stale_shows_bare_pct_no_bar() -> None:
+    """A snapshot older than the session window's own lifetime (5h) drops the bar for
+    a bare '?%' — a colour would otherwise imply a live reading it can't support."""
+    snap = usage.Usage(
+        captured_at=_NOW - usage._SESSION_STALE_AFTER_SEC - 1,  # just past 5h
+        five_hour=usage.Window(27, _NOW + 3600),
+        seven_day=usage.Window(93, _NOW + 7 * 86400),
+    )
+    plain = usage.render_usage(snap, now=_NOW).plain
+    assert "Session: ?%" in plain
+    assert "27%" not in plain  # the stale bar's own percentage is gone, not just hidden
+    # The week window is only 5h+1s old too — well under its own 7d threshold — so it
+    # still renders as a live bar.
+    assert "Week: Resets in " in plain
+    assert "93%" in plain
+
+
+def test_render_usage_week_stale_shows_bare_pct_no_bar() -> None:
+    """Past 7d old, the week row goes stale too — independently of the session row."""
+    snap = usage.Usage(
+        captured_at=_NOW - usage._WEEK_STALE_AFTER_SEC - 1,  # just past 7d
+        five_hour=usage.Window(27, _NOW + 3600),
+        seven_day=usage.Window(93, _NOW + 7 * 86400),
+    )
+    plain = usage.render_usage(snap, now=_NOW).plain
+    # 7d-old is also >5h old, so both rows go stale off the one shared captured_at clock.
+    assert "Session: ?%" in plain
+    assert "Week: ?%" in plain
+    assert "27%" not in plain and "93%" not in plain
+
+
+def test_render_usage_fresh_snapshot_keeps_bars() -> None:
+    """Just under both thresholds, the bars render exactly as before (regression guard)."""
+    snap = usage.Usage(
+        captured_at=_NOW - usage._SESSION_STALE_AFTER_SEC + 1,
+        five_hour=usage.Window(27, _NOW + 3600),
+        seven_day=usage.Window(93, _NOW + 7 * 86400),
+    )
+    plain = usage.render_usage(snap, now=_NOW).plain
+    assert "Session: Resets in " in plain and "27%" in plain
+    assert "Week: Resets in " in plain and "93%" in plain
+    assert "?%" not in plain
+
+
+def test_render_codex_usage_never_goes_stale() -> None:
+    """The Codex card shares `_render_card` but opts out of staleness (`staleness=None`
+    by default) — its own source is already 'as fresh as the last token_count event'."""
+    snap = usage.Usage(
+        captured_at=_NOW - usage._WEEK_STALE_AFTER_SEC - 100,  # ancient by Claude's rule
+        five_hour=usage.Window(27, _NOW + 3600),
+        seven_day=usage.Window(93, _NOW + 7 * 86400),
+    )
+    plain = usage.render_codex_usage(snap, now=_NOW).plain
+    assert "?%" not in plain
+    assert "27%" in plain and "93%" in plain
+
+
 def test_fill_for_pct_thresholds() -> None:
     """green ≤65, orange 66–85, red ≥86 — inclusive at each upper boundary."""
     assert usage._fill_for_pct(0) == usage._FILL_GREEN

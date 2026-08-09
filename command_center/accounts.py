@@ -21,6 +21,7 @@ Two renderings of the same rule:
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import sys
@@ -89,6 +90,69 @@ def account_label(config_dir: str) -> str:
         if _resolve(path) == target:
             return label
     return Path(config_dir).name or config_dir
+
+
+def _claude_json_path(config_dir: str | Path) -> Path:
+    """Where Claude Code's own account/profile JSON lives for *config_dir*.
+
+    Mirrors Claude Code's own resolution (the same fork :mod:`usage` uses for its
+    Keychain service name): the DEFAULT account's file is ``$HOME/.claude.json`` —
+    a sibling of ``~/.claude/``, NOT inside it — while any other account's file is
+    ``<config_dir>/.claude.json``.
+    """
+    if _resolve(config_dir) == default_config_dir():
+        return Path.home() / ".claude.json"
+    return _resolve(config_dir) / ".claude.json"
+
+
+def account_email(config_dir: str) -> str | None:
+    """The email currently logged into *config_dir*'s Claude account, or ``None``.
+
+    Reads Claude Code's own ``.claude.json`` (``oauthAccount.emailAddress`` — the
+    same field ``/status`` prints as "Email:"). Best-effort and read-only: a
+    missing/unreadable/malformed file, or no active OAuth account, returns ``None``.
+    Never raises.
+    """
+    try:
+        data = json.loads(_claude_json_path(config_dir).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    oauth = data.get("oauthAccount") if isinstance(data, dict) else None
+    if not isinstance(oauth, dict):
+        return None
+    email = oauth.get("emailAddress")
+    return email if isinstance(email, str) and email else None
+
+
+def resolve_card_label(card_label: str) -> str | None:
+    """Which configured account label's cache actually backs *card_label*'s card.
+
+    ccc's account labels ("private"/"work") name a config DIR (``claude_accounts``);
+    WHICH Claude account is logged into that dir can drift — a bare ``/login`` run in
+    a shell with the wrong (or unset) ``CLAUDE_CONFIG_DIR`` silently overwrites it, so
+    a dir named "work" can end up holding the private account or vice-versa with no
+    visible cause. When *card_label* has a hard-linked email configured
+    (``claude_account_emails``), this walks every configured account, reads its
+    CURRENT identity (:func:`account_email`), and returns whichever label's live
+    email matches that hard link — so e.g. the "work" card always shows the SDSC
+    account's numbers regardless of which physical dir currently holds them.
+
+    Returns:
+
+    * *card_label* itself, unchanged, when no hard link is configured for it —
+      today's pure path-based behaviour, fully backward compatible.
+    * the label whose live identity matches the hard link.
+    * ``None`` when a hard link IS configured but no configured account currently
+      matches it (logged out, or the seat lapsed) — callers must render this as "no
+      data", never fall back to a path-based guess that could be wrong again.
+    """
+    expected = config.claude_account_email_map().get(card_label)
+    if not expected:
+        return card_label
+    for label, path in config.claude_config_dirs().items():
+        if account_email(str(path)) == expected:
+            return label
+    return None
 
 
 def account_config_dir(label: str) -> str:

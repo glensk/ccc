@@ -141,6 +141,16 @@ _OAUTH_BACKOFF_CAP_SEC = 7200
 # a frozen number (e.g. a persistent 429 backoff) is then never shown as if it were live.
 _FABLE_STALE_AFTER_SEC = 3600
 
+# Session/Week staleness for the two Claude cards, keyed on ``Usage.captured_at`` (the
+# last time ANY live session under that account talked to the API, or an OAuth fetch
+# ran — whichever is more recent). Past this age the figure predates its own window's
+# lifetime, so it is no longer a trustworthy reading of "usage right now": the bar is
+# replaced with a bare "?%" (see :func:`_section`) instead of a colour that implies
+# live data. Thresholds mirror each window's own duration — a 5h-old session figure or
+# a 7d-old weekly figure is stale almost by definition.
+_SESSION_STALE_AFTER_SEC = 5 * 3600
+_WEEK_STALE_AFTER_SEC = 7 * 86400
+
 
 @dataclass
 class Window:
@@ -961,17 +971,24 @@ def _section(  # pylint: disable=too-many-arguments
     label_color: str = _RESET_STYLE,
     *,
     label: str | None = None,
+    stale: bool = False,
 ) -> Text:
     """One window as a single bar row: ``<prefix>Resets …`` embossed, percentage right.
 
     *prefix* names the window inside the bar (``"Session: "`` / ``"Week: "``) — the
     standalone title line above the bar was dropped so each window is just one row. Pass
     *label* to override the default ``<prefix>Resets …`` emboss (used for the stale-Fable
-    marker), keeping the same bar/percentage rendering.
+    marker), keeping the same bar/percentage rendering. *stale* (see
+    :data:`_SESSION_STALE_AFTER_SEC` / :data:`_WEEK_STALE_AFTER_SEC`) drops the bar
+    entirely in favour of a bare ``<prefix>?%`` — a coloured fill would otherwise imply
+    a live reading the snapshot is too old to support.
     """
     text = Text()
     if win is None:
         text.append(f"{prefix}—\n", style="grey50")
+        return text
+    if stale:
+        text.append(f"{prefix}?%\n", style="grey50")
         return text
     # Reset time is embossed onto the bar (not appended after it) so the row stays
     # short — one line per window, and the card no longer grows wider than the bar.
@@ -981,13 +998,14 @@ def _section(  # pylint: disable=too-many-arguments
     return text
 
 
-def _render_card(
+def _render_card(  # pylint: disable=too-many-arguments
     usage: Usage,
     now: int,
     *,
     fill_color: str,
     label_color: str,
     fill_for_pct: Callable[[float], str] | None = None,
+    staleness: tuple[int, int] | None = None,
 ) -> Text:
     """The two-bar card body (session + week), shared by both providers.
 
@@ -1002,6 +1020,11 @@ def _render_card(
     percentage (:func:`_fill_for_pct` for the Claude cards' green/orange/red thresholds);
     when None the single flat *fill_color* is used for every bar (Codex/Copilot behaviour,
     exactly as before).
+
+    *staleness*, when given, is ``(session_stale_after_sec, week_stale_after_sec)``:
+    each row drops its bar for a bare ``?%`` once ``now - usage.captured_at`` exceeds
+    its own threshold (see :func:`_section`). ``None`` (Codex/Copilot) keeps today's
+    behaviour — a bar is always drawn from whatever figure the cache holds.
     """
 
     def _fill(win: Window | None) -> str:
@@ -1009,12 +1032,27 @@ def _render_card(
             return fill_for_pct(win.used_percentage)
         return fill_color
 
+    age = now - usage.captured_at
+    session_stale = staleness is not None and age > staleness[0]
+    week_stale = staleness is not None and age > staleness[1]
+
     text = Text()
     text.append_text(
-        _section("Session: ", usage.five_hour, now, _fill(usage.five_hour), label_color)
+        _section(
+            "Session: ",
+            usage.five_hour,
+            now,
+            _fill(usage.five_hour),
+            label_color,
+            stale=session_stale,
+        )
     )
     # No blank line between the windows — keeps the card tight.
-    text.append_text(_section("Week: ", usage.seven_day, now, _fill(usage.seven_day), label_color))
+    text.append_text(
+        _section(
+            "Week: ", usage.seven_day, now, _fill(usage.seven_day), label_color, stale=week_stale
+        )
+    )
     if usage.fable_week is not None:
         fable_label: str | None = None
         if usage.oauth_fetched_at > 0 and now - usage.oauth_fetched_at > _FABLE_STALE_AFTER_SEC:
@@ -1042,12 +1080,20 @@ def render_usage(
     private gold (:data:`_CLAUDE_ACCENT`), work blue (:data:`_CLAUDE_WORK_ACCENT`).
     Both colour each bar from its own usage via :func:`_fill_for_pct`
     (green ≤65% / orange ≤85% / red otherwise): same product, per-bar health colour.
+
+    Session/Week each go stale (bare ``?%``, no bar) once the snapshot predates its own
+    window's lifetime — see :data:`_SESSION_STALE_AFTER_SEC` / :data:`_WEEK_STALE_AFTER_SEC`.
     """
     now = int(time.time()) if now is None else now
     if usage is None or usage.is_empty():
         return Text("—\n(start a turn to populate)", style="grey50")
     return _render_card(
-        usage, now, fill_color=_FILL_COLOR, label_color=accent, fill_for_pct=_fill_for_pct
+        usage,
+        now,
+        fill_color=_FILL_COLOR,
+        label_color=accent,
+        fill_for_pct=_fill_for_pct,
+        staleness=(_SESSION_STALE_AFTER_SEC, _WEEK_STALE_AFTER_SEC),
     )
 
 

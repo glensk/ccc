@@ -106,6 +106,14 @@ DEFAULTS: dict[str, object] = {
     # (the default) ⇒ a single ``{"private": claude_home()}`` account, i.e. today's
     # behaviour. Labels are validated ``^[a-z0-9][a-z0-9_-]*$``.
     "claude_accounts": [],
+    # Identity hard-link for the usage cards: ``"label=email"`` entries, same shape as
+    # ``claude_accounts``. WHICH config dir a label points at is a path; WHICH Claude
+    # account is actually logged into that dir can drift (a bare `/login` in the wrong
+    # shell silently swaps it) — this pins the "Claude Code (work)"/"(private)" cards to
+    # an ACTUAL email address instead, so the right numbers show under the right card
+    # even after such a drift. Empty (the default) ⇒ no hard link, today's pure
+    # path-based behaviour (see ``accounts.resolve_card_label``).
+    "claude_account_emails": [],
     # Which account a NEW job (no explicit -A / account select) bills to: "" = default
     # account, a label = pin, "auto" = saturate-earliest-reset routing (see routing.py).
     "job_account": "",
@@ -256,6 +264,37 @@ def parse_claude_accounts(entries: list[str]) -> dict[str, Path]:
     return dirs or {"private": claude_home()}
 
 
+def claude_account_email_map() -> dict[str, str]:
+    """Map each Claude account label → its hard-linked expected email (see DEFAULTS).
+
+    Parses the ``claude_account_emails`` config key. Empty ⇒ ``{}`` (no hard link
+    configured — deliberately NO ``{"private": ...}`` fallback the way
+    :func:`claude_config_dirs` has one: an absent hard link means "resolve by path
+    only", not "assume private").
+    """
+    return parse_claude_account_emails(load_config().claude_account_emails)
+
+
+def parse_claude_account_emails(entries: list[str]) -> dict[str, str]:
+    """Pure ``"label=email"`` parser behind :func:`claude_account_email_map`.
+
+    Mirrors :func:`parse_claude_accounts`'s tolerance: an entry with no ``=``, a
+    label failing ``_ACCOUNT_LABEL_RE``, or a value with no ``@`` is SKIPPED without
+    crashing. Unlike ``claude_accounts`` there is no non-empty fallback — an empty
+    result means "no hard link configured" for every label.
+    """
+    emails: dict[str, str] = {}
+    for entry in entries:
+        label, sep, raw = entry.partition("=")
+        if not sep:
+            continue  # no "=" → not a "label=email" entry
+        label, raw = label.strip(), raw.strip()
+        if not raw or "@" not in raw or not _ACCOUNT_LABEL_RE.match(label):
+            continue  # blank/malformed email, or a label that could smuggle a path separator
+        emails[label] = raw
+    return emails
+
+
 def guard_vault_path(path: Path) -> Path:
     """Fail loudly when a TEST resolves a vault path under the real ``$HOME``.
 
@@ -339,6 +378,7 @@ class Config:
     claude_usage_refresh_sec: int = 600
     claude_usage_refresh_active_sec: int = 200
     claude_accounts: list[str] = field(default_factory=list)  # "label=path" per Claude account
+    claude_account_emails: list[str] = field(default_factory=list)  # "label=email" hard link
     job_account: str = ""  # "" = default account, a label = pin, "auto" = burn-rate routing
     usage_card_private: bool = True
     usage_card_work: bool = True
