@@ -1377,7 +1377,10 @@ def test_e_edits_the_first_aim_in_place(tmp_path: Path, monkeypatch: pytest.Monk
     # _seed's AIM becomes revision 1 when the first tracked change seeds it; the change
     # itself is revision 2 — two revisions is what makes the `/aim (1)` row show.
     store.set_aim(sid, "second aim: pytest -q green")
+    store.set_short_aim(sid, "ship the thing")  # stale label — built on the OLD original
     store.close()
+    spawned: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", lambda argv, **kw: spawned.append(argv))
 
     from textual.containers import Horizontal
     from textual.widgets import TextArea
@@ -1390,6 +1393,7 @@ def test_e_edits_the_first_aim_in_place(tmp_path: Path, monkeypatch: pytest.Monk
             await settle(pilot)
             app.cfg.aim_score_on_set = False
             app.cfg.drift_check = False
+            app.cfg.short_aim = True  # the /aim column's label must be regenerated
             table = app.query_one("#sessions", SessionTable)
             table.move_cursor(row=table.get_row_index(sid))
             table.focus()
@@ -1416,6 +1420,11 @@ def test_e_edits_the_first_aim_in_place(tmp_path: Path, monkeypatch: pytest.Monk
     assert history == ["first aim, restated: ccc ls lists it", "second aim: pytest -q green"]
     assert saved is not None
     assert saved.aim == "second aim: pytest -q green"  # the current AIM is untouched
+    # The narrow `/aim` COLUMN renders the short label, which is generated from the original
+    # AIM as a hint — so the rewrite drops it and spawns a regeneration; without this the
+    # column would keep showing the pre-edit wording while the detail pane shows the new one.
+    assert saved.short_aim is None
+    assert spawned == [["short-aim", "--session", sid]]
 
 
 def test_e_refuses_to_empty_the_first_aim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

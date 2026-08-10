@@ -847,6 +847,13 @@ class Store:  # pylint: disable=too-many-public-methods
         self.conn.commit()
         if self.count_aim_history(session_id) == 1:
             self._mirror_first_aim_onto_session(session_id, new)
+        else:
+            # The CURRENT revision's short label is generated with the original AIM as its
+            # hint (short_aim._original_hint), so rewriting the original makes that label
+            # stale too — and the label IS what the narrow `/aim` column and the status line
+            # render. Drop it so the column falls back to the full current AIM until the
+            # cheap generator (spawned by the caller) backfills a label built on the new original.
+            self.set_short_aim(session_id, None)
         return True
 
     def _mirror_first_aim_onto_session(self, session_id: str, new: str) -> None:

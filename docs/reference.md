@@ -733,7 +733,11 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   `ccc set-aim -f/--first "<text>"`), for when the *original* done-condition was stated badly and
   the pane/history keeps showing that wording. It is rewritten **in place**: revision 1's text is
   replaced (re-scored, its stale short-AIM label dropped), **no** revision is appended, the running
-  index never shifts, and the current AIM is untouched. Emptying it is refused — history never
+  index never shifts, and the current AIM is untouched. The **short-AIM label is regenerated**
+  with it — the narrow `/aim` column renders that label, and the generator builds it from the
+  original AIM as a hint, so the rewrite drops the stale one (column falls back to the full AIM)
+  and spawns a fresh one; without that the column would keep showing the pre-edit wording while
+  the detail pane already shows the new. Emptying it is refused — history never
   loses where the goal started. When that first revision *is* the current AIM (a single revision,
   or an AIM predating history) the live AIM is rewritten with it and any stale DONE verdict is
   dropped; the sub-goal checklist is kept, since restating a goal is not changing it.

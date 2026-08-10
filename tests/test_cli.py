@@ -358,12 +358,18 @@ def test_set_aim_first_rewrites_revision_one_without_adding_one(
 ) -> None:
     """``ccc set-aim --first`` adapts ``/aim (1)`` in place; the current AIM stays put."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
-    monkeypatch.setattr("command_center.cli.config.load_config", lambda: _no_score_cfg())
+    cfg = _no_score_cfg()
+    # The label regenerates: it is what the narrow /aim column shows.
+    setattr(cfg, "short_aim", True)  # noqa: B010 — _no_score_cfg is an untyped stub object
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: cfg)
+    spawned: list[list[str]] = []
+    monkeypatch.setattr("command_center.spawn.spawn_ccc", lambda argv, **kw: spawned.append(argv))
     (tmp_path / "command-center").mkdir(parents=True)
     with Store(tmp_path / "command-center" / "state.db") as store:
         store.ensure("s1", cwd="/repo")
         store.set_aim("s1", "vague first aim")
         store.set_aim("s1", "second aim: pytest -q green")
+        store.set_short_aim("s1", "vague first aim")  # stale label built on the OLD original
 
     args = argparse.Namespace(text="first aim, restated: ccc ls lists it", session="s1", first=True)
     assert cli.cmd_set_aim(args) == 0
@@ -376,6 +382,11 @@ def test_set_aim_first_rewrites_revision_one_without_adding_one(
         ]
         session = store.get("s1")
     assert session is not None and session.aim == "second aim: pytest -q green"
+    # The stale short label (built on the OLD original) is dropped and regenerated — without
+    # this the narrow /aim column keeps showing the pre-edit wording. No re-score: the rewrite
+    # did not touch the current AIM.
+    assert session.short_aim is None
+    assert spawned == [["short-aim", "--session", "s1"]]
 
     # Re-running is a no-op; an empty --first is refused (exit 1), history untouched.
     assert cli.cmd_set_aim(args) == 0

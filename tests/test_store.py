@@ -526,10 +526,14 @@ def test_set_first_aim_rewrites_revision_one_in_place(tmp_path: Path) -> None:
     assert len(history) == 2  # rewritten in place — the running index never shifts
     assert history[0].score >= 0  # re-scored lexically for the new wording
     assert history[0].short_aim is None  # the old label described the old wording
-    assert history[1].short_aim == "second"
     session = store.get("s1")
     assert session is not None
     assert session.aim == "second, concrete aim: pytest -q green"  # current AIM untouched
+    # The CURRENT revision's short label is generated from the original AIM as a hint, so it
+    # went stale too — dropped here (the `/aim` column falls back to the full AIM until the
+    # generator backfills), which is what keeps the column from showing the pre-edit wording.
+    assert session.short_aim is None
+    assert history[1].short_aim is None
 
     # Idempotent / refuses to empty a history row.
     assert store.set_first_aim("s1", "first aim, restated: ccc ls shows the row") is False

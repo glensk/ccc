@@ -260,16 +260,18 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
         store.ensure(session_id, cwd=os.getcwd())
         if first:
             # Rewrite `/aim (1)` in place — no new revision, the current AIM stays as is.
-            # Refreshing the score/label only makes sense when that revision IS the current
-            # AIM (a single revision); a historical row carries its own lexical score.
-            is_current = store.count_aim_history(session_id) <= 1
+            # Re-scoring only makes sense when that revision IS the current AIM (a single
+            # revision); a historical row carries its own lexical score. The short label is
+            # regenerated either way: it is built from the original AIM as a hint, so it went
+            # stale with this rewrite (set_first_aim dropped it).
+            rescore = store.count_aim_history(session_id) <= 1
             changed = store.set_first_aim(session_id, args.text)
             if not changed:
                 print(f"first aim unchanged for {session_id}")
                 return 0
             print(f"first aim rewritten for {session_id}")
-            changed = is_current
         else:
+            rescore = True
             changed = store.set_aim(session_id, args.text)  # clears stale auto checklist + offset
             print(f"aim set for {session_id}")
     # On a real change, detached so we never block the caller: (a) refine the instant
@@ -279,7 +281,7 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
         cfg = config.load_config()
         from .spawn import spawn_ccc
 
-        if cfg.aim_score_on_set:
+        if cfg.aim_score_on_set and rescore:
             spawn_ccc(["score-aim", "--session", session_id])
         if cfg.short_aim:
             spawn_ccc(["short-aim", "--session", session_id])

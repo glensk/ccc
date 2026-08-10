@@ -4429,7 +4429,13 @@ class CommandCenterApp(App[None]):
         # where the goal started, and the current AIM above already covers "no AIM".
         if aim1 != original.get("aim1", ""):
             if aim1.strip():
-                store.set_first_aim(sid, aim1)
+                # On a real rewrite the current AIM's short label went stale with it (it is
+                # generated from the original as a hint, and it is what the `/aim` COLUMN
+                # renders) — set_first_aim dropped it, so regenerate it here.
+                if store.set_first_aim(sid, aim1) and self.cfg.short_aim:
+                    from .. import spawn  # pylint: disable=import-outside-toplevel
+
+                    spawn.spawn_ccc(["short-aim", "--session", sid])
             else:
                 self.notify(
                     "The first AIM cannot be emptied — /aim (1) kept unchanged.",
