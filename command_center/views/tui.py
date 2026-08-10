@@ -792,8 +792,10 @@ class EditForm(Vertical):
     ``Scheduled for``) come FIRST, mirroring the read-only head where the models sit
     on the ``Status:`` line and the scheduled date right under it — while editing,
     the head drops those readouts so every option renders exactly once. The first
-    AIM and the importance line are read-only ``Static`` lines the focus cursor
-    skips. AIM / prompt / sub-goals are borderless, grow-to-fit ``TextArea`` s
+    AIM (``/aim (1):``) is editable too — rewritten in place, so correcting how the
+    original goal was stated never invents a new revision; the importance line is a
+    read-only ``Static`` the focus cursor skips. AIM / prompt / sub-goals are
+    borderless, grow-to-fit ``TextArea`` s
     (multi-line, no border). Two edit-only rows have no read-only twin (their values
     render elsewhere outside edit mode): ``progress %`` (a manual bar override,
     blank = auto from sub-goals; shows in the head bar) and ``sub-goals`` (one item
@@ -836,7 +838,11 @@ class EditForm(Vertical):
         with Horizontal(id="edit-scheduled-row", classes="fieldrow"):
             yield Label("Scheduled for: ", classes="fieldlabel")
             yield Input(id="edit-scheduled", placeholder="YYYY-MM-DD — sinks to SCHEDULED")
-        yield Static("", id="edit-aim1")  # read-only first AIM (shown only when ≥2 revisions)
+        # First AIM — editable (rewritten in place, never appended as a revision). Shown
+        # only when ≥2 revisions exist; with a single one the `/aim (N)` row below IS it.
+        with Horizontal(id="edit-aim1-row", classes="fieldrow"):
+            yield Label("/aim (1): ", classes="fieldlabel")
+            yield TextArea("", id="edit-aim1", tab_behavior="focus", soft_wrap=True)
         with Horizontal(classes="fieldrow"):
             yield Label("/aim: ", id="edit-aim-label", classes="fieldlabel")
             yield TextArea("", id="edit-aim", tab_behavior="focus", soft_wrap=True)
@@ -1870,7 +1876,6 @@ class CommandCenterApp(App[None]):
         border: none; background: transparent; height: 1; min-width: 0; padding: 0;
     }
     #detail-edit Button:focus { background: $accent 30%; }
-    #detail-edit #edit-aim1 { color: white; }
     #detail-edit #edit-important { color: white; }
     #usage-col { width: auto; height: auto; }
     #usage { width: auto; min-width: 38; height: auto; padding: 0 1; border: round $accent; }
@@ -4242,24 +4247,28 @@ class CommandCenterApp(App[None]):
             "scheduled": session.start_date or "",
             "depends": session.depends_on or "",
             "subgoals": "\n".join(s.text for s in store.list_subgoals(sid)),
+            "aim1": "",  # filled below when a distinct first revision exists
         }
         # Dependency picker: seed the button label + the pending value from the row.
         self._edit_depends_pending = session.depends_on or ""
         self.query_one("#edit-depends", Button).label = self._dep_button_label(
             session.depends_on or ""
         )
-        # Read-only first AIM line + the `/aim (N):` label mirror the read-only view, so
-        # entering edit mode shows the same lines (only the editable ones gain a cursor).
+        # First AIM line + the `/aim (N):` label mirror the read-only view, so entering
+        # edit mode shows the same lines. `/aim (1)` is its own editable field: it rewrites
+        # revision 1 in place (see Store.set_first_aim) instead of setting the current AIM.
         revisions = store.list_aim_history(sid)
-        aim1 = self.query_one("#edit-aim1", Static)
+        aim1_row = self.query_one("#edit-aim1-row", Horizontal)
         if len(revisions) >= 2:
-            first = Text("/aim (1): ", style="white")
-            first.append(revisions[0].aim or "—", style=_GOLD)
-            aim1.update(first)
-            aim1.styles.display = "block"
+            self._edit_original["aim1"] = revisions[0].aim or ""
+            self.query_one("#edit-aim1", TextArea).text = self._edit_original["aim1"]
+            aim1_row.styles.display = "block"
             current_index = len(revisions)
         else:
-            aim1.styles.display = "none"
+            # Clear it too: a hidden field left holding the PREVIOUS session's first AIM
+            # would read as an edit against this session's blank original on commit.
+            self.query_one("#edit-aim1", TextArea).text = ""
+            aim1_row.styles.display = "none"
             current_index = 1
         self.query_one("#edit-aim-label", Label).update(f"/aim ({current_index}): ")
         self.query_one("#edit-aim", TextArea).text = self._edit_original["aim"]
@@ -4402,6 +4411,7 @@ class CommandCenterApp(App[None]):
             return
         original = self._edit_original
         aim = self.query_one("#edit-aim", TextArea).text
+        aim1 = self.query_one("#edit-aim1", TextArea).text
         next_step = self.query_one("#edit-next", Input).value
         deadline = self.query_one("#edit-deadline", Input).value
         progress = self.query_one("#edit-progress", Input).value
@@ -4414,6 +4424,17 @@ class CommandCenterApp(App[None]):
                 from .. import spawn  # pylint: disable=import-outside-toplevel
 
                 spawn.spawn_ccc(["score-aim", "--session", sid])
+        # The first AIM is rewritten in place (no new revision, current AIM untouched).
+        # Blanking it is refused rather than confirmed: an empty history row would erase
+        # where the goal started, and the current AIM above already covers "no AIM".
+        if aim1 != original.get("aim1", ""):
+            if aim1.strip():
+                store.set_first_aim(sid, aim1)
+            else:
+                self.notify(
+                    "The first AIM cannot be emptied — /aim (1) kept unchanged.",
+                    severity="warning",
+                )
         if next_step != original.get("next", ""):
             store.update_fields(sid, next_step=next_step, next_step_source="user")
         if deadline != original.get("deadline", ""):

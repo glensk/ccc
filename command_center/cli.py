@@ -250,10 +250,28 @@ def cmd_set_aim(args: argparse.Namespace) -> int:
     if not session_id:
         print("error: could not resolve a session (pass --session <id>)", file=sys.stderr)
         return 1
+    first = getattr(args, "first", False)
+    if first and not args.text.strip():
+        print(
+            "error: --first cannot empty the first AIM (pass the corrected text)", file=sys.stderr
+        )
+        return 1
     with Store() as store:
         store.ensure(session_id, cwd=os.getcwd())
-        changed = store.set_aim(session_id, args.text)  # clears stale auto checklist + offset
-    print(f"aim set for {session_id}")
+        if first:
+            # Rewrite `/aim (1)` in place — no new revision, the current AIM stays as is.
+            # Refreshing the score/label only makes sense when that revision IS the current
+            # AIM (a single revision); a historical row carries its own lexical score.
+            is_current = store.count_aim_history(session_id) <= 1
+            changed = store.set_first_aim(session_id, args.text)
+            if not changed:
+                print(f"first aim unchanged for {session_id}")
+                return 0
+            print(f"first aim rewritten for {session_id}")
+            changed = is_current
+        else:
+            changed = store.set_aim(session_id, args.text)  # clears stale auto checklist + offset
+            print(f"aim set for {session_id}")
     # On a real change, detached so we never block the caller: (a) refine the instant
     # lexical AIM score with a cheap LLM call, and (b) regenerate the short-AIM label
     # (cheap codex run — keeps the column scannable without spending Claude tokens).

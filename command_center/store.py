@@ -808,6 +808,61 @@ class Store:  # pylint: disable=too-many-public-methods
             self._record_aim_history(session_id, old, current, new)
         return True
 
+    def set_first_aim(self, session_id: str, aim: str) -> bool:
+        """Rewrite the FIRST recorded AIM (``/aim (1)``) **in place**; True if it changed.
+
+        Corrects how the *original* done-condition was stated — a typo, a wording the
+        first `/aim` never captured well — WITHOUT touching the current AIM and WITHOUT
+        appending a revision, so the running index (`(1)`, `(2)`, …) stays stable. This
+        is what the TUI's ``e`` form `/aim (1):` line and ``ccc set-aim --first`` write.
+
+        A blank *aim* is refused (history rows are never emptied). When the first
+        revision is ALSO the current one (a single recorded revision, or an AIM that
+        predates history tracking) the session's live AIM is rewritten too, so the two
+        can never disagree; the stale "is it done?" verdict is dropped in that case.
+        """
+        new = (aim or "").strip()
+        if not new:
+            return False
+        row = self.conn.execute(
+            "SELECT id, aim FROM aim_history WHERE session_id = ? ORDER BY created_at, id LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            # Pre-history session: the live AIM is the sole (unrecorded) revision — rewrite
+            # it in place, still as revision 1 (recording it here would invent a revision 2).
+            session = self.get(session_id)
+            if session is None or not (session.aim or "").strip():
+                return False  # nothing to adapt — there is no first AIM yet
+            if session.aim == new:
+                return False
+            self._mirror_first_aim_onto_session(session_id, new)
+            return True
+        if row["aim"] == new:
+            return False
+        self.conn.execute(
+            "UPDATE aim_history SET aim = ?, score = ?, short_aim = NULL WHERE id = ?",
+            (new, score_aim_lexical(new), row["id"]),
+        )
+        self.conn.commit()
+        if self.count_aim_history(session_id) == 1:
+            self._mirror_first_aim_onto_session(session_id, new)
+        return True
+
+    def _mirror_first_aim_onto_session(self, session_id: str, new: str) -> None:
+        """Copy a rewritten first AIM onto the session (it is also the current AIM)."""
+        self.update_fields(
+            session_id,
+            aim=new,
+            short_aim=None,  # the cheap label is stale → the generator backfills a fresh one
+            aim_score=score_aim_lexical(new),
+            aim_score_reason=None,
+            # Same reasoning as set_aim: never let a DONE verdict outlive the wording it judged.
+            aim_met=False,
+            aim_assessed_at=0,
+            aim_met_reason=None,
+        )
+
     def set_aim_met(self, session_id: str, met: bool, reason: str | None, assessed_at: int) -> None:
         """Record the impartial "is the AIM fulfilled?" verdict (latest wins).
 
