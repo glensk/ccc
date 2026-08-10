@@ -1664,6 +1664,44 @@ def test_tp_tw_switch_account_on_draft_and_guard_parked(
     assert parked is not None and accounts.same_config_dir(parked.config_dir, str(tmp_path))
 
 
+def test_model_column_glyph_is_identity_corrected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drifted login must not mislead the model column: the dir NAMED private holds the
+    WORK account here (hard-linked email), so its rows wear 💼 — the account they truly bill —
+    not the 🏠 the purely path-based marker used to paint (accounts.effective_home_markers)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    # The default account's identity file is $HOME/.claude.json (a sibling, not inside the dir).
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work = tmp_path / "work"
+    work.mkdir()
+    from command_center import config as _config
+
+    monkeypatch.setattr(_config, "claude_config_dirs", lambda: {"private": tmp_path, "work": work})
+    monkeypatch.setattr(_config, "claude_account_email_map", lambda: {"work": "work@example.com"})
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}}), encoding="utf-8"
+    )
+
+    draft_sid = "draft-drifted-account"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.create_draft(draft_sid, "/Users/x/repo", "Prepare draft")  # config_dir = the private dir
+    store.close()
+
+    from command_center.views.tui import _MODEL_COL, CommandCenterApp, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            cell = table.get_row_at(table.get_row_index(draft_sid))[_MODEL_COL]
+            assert isinstance(cell, Text)
+            assert "💼" in cell.plain and "🏠" not in cell.plain
+
+    asyncio.run(scenario())
+
+
 def test_tp_switches_parked_when_transcript_present(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

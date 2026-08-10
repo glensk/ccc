@@ -301,6 +301,67 @@ def test_home_marker_single_account_is_empty(monkeypatch: pytest.MonkeyPatch) ->
     assert accounts.home_marker("") == ""
 
 
+def test_effective_home_markers_correct_a_drifted_login(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The row markers are IDENTITY-corrected: the dir *named* private holding the WORK
+    login marks its rows 💼, so the TUI / `ccc ls` model column shows the account each row
+    truly bills — the path-based `home_marker` would show the drifted 🏠 instead."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work_dir = two_accounts["work"]
+    # Drift: the "private"-named (default) dir now holds the "work" identity, and vice-versa.
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    (work_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "private@example.com"}})
+    )
+    monkeypatch.setattr(
+        config,
+        "claude_account_email_map",
+        lambda: {"work": "work@example.com", "private": "private@example.com"},
+    )
+    markers = accounts.effective_home_markers(two_accounts)
+    assert markers[str(accounts._resolve(two_accounts["private"]))] == accounts._WORK_GLYPH
+    assert markers[str(accounts._resolve(work_dir))] == accounts._HOME_GLYPH
+    # The per-row lookup agrees — and differs from the path-based marker it replaces.
+    priv_row = str(two_accounts["private"])
+    assert accounts.home_marker_from(priv_row, markers) == accounts._WORK_GLYPH
+    assert accounts.home_marker(priv_row, two_accounts) == accounts._HOME_GLYPH  # the old bug
+
+
+def test_effective_home_markers_fall_back_to_path_labels_without_hard_link(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No hard link configured → nothing to correct, so the markers match `home_marker`."""
+    monkeypatch.setattr(config, "claude_account_email_map", lambda: {})
+    markers = accounts.effective_home_markers(two_accounts)
+    assert markers[str(accounts._resolve(two_accounts["private"]))] == accounts._HOME_GLYPH
+    assert markers[str(accounts._resolve(two_accounts["work"]))] == accounts._WORK_GLYPH
+
+
+def test_effective_home_markers_empty_in_single_account_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Single account → no map (and so no marker), matching `home_marker`'s own rule."""
+    monkeypatch.setattr(config, "claude_config_dirs", lambda: {"private": Path("/x/.claude")})
+    assert accounts.effective_home_markers() == {}
+    assert accounts.home_marker_from("/x/.claude", {}) == ""
+    assert accounts.home_marker_from("", {}) == ""
+
+
+def test_home_marker_from_blanks_unknown_and_unconfigured_rows(
+    two_accounts: dict[str, Path],
+) -> None:
+    """Multi-account: the UNKNOWN sentinel ("") and a third/unconfigured dir get blanks
+    of the glyph's width, so the model text stays column-aligned on those rows."""
+    markers = accounts.effective_home_markers(two_accounts)
+    blank = accounts.home_marker_from("", markers)
+    assert blank == accounts._NO_HOME
+    assert set(blank) == {" "}  # blanks only, no glyph
+    assert accounts.home_marker_from("/nowhere/.claude-third", markers) == accounts._NO_HOME
+
+
 def test_effective_account_label_passthrough_when_no_hard_link(
     two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

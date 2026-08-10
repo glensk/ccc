@@ -1911,6 +1911,9 @@ class CommandCenterApp(App[None]):
         self._rows: dict[str, Row] = {}
         # Account map cached per render tick (see _apply_rows) → the model column's home marker.
         self._account_dirs: dict[str, Path] = {}
+        # …and the identity-corrected marker map derived from it (resolved dir → 🏠/💼/blank).
+        # Empty until the first _apply_rows, which suppresses the marker (single-account rule).
+        self._account_markers: dict[str, str] = {}
         self._sep_seq = 0  # monotonic counter giving each header/separator row a unique key
         # Last time we spawned a detached `ccc claude-usage` warmer (monotonic seconds); an
         # in-process throttle so a failing OAuth fetch can't respawn on every render tick.
@@ -2106,6 +2109,10 @@ class CommandCenterApp(App[None]):
         # Resolve the account map once per render — drives the model column's home-icon
         # marker (see _add_session_row). One cheap read per tick, like the detail pane.
         self._account_dirs = config.claude_config_dirs()
+        # Identity-correct those markers ONCE per render, never per row: each account costs
+        # one .claude.json read, so a drifted login shows the TRUE billing glyph on every row
+        # (accounts.effective_home_markers) without re-reading it per session.
+        self._account_markers = accounts.effective_home_markers(self._account_dirs)
         self._rows = {r.session.session_id: r for r in rows}
         self._sep_seq = 0
         self._sep_category = {}
@@ -2536,8 +2543,10 @@ class CommandCenterApp(App[None]):
         else:
             sid = Text("  " + short_id(session.session_id), style=_DONE_STYLE if done else "grey50")
         # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
-        # only); every other row gets an equal-width blank so the model text stays aligned.
-        home = accounts.home_marker(session.config_dir or "", self._account_dirs)
+        # only); every other row gets an equal-width blank so the model text stays aligned. The
+        # marker map is identity-corrected per render, so a drifted login shows the account the
+        # row TRULY bills, not the one its config dir is named after.
+        home = accounts.home_marker_from(session.config_dir or "", self._account_markers)
         if session.draft:
             # Future job: it never ran, so show the CONFIGURED overseer ▸ executor model
             # pair (colour-coded, single name when they match) instead of an observed "—".

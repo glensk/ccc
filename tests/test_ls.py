@@ -50,23 +50,41 @@ def test_render_row_unscored_aim_not_red() -> None:
 
 _DEP = "abcd1234-1234-5678-9abc-def012345678"
 
+# What `render` now hands `_render_row`: the identity-corrected marker map
+# (accounts.effective_home_markers), i.e. resolved account dir → model-column glyph.
+_PRIV_DIR = "/home/u/.claude"
+_WORK_DIR = "/home/u/.claude-work"
+_MULTI_MARKERS = {
+    str(accounts._resolve(_PRIV_DIR)): accounts._HOME_GLYPH,
+    str(accounts._resolve(_WORK_DIR)): accounts._WORK_GLYPH,
+}
+
 
 def test_render_row_home_icon_marks_private_account() -> None:
     """Multi-account: a private-account row carries 🏠, a work-account row carries 💼."""
-    dirs = {"private": Path("/home/u/.claude"), "work": Path("/home/u/.claude-work")}
-    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
-    work = Session(session_id="w", cwd="/repo", aim="x", config_dir="/home/u/.claude-work")
-    line_priv = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
-    line_work = ls_view._render_row(Row(work, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
+    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir=_PRIV_DIR)
+    work = Session(session_id="w", cwd="/repo", aim="x", config_dir=_WORK_DIR)
+    row_args = (True, 2, 50, _MULTI_MARKERS)
+    line_priv = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), *row_args)[0]
+    line_work = ls_view._render_row(Row(work, None, Status.PARKED, 0, 0), *row_args)[0]
     assert accounts._HOME_GLYPH in line_priv and "💼" not in line_priv
     assert accounts._WORK_GLYPH in line_work and "🏠" not in line_work
 
 
+def test_render_row_home_icon_follows_the_corrected_identity() -> None:
+    """A drifted login (the private-*named* dir actually holding the work account) renders
+    the TRUE billing glyph — the markers are identity-corrected before they reach a row."""
+    drifted = {str(accounts._resolve(_PRIV_DIR)): accounts._WORK_GLYPH}
+    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir=_PRIV_DIR)
+    line = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, drifted)[0]
+    assert accounts._WORK_GLYPH in line and "🏠" not in line
+
+
 def test_render_row_no_home_icon_in_single_account() -> None:
-    """Single account: no marker at all (it would sit on every row and mean nothing)."""
-    dirs = {"private": Path("/home/u/.claude")}
-    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
-    line = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, dirs)[0]
+    """Single account: no marker at all (it would sit on every row and mean nothing) —
+    `effective_home_markers` returns {} there, which `home_marker_from` renders as ""."""
+    priv = Session(session_id="p", cwd="/repo", aim="x", config_dir=_PRIV_DIR)
+    line = ls_view._render_row(Row(priv, None, Status.PARKED, 0, 0), True, 2, 50, {})[0]
     assert "🏠" not in line
 
 
@@ -230,9 +248,6 @@ def test_render_row_draft_shows_models_readout() -> None:
     assert "▸" not in mixed[1]
 
 
-_MULTI = {"private": Path("/home/u/.claude"), "work": Path("/home/u/.claude-work")}
-
-
 class _FakeAdapter:
     """Adapter stub exposing only ``transcript_path`` (the probed capability)."""
 
@@ -274,7 +289,7 @@ def test_render_row_cache_countdown_before_home_glyph(
         True,
         2,
         50,
-        _MULTI,
+        _MULTI_MARKERS,
         cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
     )[0]
     assert "♨" in line
@@ -290,7 +305,7 @@ def test_render_row_cache_countdown_absent_without_transcript() -> None:
         True,
         2,
         50,
-        _MULTI,
+        _MULTI_MARKERS,
         cast(Adapter, _FakeAdapter(None)),
     )[0]
     assert "♨" not in line
@@ -307,7 +322,7 @@ def test_render_row_cache_countdown_skipped_on_draft(tmp_path: Path) -> None:
         True,
         2,
         50,
-        _MULTI,
+        _MULTI_MARKERS,
         cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
     )[0]
     assert "♨" not in line
@@ -321,7 +336,7 @@ def test_render_row_cache_countdown_skipped_on_done(tmp_path: Path) -> None:
         True,
         2,
         50,
-        _MULTI,
+        _MULTI_MARKERS,
         cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
     )[0]
     assert "♨" not in line

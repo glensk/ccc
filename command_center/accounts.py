@@ -263,6 +263,10 @@ def home_marker(config_dir: str, dirs: dict[str, Path] | None = None) -> str:
     aligned), and ``""`` in single-account mode (the mark would be on every row and so
     carries no signal). *dirs* is the already-parsed account map — pass it to avoid a
     config read per row.
+
+    Purely PATH-based: row-rendering callers should use the identity-corrected pair
+    :func:`effective_home_markers` + :func:`home_marker_from` instead, which survive a
+    drifted login (see :func:`resolve_card_label`).
     """
     dirs = config.claude_config_dirs() if dirs is None else dirs
     if len(dirs) <= 1:  # single account → the mark would be on every row → drop it
@@ -272,6 +276,54 @@ def home_marker(config_dir: str, dirs: dict[str, Path] | None = None) -> str:
     if is_work_account(config_dir, dirs):
         return _WORK_GLYPH
     return _NO_HOME
+
+
+def effective_home_markers(dirs: dict[str, Path] | None = None) -> dict[str, str]:
+    """Resolved account-dir path → that dir's IDENTITY-CORRECTED model-column marker.
+
+    :func:`home_marker` decides purely by PATH, so after the drift
+    :func:`resolve_card_label` guards against (a bare ``/login`` in the wrong shell
+    silently swaps which account a config dir holds) every row of that dir claims the
+    wrong account — a session that actually bills ``work`` still shows 🏠 because it ran
+    under the dir *named* private. This is the row-rendering counterpart of the
+    statusline's :func:`current_account_glyph`: it asks each configured dir who is
+    CURRENTLY logged into it (:func:`effective_account_label`) and maps its resolved path
+    to the glyph of the account it TRULY bills.
+
+    Build the map ONCE per render / listing and look each row up with
+    :func:`home_marker_from` — every entry costs one ``.claude.json`` read, which a
+    per-row call would repeat for every session. Returns ``{}`` in single-account mode
+    (``len(dirs) <= 1``), the same "the mark would be on every row ⇒ no signal" rule
+    :func:`home_marker` follows, which :func:`home_marker_from` renders as no marker at
+    all. *dirs* is the already-parsed account map; ``None`` reads the config.
+    """
+    dirs = config.claude_config_dirs() if dirs is None else dirs
+    if len(dirs) <= 1:  # single account → the mark would be on every row → drop it
+        return {}
+    markers: dict[str, str] = {}
+    for path in dirs.values():
+        label = effective_account_label(str(path))
+        markers[str(_resolve(path))] = {"private": _HOME_GLYPH, "work": _WORK_GLYPH}.get(
+            label, _NO_HOME
+        )
+    return markers
+
+
+def home_marker_from(config_dir: str, markers: dict[str, str]) -> str:
+    """One row's model-column marker, looked up in a precomputed *markers* map.
+
+    The per-row half of :func:`effective_home_markers` — a plain dict lookup, so the
+    identity resolution is paid once per render instead of once per row. Returns ``""``
+    when *markers* is empty (single-account mode ⇒ no marker at all) and the equal-width
+    blank for the multi-account UNKNOWN sentinel (``config_dir == ""``: an id live under
+    two accounts, or never observed) or a dir no configured account claims — so the model
+    text stays column-aligned on those rows.
+    """
+    if not markers:  # single account (or nothing configured) → no marker at all
+        return ""
+    if not config_dir:  # multi-account UNKNOWN → blanks only, keeping the column aligned
+        return _NO_HOME
+    return markers.get(str(_resolve(config_dir)), _NO_HOME)
 
 
 def _export_value(config_dir: str) -> str:

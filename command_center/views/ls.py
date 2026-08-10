@@ -110,7 +110,7 @@ def _render_row(
     enabled: bool,
     warn_days: int,
     aim_threshold: int,
-    account_dirs: dict[str, Path] | None = None,
+    account_markers: dict[str, str] | None = None,
     adapter: Adapter | None = None,
     resume_armed_ids: frozenset[str] = frozenset(),
 ) -> list[str]:
@@ -200,8 +200,13 @@ def _render_row(
         else model_effort_cell(session.model, session.effort)
     )
     # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
-    # only); other rows get an equal-width blank so the model text stays aligned.
-    home = accounts.home_marker(session.config_dir or "", account_dirs)
+    # only); other rows get an equal-width blank so the model text stays aligned. *account_markers*
+    # is the identity-corrected map `render` resolves once per listing (a drifted login shows the
+    # account the row TRULY bills); None re-resolves it here, for direct/one-off callers.
+    home = accounts.home_marker_from(
+        session.config_dir or "",
+        accounts.effective_home_markers() if account_markers is None else account_markers,
+    )
     # Prompt-cache TTL countdown, prepended BEFORE the account glyph: how long this
     # session's Anthropic prompt cache stays warm (transcript mtime + TTL). Skipped on
     # drafts (never ran) and done rows, mirroring the statusline's ♨/❄ readout (cachettl).
@@ -276,7 +281,10 @@ def render(
     enabled = _color_enabled()
     if not rows:
         return _paint(_DIM, "No Claude Code sessions tracked yet.", enabled)
-    account_dirs = config.claude_config_dirs()  # resolved once; drives the home-icon marker
+    # Resolved once per listing; drives the home-icon marker. Identity-corrected, so a drifted
+    # login marks each row with the account it TRULY bills — one .claude.json read per configured
+    # account here, never one per row (see accounts.effective_home_markers).
+    account_markers = accounts.effective_home_markers()
     # Which halted rows will auto-revive on their account's reset (green ▶ after the red ||).
     # Evaluated ONLY for halted rows — it stats a transcript — and the config is read once.
     armed: set[str] = set()
@@ -293,7 +301,7 @@ def render(
         counts[row.status] = counts.get(row.status, 0) + 1
         out.extend(
             _render_row(
-                row, enabled, warn_days, aim_threshold, account_dirs, adapter, resume_armed_ids
+                row, enabled, warn_days, aim_threshold, account_markers, adapter, resume_armed_ids
             )
         )
     summary = "  ".join(

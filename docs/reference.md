@@ -1344,7 +1344,13 @@ filenames); malformed entries are skipped.
   `CLAUDE_CONFIG_DIR`, corrected by the identity hard-link
   (`accounts.effective_account_label`) when `claude_account_emails` is configured, so
   the badge survives a drifted login rather than just trusting the path. Falls back
-  to a plain path check when `ccc` is unavailable. Keep the glyphs in sync with
+  to a plain path check when `ccc` is unavailable. The **row** markers are corrected the
+  same way: each render/listing resolves every configured dir's current identity once
+  (`accounts.effective_home_markers`, then a per-row `accounts.home_marker_from` lookup —
+  one `.claude.json` read per account, never per session), so a drifted login shows the
+  account each row TRULY bills instead of the one its config dir happens to be named
+  after. Without a hard link configured (or with an unreadable identity) both surfaces
+  degrade to exactly the old path-based marker. Keep the glyphs in sync with
   `accounts._HOME_GLYPH` / `_WORK_GLYPH` (public accessor: `accounts.card_glyph`).
   The glyph only shows in multi-account mode (with one account it would sit on every
   row and mean nothing). To change a row's account fast, without opening the `e` form: highlight it
