@@ -195,7 +195,12 @@ def resolve_card_label(card_label: str) -> str | None:
 
     * *card_label* itself, unchanged, when no hard link is configured for it —
       today's pure path-based behaviour, fully backward compatible.
-    * the label whose live identity matches the hard link.
+    * the label whose live identity matches the hard link. When SEVERAL dirs hold
+      that identity at once (an accidental ``/login`` duplicated one account into
+      another dir), the card's OWN dir wins the tie: the duplicate is the drifted
+      copy, and first-match-in-config-order once bound the work card to the private
+      dir's cache — whose OAuth fetch was in 429 backoff — showing a stale Fable
+      figure while the work dir's own cache was fresh.
     * ``None`` when a hard link IS configured but no configured account currently
       matches it (logged out, or the seat lapsed) — callers must render this as "no
       data", never fall back to a path-based guess that could be wrong again.
@@ -203,10 +208,14 @@ def resolve_card_label(card_label: str) -> str | None:
     expected = config.claude_account_email_map().get(card_label)
     if not expected:
         return card_label
-    for label, path in config.claude_config_dirs().items():
-        if account_email(str(path)) == expected:
-            return label
-    return None
+    matches = [
+        label
+        for label, path in config.claude_config_dirs().items()
+        if account_email(str(path)) == expected
+    ]
+    if not matches:
+        return None
+    return card_label if card_label in matches else matches[0]
 
 
 def account_config_dir(label: str) -> str:

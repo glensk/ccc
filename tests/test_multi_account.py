@@ -950,6 +950,34 @@ def test_resolve_card_label_follows_identity_across_a_drifted_swap(
     assert accounts.resolve_card_label("private") == "work"
 
 
+def test_resolve_card_label_prefers_own_dir_when_identity_is_duplicated(
+    two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An accidental ``/login`` can DUPLICATE one identity into both dirs (not swap
+    them). The card must then bind to its OWN dir — the duplicate is the drifted copy;
+    first-match-in-config-order once bound the work card to the private dir's cache,
+    whose OAuth fetch was in 429 backoff, freezing the Fable figure at a stale value
+    while the work dir's own cache was fresh."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    work_dir = two_accounts["work"]
+    # Both dirs hold the WORK identity ("private" is listed first in the account map).
+    (tmp_path / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    (work_dir / ".claude.json").write_text(
+        json.dumps({"oauthAccount": {"emailAddress": "work@example.com"}})
+    )
+    monkeypatch.setattr(
+        config,
+        "claude_account_email_map",
+        lambda: {"work": "work@example.com", "private": "private@example.com"},
+    )
+    # The work card reads the work dir's own cache, not the drifted private copy…
+    assert accounts.resolve_card_label("work") == "work"
+    # …and the private card has no matching login anywhere → no data, never a guess.
+    assert accounts.resolve_card_label("private") is None
+
+
 def test_resolve_card_label_none_when_hard_link_has_no_current_match(
     two_accounts: dict[str, Path], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
