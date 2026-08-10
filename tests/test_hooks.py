@@ -162,6 +162,37 @@ def test_iterm_session_captured(home: Path, monkeypatch: pytest.MonkeyPatch) -> 
     assert got.iterm_session_id == "w0t1p0:ABC-123"
 
 
+def test_iterm_session_self_heals_on_any_hook_event(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A row that missed its SessionStart stamp (transient store error, or first created
+    by another handler) is re-stamped by the NEXT hook event — set-once used to leave it
+    permanently un-locatable (f+j could neither highlight nor focus the session)."""
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
+    got = Store().get("s1")
+    assert got is not None and got.iterm_session_id is None
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t8p0:HEAL-456")
+    hooks.handle_post_tool_use({"session_id": "s1", "cwd": "/repo"})
+    got = Store().get("s1")
+    assert got is not None
+    assert got.iterm_session_id == "w0t8p0:HEAL-456"
+
+
+def test_iterm_session_not_cleared_when_env_absent(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A headless/daemon-context hook run (no $ITERM_SESSION_ID) must never CLEAR a
+    previously stamped tab id — absent env means "unknown here", not "no tab"."""
+    monkeypatch.setenv("ITERM_SESSION_ID", "w0t1p0:KEEP-789")
+    hooks.handle_session_start({"session_id": "s1", "cwd": "/repo"})
+    monkeypatch.delenv("ITERM_SESSION_ID", raising=False)
+    hooks.handle_post_tool_use({"session_id": "s1", "cwd": "/repo"})
+    got = Store().get("s1")
+    assert got is not None
+    assert got.iterm_session_id == "w0t1p0:KEEP-789"
+
+
 def test_post_tool_use_captures_payload_todos(home: Path) -> None:
     from command_center.models import loads_todos  # pylint: disable=import-outside-toplevel
 

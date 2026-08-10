@@ -198,6 +198,18 @@ def ensure_current_session(store: Store, sid: str, cwd: str) -> tuple[Session, s
     if current and current != (session.config_dir or ""):
         store.update_fields(sid, config_dir=current)
         session = store.get(sid) or session
+    # Track the CURRENT iTerm tab on EVERY hook event, not only SessionStart: the
+    # stamp used to be SessionStart-only, so one missed start (a transient store
+    # error mid-hook, or the row first created by another handler) left the session
+    # permanently un-locatable — ``f+j`` could neither highlight its row nor focus
+    # its tab ("Session is live but its tab can't be located"), and the TUI folder
+    # badge fell back to the per-repo symbol while the tab showed its claimed one.
+    # Re-stamping here self-heals within one hook event and also follows a session
+    # that lands in a new tab. An absent env var (headless/daemon) never clears.
+    iterm = os.environ.get("ITERM_SESSION_ID")
+    if iterm and iterm != (session.iterm_session_id or ""):
+        store.update_fields(sid, iterm_session_id=iterm)
+        session = store.get(sid) or session
     return session, warning
 
 
@@ -304,13 +316,9 @@ def handle_session_start(payload: dict[str, Any]) -> int:
         return 0
     with Store() as store:
         session, switch_warning = ensure_current_session(store, sid, payload.get("cwd", ""))
-        # Capture the iTerm tab id (inherited in the hook's env) so the TUI can
-        # focus the live tab instead of resuming. Cheap, set-once.
-        # Always track the CURRENT tab id (a resume lands the session in a new tab),
-        # so the TUI can focus the live tab instead of trying to re-resume it.
+        # The iTerm tab id itself is stamped inside ensure_current_session (every
+        # hook event, self-healing) — here we only need the env value for the badge.
         iterm = os.environ.get("ITERM_SESSION_ID")
-        if iterm and iterm != session.iterm_session_id:
-            store.update_fields(sid, iterm_session_id=iterm)
         # Seed this tab's distinctness badge into its title now, so a freshly-launched
         # (or resumed) session's tab shows the same emoji as its command-center row
         # without waiting for the next `cd` (zsh hook) or daemon pass. Marker-preserving
