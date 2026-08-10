@@ -236,6 +236,73 @@ def test_loaded_from_disk_never_serialized(tmp_path: Path, monkeypatch: pytest.M
     assert "loaded_from_disk" not in config.DEFAULTS
 
 
+def test_quoted_string_value_round_trips(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A string value carrying inner double quotes must stay valid TOML.
+
+    Regression for the real bricking: ``llm_custom_command`` (the routing hatch) holds a
+    shell command with quoted ``${VAR:+-p "$VAR"}`` expansions. Serialized with a naive
+    f-string the inner ``"`` closed the basic string early, ``tomllib`` refused the file,
+    ``load_config`` fell back to pure DEFAULTS and every opt-in feature silently died.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    command = (
+        'ai.py prompt -i -R judge ${CCC_LLM_PURPOSE:+-p "$CCC_LLM_PURPOSE"} '
+        '${CCC_LLM_NOTE:+-N "$CCC_LLM_NOTE"}'
+    )
+    cfg = config.load_config()
+    cfg.llm_custom_command = command
+    config.save_config(cfg)
+
+    # (a) the raw file is parsable TOML at all, and (b) holds the exact string.
+    with config.config_path().open("rb") as handle:
+        written = tomllib.load(handle)
+    assert written["llm_custom_command"] == command
+
+    # (c) the loaded Config is the real thing, not the fail-closed defaults fallback.
+    reloaded = config.load_config()
+    assert reloaded.llm_custom_command == command
+    assert reloaded.loaded_from_disk is True
+
+
+def test_backslash_and_control_chars_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backslashes, newlines and tabs are escaped, not emitted raw."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    gnarly = 'C:\\path\\to\\x\nsecond "line"\tafter tab'
+    cfg = config.load_config()
+    cfg.resume_continue_script = gnarly
+    config.save_config(cfg)
+
+    with config.config_path().open("rb") as handle:
+        written = tomllib.load(handle)
+    assert written["resume_continue_script"] == gnarly
+    reloaded = config.load_config()
+    assert reloaded.resume_continue_script == gnarly
+    assert reloaded.loaded_from_disk is True
+
+
+def test_quoted_list_and_dict_entries_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """List items and dict keys/values are escaped too, not just scalar strings."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    quoted_item = 'work=~/.claude-"work"'
+    cfg = config.load_config()
+    cfg.claude_accounts = [quoted_item, "private=~/.claude"]
+    cfg.category_colors = {'odd"cat': '#123456 "x"'}
+    config.save_config(cfg)
+
+    with config.config_path().open("rb") as handle:
+        written = tomllib.load(handle)
+    assert written["claude_accounts"] == [quoted_item, "private=~/.claude"]
+    assert written["category_colors"] == {'odd"cat': '#123456 "x"'}
+    reloaded = config.load_config()
+    assert reloaded.claude_accounts == [quoted_item, "private=~/.claude"]
+    assert reloaded.category_colors == {'odd"cat': '#123456 "x"'}
+    assert reloaded.loaded_from_disk is True
+
+
 def test_short_folder(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HOME", "/home/tester")
     root = "/home/tester/repo-root"

@@ -456,6 +456,39 @@ def load_config() -> Config:
     return cfg
 
 
+# The escapes TOML requires inside a basic ("…") string, per the spec.
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_str(value: str) -> str:
+    """Render *value* as a valid TOML basic string, escaping quotes/backslashes/controls.
+
+    Every string ``save_config`` emits must go through here. Naive ``f'"{value}"'``
+    interpolation once bricked a real config: an ``llm_custom_command`` containing an
+    inner ``"`` (``... ${CCC_LLM_PURPOSE:+-p "$CCC_LLM_PURPOSE"} ...``) terminated the
+    basic string early, so ``tomllib`` raised ``TOMLDecodeError``, ``load_config`` fell
+    back to pure DEFAULTS and the whole multi-account feature set silently switched off.
+    """
+    out: list[str] = []
+    for ch in value:
+        esc = _TOML_ESCAPES.get(ch)
+        if esc is not None:
+            out.append(esc)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
     """Write the config back to the TOML file (flat key = value).
 
@@ -472,6 +505,10 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
     concurrent reader never observes a truncated/empty file. There is no lock —
     concurrent whole-file saves are last-wins; the atomicity only guarantees no partial
     read.
+
+    Every emitted string — scalar, list item, dict key AND dict value — goes through
+    :func:`_toml_str`, so a value carrying a quote or backslash stays parsable TOML
+    instead of poisoning the file into the fail-closed path above.
     """
     path = config_path()
     if path.exists() and cfg.loaded_from_disk is False:
@@ -490,16 +527,18 @@ def save_config(cfg: Config) -> None:  # pylint: disable=too-many-branches
         elif isinstance(value, float):
             lines.append(f"{key} = {value}")
         elif isinstance(value, list):
-            items = ", ".join(f'"{item}"' for item in value)
+            items = ", ".join(_toml_str(str(item)) for item in value)
             lines.append(f"{key} = [{items}]")
         elif isinstance(value, dict):
             if value:
-                items = ", ".join(f'"{k}" = "{v}"' for k, v in value.items())
+                items = ", ".join(
+                    f"{_toml_str(str(k))} = {_toml_str(str(v))}" for k, v in value.items()
+                )
                 lines.append(f"{key} = {{ {items} }}")
             else:
                 lines.append(f"{key} = {{}}")
         else:
-            lines.append(f'{key} = "{value}"')
+            lines.append(f"{key} = {_toml_str(str(value))}")
     text = "\n".join(lines) + "\n"
 
     # One-deep backup: preserve the prior content before an overwrite that changes it.
