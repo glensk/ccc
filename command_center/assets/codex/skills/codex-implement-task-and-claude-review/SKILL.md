@@ -135,7 +135,10 @@ diff and ask how to proceed.
 - In `--write` mode, review **only Codex's** changes (the helper prints a `### CODEX-WROTE` file list).
 - Never `git commit`/push from inside the loop (the helper sets `AI_NO_AUTOCOMMIT=1`); the normal
   end-of-turn workflow commits.
-- Model/effort: `codex-in-claude set-model <slug> --for delegate-review`,
-  `codex-in-claude set-effort <low|medium|high|xhigh>`, `codex-in-claude models`.
+- Model/effort: `codex-in-claude pick` (interactive), or
+  `codex-in-claude set-model <slug> --for delegate-review`,
+  `codex-in-claude set-effort <low|medium|high|xhigh>`, `codex-in-claude models`. The installer
+  stamps the resolved model into this file's `description:` as a `[codex …]` marker
+  (`codex-in-claude sync-skills` re-stamps it) — don't hand-edit that marker.
   (`delegate-review` is this command's short config key.)
 - Kill switch: honor a user request to skip; `CCC_NO_CODEX=1` disables the codex automation.

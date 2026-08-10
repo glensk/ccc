@@ -106,6 +106,36 @@ def test_build_plan_covers_expected_targets(_claude_home: Path) -> None:
     assert len(plan) == len(install_commands.CORE_COMMANDS) + len(install_commands.CORE_SKILLS) + 2
 
 
+def test_codex_items_carry_the_model_marker(
+    _claude_home: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The installed codex command/skill name the model, so /codex… help never goes stale.
+
+    The shipped assets stay marker-free; the marker is stamped at plan time from the shared
+    codex-in-claude config (pointed at a tmp file here).
+    """
+    cfg = tmp_path / "codex-cfg.json"
+    cfg.write_text('{"default": "gpt-5.6-sol", "effort": "xhigh"}', encoding="utf-8")
+    monkeypatch.setenv("CODEX_IN_CLAUDE_CONFIG", str(cfg))
+    plan = install_commands.build_plan(_claude_home, codex=True)
+    for label in (
+        "commands/codex-implement-task-and-claude-review.md",
+        "skills/codex-implement-task-and-claude-review/SKILL.md",
+    ):
+        item = next(i for i in plan if i.label == label)
+        marker = "[codex gpt-5.6-sol effort=xhigh]"
+        assert marker in item.content
+        # exactly one *stamped* marker, in the frontmatter (the body may mention the syntax)
+        frontmatter = item.content.split("---")[1]
+        assert frontmatter.count("[codex ") == 1
+        assert marker in frontmatter
+    # the asset itself stays marker-free — only the installed copy is stamped
+    asset = install_commands._read_asset(
+        "codex", "commands", "codex-implement-task-and-claude-review.md"
+    )
+    assert "[codex " not in asset.split("---")[1]
+
+
 def test_default_plan_ships_the_core_skill(_claude_home: Path) -> None:
     """`build_plan(codex=False)` already carries the ccc-mark-done-and-close skill item."""
     plan = install_commands.build_plan(_claude_home, codex=False)

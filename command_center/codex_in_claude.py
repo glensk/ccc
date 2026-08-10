@@ -9,6 +9,9 @@ command (``/codex-implement-task-and-claude-review`` and ``/codex-debate``):
 * ``models``      — list the Codex models available on this login.
 * ``get-model``   — print the model resolved for a given command.
 * ``set-model``   — set the model for a command (or the global default).
+* ``pick``        — interactive numbered picker for the model (terminal only).
+* ``sync-skills`` — stamp the resolved model into the ``description:`` frontmatter of the
+                    codex skills/commands, so Claude Code's ``/codex…`` help shows it.
 * ``delegate``    — run ONE Codex round, **printing the model as the first stdout line**,
                     then Codex's reply. Used by the codex-implement-task-and-claude-review skill.
 * ``usage``       — print the current Codex rate-limit usage (5h + weekly windows).
@@ -20,9 +23,13 @@ Model source: ``codex debug models`` (``--refresh``), else the offline cache
 Config (JSON, atomic writes)::
 
     ~/.config/codex-in-claude/config.json        # override via $CODEX_IN_CLAUDE_CONFIG
-    {"default": "gpt-5.5", "delegate-review": null, "debate": null}
+    {"default": "gpt-5.6-sol", "delegate-review": null, "debate": null}
 
-Resolution order for a command: per-command value -> ``default`` -> ``gpt-5.5``.
+Resolution order for a command: per-command value -> ``default`` -> ``gpt-5.6-sol``.
+
+``set-model`` / ``set-effort`` / ``pick`` also re-stamp the ``[codex <model> effort=<e>]``
+marker into the codex skill/command descriptions (see ``sync-skills``), so the model in
+Claude Code's slash-command help never drifts from the config.
 
 ``delegate`` exit codes (the skill branches on these):
   0 ok | 2 usage | 3 invalid-model | 4 codex-missing-or-auth | 5 timeout |
@@ -45,6 +52,7 @@ import contextlib
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -54,7 +62,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import TextIO
 
-DEFAULT_MODEL = "gpt-5.5"  # newest/best per the Codex catalog
+DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
 EFFORTS = ("low", "medium", "high", "xhigh")  # codex reasoning levels (API-validated)
 CODEX_CACHE = Path.home() / ".codex" / "models_cache.json"
@@ -148,6 +156,130 @@ def resolve_effort() -> str | None:
 
 
 # --------------------------------------------------------------------------- #
+# Description markers — make the active model visible in Claude Code's help
+#
+# Claude Code renders the one-line help for `/codex-debate` and
+# `/codex-implement-task-and-claude-review` from the `description:` YAML frontmatter of
+# their skill/command markdown, and that text is STATIC (read at session start). So the
+# model is surfaced by stamping a leading `[codex <model> effort=<e>]` marker into those
+# descriptions whenever the config changes — a prefix, so it survives the terminal's
+# right-truncation of long descriptions.
+# --------------------------------------------------------------------------- #
+MARKER_RE = re.compile(r"^\[codex\s+[^\]]*\]\s*")
+_BLOCK_SCALARS = (">", ">-", ">+", "|", "|-", "|+")
+
+
+def claude_home() -> Path:
+    """Claude Code's config dir ($CLAUDE_CONFIG_DIR override, else ~/.claude)."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(env).expanduser() if env else Path.home() / ".claude"
+
+
+def marker_surfaces() -> list[tuple[str, Path]]:
+    """(config key, markdown file) pairs whose ``description:`` carries the model marker.
+
+    Skill files and command files both count: a command file shadows a same-named skill in
+    the slash-command listing, so whichever exists must stay in sync. Missing paths are
+    reported, never an error — not every surface exists on every machine.
+    """
+    home = claude_home()
+    return [
+        ("debate", home / "skills" / "codex-debate" / "SKILL.md"),
+        (
+            "delegate-review",
+            home / "skills" / "codex-implement-task-and-claude-review" / "SKILL.md",
+        ),
+        ("debate", home / "commands" / "codex-debate.md"),
+        ("delegate-review", home / "commands" / "codex-implement-task-and-claude-review.md"),
+        ("", home / "commands" / "codex-model.md"),  # "" = the global default model
+    ]
+
+
+def marker_for(key: str) -> str:
+    """The ``[codex <model> effort=<e>]`` marker for config *key* (``debate`` / …)."""
+    model = resolve_model(key)
+    effort = resolve_effort() or effort_of(model)
+    return f"[codex {model} effort={effort}]" if effort != "?" else f"[codex {model}]"
+
+
+def _yaml_dq(value: str) -> str:
+    """Double-quote *value* as a YAML scalar (escaping ``\\`` and ``"``).
+
+    Needed because the marker starts with ``[``, which YAML would read as a flow sequence
+    at the head of a plain scalar. Block scalars are literal text and need no quoting.
+    """
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def inject_marker(text: str, marker: str) -> str:
+    """Return *text* with its frontmatter ``description:`` prefixed by *marker*.
+
+    Idempotent: an existing marker is replaced, never stacked. Raises ``ValueError`` when
+    the file has no usable frontmatter description.
+    """
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        raise ValueError("no YAML frontmatter")
+    end = next((i for i, ln in enumerate(lines[1:], 1) if ln.strip() == "---"), None)
+    if end is None:
+        raise ValueError("unterminated YAML frontmatter")
+    idx = next((i for i in range(1, end) if lines[i].startswith("description:")), None)
+    if idx is None:
+        raise ValueError("no description: key in frontmatter")
+
+    value = lines[idx].partition(":")[2].strip()
+    if value in _BLOCK_SCALARS:
+        # Folded/literal block: stamp the first non-blank continuation line.
+        body = next((i for i in range(idx + 1, end) if lines[i].strip()), None)
+        if body is None:
+            raise ValueError("empty block description")
+        indent = lines[body][: len(lines[body]) - len(lines[body].lstrip())]
+        content = MARKER_RE.sub("", lines[body].strip(), count=1)
+        lines[body] = f"{indent}{marker} {content}\n"
+    else:
+        quote = value[0] if value[:1] in ("'", '"') else ""
+        inner = value[1:-1] if quote and value.endswith(quote) and len(value) > 1 else value
+        if quote == '"':  # undo YAML escaping before re-quoting
+            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        elif quote == "'":
+            inner = inner.replace("''", "'")
+        inner = MARKER_RE.sub("", inner, count=1)
+        lines[idx] = f"description: {_yaml_dq(f'{marker} {inner}')}\n"
+    return "".join(lines)
+
+
+def sync_markers() -> list[tuple[str, Path, str]]:
+    """Stamp the current model marker into every surface; returns (status, path, detail).
+
+    Status is ``updated`` / ``ok`` (already current) / ``missing`` / ``error``. Files are
+    rewritten **in place** (truncate + write, never temp+rename): a dotfiles setup often
+    hard-links these paths to a tracked working copy, and an atomic replace would break the
+    link and silently fork the two copies.
+    """
+    out: list[tuple[str, Path, str]] = []
+    for key, path in marker_surfaces():
+        if not path.exists():
+            out.append(("missing", path, ""))
+            continue
+        try:
+            old = path.read_text(encoding="utf-8")
+            new = inject_marker(old, marker_for(key))
+        except (OSError, ValueError) as exc:
+            out.append(("error", path, str(exc)))
+            continue
+        if new == old:
+            out.append(("ok", path, key))
+            continue
+        try:
+            path.write_text(new, encoding="utf-8")
+        except OSError as exc:
+            out.append(("error", path, str(exc)))
+            continue
+        out.append(("updated", path, key))
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Model catalog
 # --------------------------------------------------------------------------- #
 def _parse_models(blob: str) -> list[dict]:
@@ -231,6 +363,7 @@ def cmd_models(args: argparse.Namespace) -> int:
         print(f"    {cmd:<16} -> {resolve_model(cmd)}")
     print(f"    {'effort':<16} -> {resolve_effort() or 'default (each model own)'}")
     print(f"\nconfig: {local_link(config_path())}")
+    print("change: codex-in-claude.py pick   |   set-model <slug> [--for debate|delegate-review]")
     return EX_OK
 
 
@@ -238,6 +371,96 @@ def cmd_get_model(args: argparse.Namespace) -> int:
     """Print the resolved model for a command (or the global default)."""
     print(resolve_model(args.for_command))
     return EX_OK
+
+
+def _report_sync(rows: list[tuple[str, Path, str]], *, verbose: bool = False) -> None:
+    """Print a one-line-per-surface summary of a marker sync (quiet unless interesting)."""
+    icon = {"updated": "✅", "ok": "•", "missing": "–", "error": "❌"}
+    for status, path, detail in rows:
+        if status == "ok" and not verbose:
+            continue
+        if status == "missing" and not verbose:
+            continue
+        suffix = f"  ({detail})" if detail and status == "error" else ""
+        print(f"  {icon.get(status, '?')} {status:<8} {path}{suffix}")
+
+
+def cmd_sync_skills(args: argparse.Namespace) -> int:
+    """Stamp the resolved model into the codex skill/command descriptions."""
+    if args.check:
+        stale: list[Path] = []
+        bad: list[tuple[Path, str]] = []
+        for key, path in marker_surfaces():
+            if not path.exists():
+                continue
+            try:
+                old = path.read_text(encoding="utf-8")
+                if inject_marker(old, marker_for(key)) != old:
+                    stale.append(path)
+            except (OSError, ValueError) as exc:
+                bad.append((path, str(exc)))
+        for path, why in bad:
+            print(f"  ❌ error    {path}  ({why})", file=sys.stderr)
+        for path in stale:
+            print(f"  ⚠️  stale    {path}")
+        if bad:
+            return EX_USAGE
+        if stale:
+            print("\nrun: codex-in-claude.py sync-skills")
+            return 1
+        print("all codex skill/command descriptions are current")
+        return EX_OK
+
+    rows = sync_markers()
+    _report_sync(rows, verbose=True)
+    if any(status == "error" for status, _, _ in rows):
+        return EX_USAGE
+    if any(status == "updated" for status, _, _ in rows):
+        print("\nNote: Claude Code reads these descriptions at session start —")
+        print("      the new model shows in `/codex…` help in the NEXT session.")
+    return EX_OK
+
+
+def cmd_pick(args: argparse.Namespace) -> int:
+    """Interactive numbered model picker (terminal only), then set + sync."""
+    models = list_models(refresh=args.refresh, include_hidden=False)
+    if not models:
+        print(
+            "No models found (cache empty and/or `codex debug models` unavailable).\n"
+            "Try: codex-in-claude.py models --refresh",
+            file=sys.stderr,
+        )
+        return EX_NO_CODEX
+    if not sys.stdin.isatty() or os.environ.get("CI"):
+        print(
+            "pick needs an interactive terminal. Non-interactive alternative:\n"
+            "  codex-in-claude.py set-model <slug> [--for delegate-review|debate|all]",
+            file=sys.stderr,
+        )
+        return EX_USAGE
+    target = args.for_command or "all"
+    current = resolve_model(None if target == "all" else target)
+    width = max(len(str(m.get("slug", ""))) for m in models)
+    print(f"Pick the Codex model for {target}  (current: {current})\n")
+    for num, m in enumerate(models, 1):
+        slug = str(m.get("slug", ""))
+        mark = "*" if slug == current else " "
+        eff = str(m.get("default_reasoning_level") or "?")
+        print(f" {mark} {num}) {slug:<{width}}  effort={eff:<7}  {m.get('description') or ''}")
+    try:
+        raw = input("\nnumber (Enter = keep current): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\naborted", file=sys.stderr)
+        return EX_USAGE
+    if not raw:
+        print(f"kept {current}")
+        return EX_OK
+    if not raw.isdigit() or not 1 <= int(raw) <= len(models):
+        print(f"Not a listed number: {raw!r}", file=sys.stderr)
+        return EX_USAGE
+    args.slug = str(models[int(raw) - 1].get("slug", ""))
+    args.for_command = target
+    return cmd_set_model(args)
 
 
 def cmd_set_model(args: argparse.Namespace) -> int:
@@ -258,11 +481,15 @@ def cmd_set_model(args: argparse.Namespace) -> int:
     if target in (None, "all"):
         cfg["default"] = slug
         where = "default (all commands)"
+        if target == "all":  # "all" also clears per-command pins, else they'd shadow it
+            for cmd in COMMANDS:
+                cfg[cmd] = None
     else:
         cfg[target] = slug
         where = target
     path = save_config(cfg)
     print(f"set {where} model -> {slug}\nconfig: {path}")
+    _report_sync(sync_markers())
     return EX_OK
 
 
@@ -287,6 +514,7 @@ def cmd_set_effort(args: argparse.Namespace) -> int:
         return EX_USAGE
     path = save_config(cfg)
     print(f"{msg}\nconfig: {path}")
+    _report_sync(sync_markers())
     return EX_OK
 
 
@@ -692,8 +920,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=(
             "Examples:\n"
             "  codex-in-claude.py models --refresh\n"
-            "  codex-in-claude.py set-model gpt-5.5 --for delegate-review\n"
+            "  codex-in-claude.py pick                     # interactive picker (+ help sync)\n"
+            "  codex-in-claude.py set-model gpt-5.6-sol --for all\n"
             "  codex-in-claude.py get-model --for debate\n"
+            "  codex-in-claude.py sync-skills --check      # is /codex… help in sync?\n"
             "  codex-in-claude.py delegate --write -C . 'add retry to fetch()'\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -721,16 +951,41 @@ def build_parser() -> argparse.ArgumentParser:
     p_get.set_defaults(func=cmd_get_model)
 
     p_set = sub.add_parser("set-model", help="set the model for a command (or global default)")
-    p_set.add_argument("slug", help="model slug, e.g. gpt-5.5")
+    p_set.add_argument("slug", help="model slug, e.g. gpt-5.6-sol")
     p_set.add_argument(
         "-f",
         "--for",
         dest="for_command",
         choices=(*COMMANDS, "all"),
         default=None,
-        help="command (default/all = global)",
+        help="command (default/all = global; 'all' also clears per-command pins)",
     )
     p_set.set_defaults(func=cmd_set_model)
+
+    p_pick = sub.add_parser("pick", help="interactive model picker (terminal only)")
+    p_pick.add_argument(
+        "-f",
+        "--for",
+        dest="for_command",
+        choices=(*COMMANDS, "all"),
+        default=None,
+        help="command to set (default: all)",
+    )
+    p_pick.add_argument(
+        "-r", "--refresh", action="store_true", help="refresh via `codex debug models`"
+    )
+    p_pick.set_defaults(func=cmd_pick)
+
+    p_sync = sub.add_parser(
+        "sync-skills", help="stamp the model into the codex skill/command descriptions"
+    )
+    p_sync.add_argument(
+        "-c",
+        "--check",
+        action="store_true",
+        help="report drift without writing (exit 1 = stale, 2 = unparsable)",
+    )
+    p_sync.set_defaults(func=cmd_sync_skills)
 
     p_geteff = sub.add_parser("get-effort", help="print the configured reasoning effort")
     p_geteff.set_defaults(func=cmd_get_effort)

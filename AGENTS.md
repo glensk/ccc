@@ -76,6 +76,15 @@ non-editable install keeps working. Stdlib-only helper scripts that must survive
 non-editable install (`codex_in_claude.py`, `session_continue.py`) live *inside* the
 package; the repo-root `codex-in-claude.py` is a thin PATH-compat shim.
 
+The codex assets ship **marker-free**; `install_commands._codex_stamped()` injects the
+`[codex <model> effort=<e>]` prefix into their `description:` at plan time (see
+`codex_in_claude.sync_markers`), because Claude Code shows that description as the
+slash-command help. Two invariants when touching this: an inline description must come out
+**double-quoted** (a leading `[` would otherwise read as a YAML flow sequence), and the
+stamped files are written **in place** — never temp + `os.replace` — so a dotfiles hard link
+to a tracked working copy is not broken. `marker_surfaces()` keys off `$CLAUDE_CONFIG_DIR`,
+so tests must set it (the `cic` fixture does) or they will edit the developer's real skills.
+
 ## The inert-defaults contract (do not regress)
 
 A fresh install must do **nothing** until the user opts in: no LLM tokens, no network calls

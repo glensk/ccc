@@ -49,9 +49,12 @@ Do this:
 Notes:
 
 - Model + reasoning effort are shared with `/codex-debate` via `codex-in-claude`. Change them
-  with `codex-in-claude set-model <slug> --for delegate-review` and
+  with `codex-in-claude pick` (interactive picker), or
+  `codex-in-claude set-model <slug> --for delegate-review` and
   `codex-in-claude set-effort <low|medium|high|xhigh>` (`delegate-review` is this command's
-  short config key).
+  short config key). Either way the `[codex <model> effort=<e>]` marker at the front of this
+  file's `description:` is re-stamped, so the slash-command help names the model Codex will
+  run (Claude Code reads descriptions at session start — it refreshes next session).
 - This is a *consult-and-build* with oversight, not a blind hand-off — you always verify by
   running the tests before reporting `✅ done`.
 - Billed to the Codex (ChatGPT) subscription, not Anthropic usage.

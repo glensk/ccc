@@ -2,7 +2,9 @@
 
 Ships the seven ccc slash commands (aim, next-step, done, block, deadline,
 aim-history, subgoal-history) as package data under ``assets/commands/`` and, with
-``--codex``, the optional codex command + skill under ``assets/codex/``. Every file is
+``--codex``, the optional codex command + skill under ``assets/codex/`` — whose
+``description:`` is stamped with the resolved Codex model (see ``codex_in_claude``) so the
+slash-command help names the model. Every file is
 written **atomically** (temp + ``os.replace``); a file that would be overwritten with
 different content is first backed up to a timestamped sibling. Reruns are **idempotent**
 (a byte-identical target is skipped). ``--uninstall`` removes only files whose content
@@ -38,6 +40,26 @@ CORE_SKILLS: tuple[str, ...] = ("ccc-mark-done-and-close",)
 #: Skill directory name for the optional codex asset.
 _CODEX_SKILL = "codex-implement-task-and-claude-review"
 _CODEX_COMMAND = "codex-implement-task-and-claude-review.md"
+
+
+def _codex_stamped(text: str) -> str:
+    """Stamp the resolved Codex model marker into a codex asset's ``description:``.
+
+    The asset ships marker-free; the installed copy carries ``[codex <model> effort=<e>]``
+    so Claude Code's slash-command help names the model Codex will actually run — and so a
+    re-install can never silently revert the marker written by ``set-model``. Falls back to
+    the raw asset if the frontmatter cannot be parsed (never blocks an install).
+    """
+    # Lazy: keeps the install path free of the engine's POSIX-only imports at import time.
+    from .codex_in_claude import (  # pylint: disable=import-outside-toplevel
+        inject_marker,
+        marker_for,
+    )
+
+    try:
+        return inject_marker(text, marker_for("delegate-review"))
+    except (ValueError, OSError):
+        return text
 
 
 @dataclass(frozen=True)
@@ -86,14 +108,14 @@ def build_plan(claude_home: Path, *, codex: bool) -> list[Item]:
         items.append(
             Item(
                 dest=commands_dir / _CODEX_COMMAND,
-                content=_read_asset("codex", "commands", _CODEX_COMMAND),
+                content=_codex_stamped(_read_asset("codex", "commands", _CODEX_COMMAND)),
                 label=f"commands/{_CODEX_COMMAND}",
             )
         )
         items.append(
             Item(
                 dest=claude_home / "skills" / _CODEX_SKILL / "SKILL.md",
-                content=_read_asset("codex", "skills", _CODEX_SKILL, "SKILL.md"),
+                content=_codex_stamped(_read_asset("codex", "skills", _CODEX_SKILL, "SKILL.md")),
                 label=f"skills/{_CODEX_SKILL}/SKILL.md",
             )
         )

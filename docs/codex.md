@@ -14,7 +14,7 @@ It runs a bounded loop: an optional read-only **scout** round (plan) → Codex i
 self-checks → Claude verifies by running the project's checks → on failure Claude gives
 concrete feedback → Codex revises. If Codex still fails after round 3, Claude announces it
 and takes over (unless `--no-takeover`). The **first output line is always the model**,
-e.g. `model: gpt-5.5 (effort xhigh)`.
+e.g. `model: gpt-5.6-sol (effort xhigh)`.
 
 Two design points worth keeping:
 
@@ -40,12 +40,28 @@ move):
 
 ```commands
 codex-in-claude.py models                                    # list models (* = configured)
-codex-in-claude.py set-model gpt-5.5 --for delegate-review   # or --for debate / --for all
+codex-in-claude.py pick [--for debate]                       # interactive numbered picker
+codex-in-claude.py set-model gpt-5.6-sol --for all           # or --for debate / delegate-review
 codex-in-claude.py get-model --for debate
 codex-in-claude.py set-effort high                           # low|medium|high|xhigh|default
+codex-in-claude.py sync-skills [--check]                     # re-stamp the model into the help
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 ```
+
+`--for all` is a real reset: it moves `default` **and** clears the per-command pins, which
+would otherwise shadow it. A bare `set-model <slug>` (no `--for`) only moves `default`.
+
+### The model is visible in the slash-command help
+
+Claude Code renders each command's one-line help from the `description:` frontmatter of its
+skill/command markdown, and reads it **at session start**. So `set-model` / `set-effort` /
+`pick` also stamp a `[codex <model> effort=<e>]` **prefix** into those descriptions
+(`sync-skills` does it on demand; `--check` reports drift and exits 1). A prefix, because the
+listing truncates long descriptions on the right. `ccc install-commands --codex` writes the
+same marker into the copies it installs, so a re-install cannot silently revert it — the
+shipped assets themselves stay marker-free. The stamped files are rewritten **in place**
+(never temp + rename) so a dotfiles hard link to a tracked working copy survives.
 
 `delegate` is the single engine both the skill and the slash command drive. It prints
 `model: <slug> (effort <e>)` as its guaranteed first stdout line, caps simultaneous Codex
