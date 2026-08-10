@@ -26,7 +26,8 @@ flags. Grouped by what they do:
 
 **AIM, progress & the checkers**
 
-- `ccc set-aim "<done-when>"` — set the done-condition (the single chokepoint for CLI/TUI/hook).
+- `ccc set-aim "<done-when>"` — set the done-condition (the single chokepoint for CLI/TUI/hook);
+  `-f/--first` instead rewrites the FIRST recorded AIM (`/aim (1)`) in place, adding no revision.
 - `ccc aim` · `ccc aim-history` — the current AIM / its first→current progression.
 - `ccc set-next` · `ccc set-blocked` · `ccc set-deadline` · `ccc set-donecheck` — the other job fields.
 - `ccc subgoals "step" …` (`--list`, `--adaptive`, `--merge`) — the progress checklist.
@@ -728,6 +729,14 @@ stuck bar, so the center scores every AIM for specificity (0–100):
   ever defined (`/aim (1):`) and the **last/current** one (`/aim (N):`), never the middle
   revisions; when the AIM has only one revision (or predates history) just the single `/aim (1):`
   line shows. The full progression lives in `ccc aim-history` / the `ah` chord.
+- **Editing the first AIM** — `/aim (1):` is an editable line in the `e` form (and
+  `ccc set-aim -f/--first "<text>"`), for when the *original* done-condition was stated badly and
+  the pane/history keeps showing that wording. It is rewritten **in place**: revision 1's text is
+  replaced (re-scored, its stale short-AIM label dropped), **no** revision is appended, the running
+  index never shifts, and the current AIM is untouched. Emptying it is refused — history never
+  loses where the goal started. When that first revision *is* the current AIM (a single revision,
+  or an AIM predating history) the live AIM is rewritten with it and any stale DONE verdict is
+  dropped; the sub-goal checklist is kept, since restating a goal is not changing it.
 - **AIM history** — every (re)definition is recorded, so you can see how the goal got sharper.
   Review the full first→current progression with `ccc aim-history`, the `/aim-history` slash
   command, or the TUI **`ah`** chord (type `a` then `h`; a bare `a` still edits the AIM). Each

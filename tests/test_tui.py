@@ -1369,6 +1369,91 @@ def test_e_opens_inline_edit_form_and_esc_saves(
     assert {s.source for s in subs} == {"user"}  # manual edit → provenance "manual"
 
 
+def test_e_edits_the_first_aim_in_place(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`e` exposes `/aim (1)` as an editable field (≥2 revisions): rewritten, never appended."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)
+    store = Store(tmp_path / "command-center" / "state.db")
+    # _seed's AIM becomes revision 1 when the first tracked change seeds it; the change
+    # itself is revision 2 — two revisions is what makes the `/aim (1)` row show.
+    store.set_aim(sid, "second aim: pytest -q green")
+    store.close()
+
+    from textual.containers import Horizontal
+    from textual.widgets import TextArea
+
+    from command_center.views.tui import CommandCenterApp, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.cfg.aim_score_on_set = False
+            app.cfg.drift_check = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index(sid))
+            table.focus()
+            await pilot.pause()
+
+            await pilot.press("e")
+            await pilot.pause()
+            # The first-AIM row is visible and seeded with revision 1 (not the current AIM).
+            assert app.query_one("#edit-aim1-row", Horizontal).styles.display == "block"
+            assert app.query_one("#edit-aim1", TextArea).text == "ship the thing"
+            assert app.query_one("#edit-aim", TextArea).text == "second aim: pytest -q green"
+
+            app.query_one("#edit-aim1", TextArea).text = "first aim, restated: ccc ls lists it"
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._editing is False
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    history = [h.aim for h in store.list_aim_history(sid)]
+    saved = store.get(sid)
+    store.close()
+    assert history == ["first aim, restated: ccc ls lists it", "second aim: pytest -q green"]
+    assert saved is not None
+    assert saved.aim == "second aim: pytest -q green"  # the current AIM is untouched
+
+
+def test_e_refuses_to_empty_the_first_aim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Blanking `/aim (1)` is refused outright (warns) — history never loses where it started."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    sid = _seed(tmp_path)
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.set_aim(sid, "second aim: pytest -q green")  # seeds "ship the thing" as revision 1
+    store.close()
+
+    from textual.widgets import TextArea
+
+    from command_center.views.tui import CommandCenterApp, SessionTable
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.cfg.aim_score_on_set = False
+            table = app.query_one("#sessions", SessionTable)
+            table.move_cursor(row=table.get_row_index(sid))
+            table.focus()
+            await pilot.pause()
+            await pilot.press("e")
+            await pilot.pause()
+            app.query_one("#edit-aim1", TextArea).text = ""
+            await pilot.press("escape")
+            await pilot.pause()
+            assert app._editing is False  # no confirm dialog — the edit is simply dropped
+
+    asyncio.run(scenario())
+
+    store = Store(tmp_path / "command-center" / "state.db")
+    history = [h.aim for h in store.list_aim_history(sid)]
+    store.close()
+    assert history == ["ship the thing", "second aim: pytest -q green"]
+
+
 def test_e_warns_before_saving_blank_aim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Clearing the AIM and exiting pops a confirm; declining keeps the AIM."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))

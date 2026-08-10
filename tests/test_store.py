@@ -509,6 +509,64 @@ def test_aim_history_seeds_preexisting_original(tmp_path: Path) -> None:
     assert [h.aim for h in store.list_aim_history("s1")] == ["legacy aim", "sharpened aim"]
 
 
+def test_set_first_aim_rewrites_revision_one_in_place(tmp_path: Path) -> None:
+    """``/aim (1)`` is editable: revision 1 is rewritten, no revision added, current AIM kept."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.set_aim("s1", "first vague aim")
+    store.set_aim("s1", "second, concrete aim: pytest -q green")
+    store.set_short_aim("s1", "second")  # label on the CURRENT revision — must survive
+
+    assert store.set_first_aim("s1", "first aim, restated: ccc ls shows the row") is True
+    history = store.list_aim_history("s1")
+    assert [h.aim for h in history] == [
+        "first aim, restated: ccc ls shows the row",
+        "second, concrete aim: pytest -q green",
+    ]
+    assert len(history) == 2  # rewritten in place — the running index never shifts
+    assert history[0].score >= 0  # re-scored lexically for the new wording
+    assert history[0].short_aim is None  # the old label described the old wording
+    assert history[1].short_aim == "second"
+    session = store.get("s1")
+    assert session is not None
+    assert session.aim == "second, concrete aim: pytest -q green"  # current AIM untouched
+
+    # Idempotent / refuses to empty a history row.
+    assert store.set_first_aim("s1", "first aim, restated: ccc ls shows the row") is False
+    assert store.set_first_aim("s1", "   ") is False
+    assert [h.aim for h in store.list_aim_history("s1")][0] == (
+        "first aim, restated: ccc ls shows the row"
+    )
+
+
+def test_set_first_aim_mirrors_when_it_is_also_the_current_aim(tmp_path: Path) -> None:
+    """With one revision (or a pre-history AIM) ``/aim (1)`` IS the current AIM — mirror it."""
+    store = _store(tmp_path)
+    store.ensure("s1")
+    store.set_aim("s1", "only aim: tests pass")
+    store.set_aim_met("s1", True, "looks done", 123)
+
+    assert store.set_first_aim("s1", "only aim, restated: pytest -q is green") is True
+    session = store.get("s1")
+    assert session is not None
+    assert session.aim == "only aim, restated: pytest -q is green"  # live AIM kept in sync
+    assert session.aim_met is False  # a DONE verdict never outlives the wording it judged
+    assert len(store.list_aim_history("s1")) == 1  # still a single revision
+
+    # Pre-history session: the live AIM is the sole, unrecorded revision 1.
+    store.ensure("s2")
+    store.update_fields("s2", aim="legacy aim", aim_score=40)
+    assert store.set_first_aim("s2", "legacy aim, restated: ruff check clean") is True
+    legacy = store.get("s2")
+    assert legacy is not None
+    assert legacy.aim == "legacy aim, restated: ruff check clean"
+    assert store.list_aim_history("s2") == []  # rewriting it must not invent a revision 2
+
+    # Nothing to adapt when no AIM was ever set.
+    store.ensure("s3")
+    assert store.set_first_aim("s3", "some aim") is False
+
+
 def test_set_short_aim_writes_session_and_latest_revision(tmp_path: Path) -> None:
     """The short label lands on the session AND mirrors onto the current AIM-history row."""
     store = _store(tmp_path)

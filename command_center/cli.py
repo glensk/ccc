@@ -2830,6 +2830,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_set_aim = sub.add_parser("set-aim", help="set 'this session is done when: ...'")
     p_set_aim.add_argument("text")
     p_set_aim.add_argument("--session")
+    p_set_aim.add_argument(
+        "-f",
+        "--first",
+        action="store_true",
+        help="rewrite the FIRST recorded AIM (/aim (1)) in place instead of setting "
+        "the current one — fixes how the original goal was stated, adds no revision",
+    )
     p_set_aim.set_defaults(func=cmd_set_aim)
 
     p_score = sub.add_parser("score-aim", help="internal: refine the AIM specificity score (LLM)")

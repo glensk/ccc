@@ -353,6 +353,39 @@ def test_check_out_of_range_errors_and_mutates_nothing(
         assert all(not s.checked for s in store.list_subgoals("sess-a"))
 
 
+def test_set_aim_first_rewrites_revision_one_without_adding_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ccc set-aim --first`` adapts ``/aim (1)`` in place; the current AIM stays put."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr("command_center.cli.config.load_config", lambda: _no_score_cfg())
+    (tmp_path / "command-center").mkdir(parents=True)
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        store.ensure("s1", cwd="/repo")
+        store.set_aim("s1", "vague first aim")
+        store.set_aim("s1", "second aim: pytest -q green")
+
+    args = argparse.Namespace(text="first aim, restated: ccc ls lists it", session="s1", first=True)
+    assert cli.cmd_set_aim(args) == 0
+    assert "first aim rewritten" in capsys.readouterr().out
+
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        assert [h.aim for h in store.list_aim_history("s1")] == [
+            "first aim, restated: ccc ls lists it",
+            "second aim: pytest -q green",
+        ]
+        session = store.get("s1")
+    assert session is not None and session.aim == "second aim: pytest -q green"
+
+    # Re-running is a no-op; an empty --first is refused (exit 1), history untouched.
+    assert cli.cmd_set_aim(args) == 0
+    assert "first aim unchanged" in capsys.readouterr().out
+    blank = argparse.Namespace(text="  ", session="s1", first=True)
+    assert cli.cmd_set_aim(blank) == 1
+    with Store(tmp_path / "command-center" / "state.db") as store:
+        assert store.list_aim_history("s1")[0].aim == "first aim, restated: ccc ls lists it"
+
+
 def _sg_args(items: list[str], **kw: object) -> argparse.Namespace:
     base: dict[str, object] = {
         "session": "s1",
