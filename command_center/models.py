@@ -204,12 +204,20 @@ class SubgoalRevision:
 # Future-job model choices: which Claude model a job's overseer / executor runs on.
 # The session runs ON the overseer's model; when the executor differs, the overseer is
 # told to delegate implementation to Agent-tool subagents on the executor's model.
-LLM_CHOICES: tuple[str, ...] = ("fable-5", "opus-4.8", "opus-4.8-1m", "sonnet-5", "haiku-4.5")
+LLM_CHOICES: tuple[str, ...] = (
+    "fable-5",
+    "opus-5",
+    "opus-4.8",
+    "opus-4.8-1m",
+    "sonnet-5",
+    "haiku-4.5",
+)
 DEFAULT_LLM = "fable-5"
 # Full model ids for ``claude --model`` (the overseer the session runs on).
 # ``opus-4.8-1m`` is the 1M-context beta form; fable-5 and sonnet-5 are natively 1M.
 LLM_MODEL_IDS: dict[str, str] = {
     "fable-5": "claude-fable-5",
+    "opus-5": "claude-opus-5",
     "opus-4.8": "claude-opus-4-8",
     "opus-4.8-1m": "claude-opus-4-8[1m]",
     "sonnet-5": "claude-sonnet-5",
@@ -219,11 +227,18 @@ LLM_MODEL_IDS: dict[str, str] = {
 # The enum has no 1M variant, so opus-4.8-1m delegates to plain "opus".
 LLM_AGENT_ALIAS: dict[str, str] = {
     "fable-5": "fable",
+    "opus-5": "opus",
     "opus-4.8": "opus",
     "opus-4.8-1m": "opus",
     "sonnet-5": "sonnet",
     "haiku-4.5": "haiku",
 }
+# Shorthands whose prefix match is genuinely ambiguous and so must be pinned explicitly.
+# ``"opus"`` prefixes three choices (opus-5, opus-4.8, opus-4.8-1m) and none of them is a
+# prefix of the others, so :func:`expand_llm_choice`'s shortest-wins rule cannot decide and
+# would reject the input. Bare ``"opus"`` means the CURRENT Opus generation; an older
+# generation needs its version (``"opus-4"`` → opus-4.8).
+LLM_PREFIX_ALIASES: dict[str, str] = {"opus": "opus-5"}
 # Separator glyph between the overseer and executor model in a draft's models readout.
 LLM_ARROW = "▸"
 # Valid ``claude --effort`` levels. Job launches pass the config ``launch_effort``
@@ -265,10 +280,12 @@ def model_effort_cell(model: str, effort: str) -> str:
 def expand_llm_choice(value: str) -> str | None:
     """Canonicalize a model choice, accepting a unique prefix.
 
-    ``"fable"`` → ``"fable-5"``, ``"opus"`` → ``"opus-4.8"``, ``"sonnet"`` → ``"sonnet-5"``;
+    ``"fable"`` → ``"fable-5"``, ``"opus"`` → ``"opus-5"``, ``"sonnet"`` → ``"sonnet-5"``;
     an exact choice passes through unchanged. When one choice is itself a prefix of the
-    others it matches (``"opus"`` hits both ``opus-4.8`` and ``opus-4.8-1m``), the shortest
-    wins — the longer variant needs its own longer prefix (``"opus-4.8-"``). Returns
+    others it matches (``"opus-4"`` hits both ``opus-4.8`` and ``opus-4.8-1m``), the shortest
+    wins — the longer variant needs its own longer prefix (``"opus-4.8-"``). Shorthands whose
+    match set has no such common prefix are pinned in :data:`LLM_PREFIX_ALIASES` (bare
+    ``"opus"`` → the current generation) since shortest-wins cannot decide them. Returns
     ``None`` when *value* is empty or genuinely ambiguous/unknown — the caller then
     rejects the edit and keeps the previous value. Matching is case-insensitive and
     whitespace-trimmed.
@@ -278,6 +295,8 @@ def expand_llm_choice(value: str) -> str | None:
         return None
     if needle in LLM_CHOICES:
         return needle
+    if needle in LLM_PREFIX_ALIASES:
+        return LLM_PREFIX_ALIASES[needle]
     matches = [choice for choice in LLM_CHOICES if choice.startswith(needle)]
     if len(matches) == 1:
         return matches[0]

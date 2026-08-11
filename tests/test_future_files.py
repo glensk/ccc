@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from command_center import config, future_files
+from command_center import config, future_files, models
 from command_center.future_files import ParsedJob
 
 _UUID = "3a8b7c12-1234-5678-9abc-def012345678"
@@ -160,11 +160,10 @@ def test_missing_llm_keys_parse_to_default() -> None:
 
 def test_controls_block_lists_model_selects() -> None:
     text = future_files.serialize(session_id=_UUID, aim="x", repo="home/ccc")
-    # Two inlineSelects bound to the model fields, options from LLM_CHOICES.
-    llm_opts = (
-        "option(fable-5), option(opus-4.8), option(opus-4.8-1m), "
-        "option(sonnet-5), option(haiku-4.5)"
-    )
+    # Two inlineSelects bound to the model fields, options from LLM_CHOICES. Derive the
+    # expected string from LLM_CHOICES rather than hardcoding it, so adding a model does
+    # not silently break this test (it did when opus-5 was added).
+    llm_opts = ", ".join(f"option({choice})" for choice in models.LLM_CHOICES)
     assert f"inlineSelect({llm_opts}):llm_overseer]" in text
     assert f"inlineSelect({llm_opts}):llm_exec]" in text
 
