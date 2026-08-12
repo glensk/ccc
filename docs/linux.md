@@ -7,7 +7,7 @@ out of the box on a plain Ubuntu desktop, what needs `tmux`, and what stays macO
 
 ```commands
 # the CLI on PATH (uv-first; pipx/pip also work)
-uv tool install git+https://github.com/glensk/ccc
+uv tool install git+https://github.com/glensk/claude-command-center
 
 # try it with fake data, zero setup
 ccc demo --ls

@@ -47,7 +47,7 @@ Everything else — the progress bars, the drift checker, the vault mirrors, aut
 
 ```commands
 # 1. install the `ccc` CLI on PATH
-uv tool install git+https://github.com/glensk/ccc
+uv tool install git+https://github.com/glensk/claude-command-center
 
 # 2. see it immediately — no wiring, fake data, throwaway store
 ccc demo            # opens the TUI against ~10 demo sessions
