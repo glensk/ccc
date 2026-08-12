@@ -246,6 +246,125 @@ def test_effective_timeout_scales_with_effort(cic: ModuleType) -> None:
     assert cic._effective_timeout(None, "xhigh") == 2700
     assert cic._effective_timeout(None, "unknown") == 900  # falls back to medium
     assert cic._effective_timeout(42, "xhigh") == 42  # explicit -t always wins
+    assert cic._effective_timeout(0, "xhigh") == 0  # -t 0 = no wall limit
+
+
+def test_prompt_unlimited_wall_note(cic: ModuleType) -> None:
+    prompt = cic._build_delegate_prompt(
+        "do x", write=True, feedback=None, round_no=1, budget_minutes=None, idle_minutes=15
+    )
+    assert "no hard wall-clock limit" in prompt
+    assert "~15 minutes with NO output" in prompt
+
+
+def test_prompt_repo_map_injected(cic: ModuleType) -> None:
+    prompt = cic._build_delegate_prompt(
+        "do x", write=True, feedback=None, round_no=1, repo_map="REPO MAP (test):\nbin/ (9 files)"
+    )
+    assert "REPO MAP (test):" in prompt
+    assert prompt.index("REPO MAP") < prompt.index("TASK:")
+
+
+def test_repo_map_prefers_repo_scope_short(cic: ModuleType, tmp_path: Path) -> None:
+    (tmp_path / "repo_scope_short.md").write_text("# myrepo\nDoes things.", encoding="utf-8")
+    result = cic._repo_map(str(tmp_path))
+    assert result is not None and "Does things." in result and "repo_scope_short" in result
+    assert cic._repo_map(None) is None
+
+
+def test_repo_map_git_fallback(cic: ModuleType, tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "top.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "a.py").write_text("y = 2\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "-A"], check=True)
+    result = cic._repo_map(str(tmp_path))
+    assert result is not None and "pkg/ (1 files)" in result and "top.py" in result
+
+
+def test_session_id_of(cic: ModuleType) -> None:
+    banner = "model: gpt-5.6-sol\nsession id: 019ff5b3-7bea-7c80-ad5e-21cc5b7c64bd\n----\n"
+    assert cic._session_id_of(banner) == "019ff5b3-7bea-7c80-ad5e-21cc5b7c64bd"
+    assert cic._session_id_of("no session here") is None
+
+
+def test_delegate_resume_assembles_resume_cmd(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, list[str]] = {}
+    uuid = "019ff5b3-7bea-7c80-ad5e-21cc5b7c64bd"
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        captured["cmd"] = cmd
+        Path(cmd[cmd.index("-o") + 1]).write_text("resumed ok", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", f"session id: {uuid}\n")
+
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
+    assert cic.cmd_delegate(_ns(resume=uuid)) == cic.EX_OK
+    assert captured["cmd"][:4] == ["codex", "exec", "resume", uuid]
+    assert "-s" not in captured["cmd"]  # sandbox inherited from the resumed session
+    out = capsys.readouterr().out
+    assert "### SESSION" in out and uuid in out  # session id reported for the next round
+
+
+def test_delegate_runs_lists_live_and_cleans_dead(
+    cic: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(cic, "RUNS_DIR", tmp_path)
+    import json as _json
+
+    live = {
+        "pid": os.getpid(),
+        "model": "m",
+        "effort": "e",
+        "repo": "/r",
+        "elapsed_s": 61,
+        "idle_s": 2,
+        "lines": 10,
+        "last_line": "editing",
+    }
+    (tmp_path / "live.json").write_text(_json.dumps(live), encoding="utf-8")
+    dead = dict(live, pid=99999999)
+    (tmp_path / "dead.json").write_text(_json.dumps(dead), encoding="utf-8")
+    assert cic.cmd_runs(argparse.Namespace(json=False)) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert f"pid {os.getpid()}" in out and "1m01s" in out and "editing" in out
+    assert "99999999" not in out
+    assert not (tmp_path / "dead.json").exists()  # stale heartbeat cleaned
+
+
+def test_exec_codex_writes_and_removes_heartbeat(cic: ModuleType, tmp_path: Path) -> None:
+    import threading
+
+    fake = _fake_codex(tmp_path, "sleep 2\nexit 0\n")
+    hb = tmp_path / "hb.json"
+    seen: list[bool] = []
+
+    def watch() -> None:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if hb.exists():
+                seen.append(True)
+                return
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    result = cic._exec_codex(
+        [fake],
+        env=dict(os.environ),
+        timeout=0,
+        idle_timeout=0,
+        heartbeat_path=hb,
+        heartbeat_meta={"model": "m"},
+    )
+    watcher.join()
+    assert result.returncode == 0
+    assert seen == [True]  # heartbeat existed while running (also proves -t 0 works)
+    assert not hb.exists()  # and was removed on exit
 
 
 def test_prompt_time_budget_note(cic: ModuleType) -> None:

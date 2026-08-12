@@ -81,23 +81,38 @@ Skip this for small/clearly-located tasks.
 
 For `round` = 1, 2, 3:
 
-1. **Delegate one round — in the BACKGROUND:**
+1. **Delegate one round — in the BACKGROUND, unbounded by default:**
 
    ```bash
-   codex-in-claude delegate -C "$REPO" -r <round> [--write] [-f "<last round's feedback>"] "$TASK"
+   codex-in-claude delegate -t 0 -C "$REPO" -r <round> [--write] [-f "<feedback>"] [-R <session>] "$TASK"
    ```
 
-   Run this as a **background** Bash task (`run_in_background: true`). **Do not sleep, poll, or
-   guess a wait time** — a backgrounded task runs across turns and the harness **re-invokes you
-   the moment Codex exits** (that IS the "hand back when done" signal). When re-invoked, read its
-   captured output (the `model:` line + `### SELF-CHECK` and `### DIFF`/edits). The wall
-   timeout `-t` defaults by effort (low 600s, medium 900s, high 1500s, xhigh 2700s) and an
-   idle watchdog (`-i`, default 900s of total silence) kills hung runs; codex's live progress
-   streams into the background task's output file (`codex›` lines), so tail it mid-run to
-   see whether codex is exploring, editing, or stuck. On non-zero exit branch on the code:
-   `4` codex missing/auth → tell the user `codex login`; `5` timeout/stall → read the
-   streamed progress tail first, then pick ONE: sharpen `$TASK` with file:line pointers (if
-   it died exploring), retry with a larger `-t` (if it died mid-implementation), or drop to
+   Prefer **`-t 0`** (no wall limit): the ground assumption is that Codex finishes — it's just
+   unclear how long it takes, and that's fine. The idle watchdog (`-i`, default 900s of total
+   silence) still kills genuinely hung runs, so `-t 0` cannot hang you forever. Set a wall
+   timeout only when the result has a real deadline. Run this as a **background** Bash task
+   (`run_in_background: true`). **Do not sleep, poll, or guess a wait time** — a backgrounded
+   task runs across turns and the harness **re-invokes you the moment Codex exits** (that IS
+   the "hand back when done" signal). When re-invoked, read its captured output (the `model:`
+   line + `### SELF-CHECK`, `### SESSION`, and `### DIFF`/edits).
+
+   **Checking on a long run (infrequently, cheaply):** `codex-in-claude runs` prints one line
+   per in-flight delegate — elapsed, idle seconds, output volume, last output line — from a
+   tiny heartbeat file, no transcript reading. Alternatively `tail -3` the background task's
+   output file (codex progress streams there as `codex›` lines). Idle near 0 = working;
+   idle climbing toward 900 = about to be culled as stalled. Don't loop on it — once or
+   twice on a very long run is plenty.
+
+   **Rounds keep context:** every run ends with `### SESSION <uuid>`. Pass `-R <uuid>` on the
+   next round (with `-f` feedback) so Codex resumes that session and keeps everything it
+   already discovered instead of re-exploring the repo from zero. A timed-out/stalled run
+   also prints its session id — resume it rather than restarting.
+
+   The prompt is automatically prefixed with a repo map (`repo_scope_short.md`, else a git
+   top-level summary; `-M` disables) so Codex starts oriented. On non-zero exit branch on
+   the code: `4` codex missing/auth → tell the user `codex login`; `5` timeout/stall → read
+   the streamed progress tail first, then pick ONE: `-R <session>` to resume where it
+   stopped, sharpen `$TASK` with file:line pointers (if it died exploring), or drop to
    `-e high`; `6` codex error → show stderr, stop; `8` quota-exhausted → the preflight
    skipped it (didn't launch); the reset time is already in the engine's error line — relay
    it and resume after reset, do NOT retry in a loop.

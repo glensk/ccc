@@ -38,10 +38,20 @@ Claude Code's slash-command help never drifts from the config.
 Supervision: ``codex exec`` runs in its own process group and the WHOLE tree is killed on
 wall timeout, idle stall, or parent SIGTERM/SIGINT — a killed delegate can never leave
 codex editing the workspace behind the caller's back. The wall timeout defaults by effort
-(``DEFAULT_TIMEOUTS``: low 600 s .. xhigh 2700 s; ``-t`` overrides), an idle watchdog
-(``-i``, default 900 s of total silence) converts hangs into fast failures, codex stderr is
-streamed through (``codex› `` prefix) for live progress, and the prompt itself tells codex
-its time budget so it spends the clock implementing instead of exploring.
+(``DEFAULT_TIMEOUTS``: low 600 s .. xhigh 2700 s; ``-t`` overrides, ``-t 0`` = no wall at
+all — the recommended mode when the task simply takes as long as it takes), an idle
+watchdog (``-i``, default 900 s of total silence) converts hangs into fast failures, codex
+stderr is streamed through (``codex› `` prefix) for live progress, and the prompt itself
+tells codex its time budget so it spends the clock implementing instead of exploring.
+
+Watchability + rounds: every run refreshes a heartbeat JSON under ``RUNS_DIR``; ``runs``
+lists all in-flight delegates (elapsed, idle seconds, output volume, last line) from one
+file read each — the cheap way to check on a long run without reading transcripts. Each
+run reports its codex session UUID as a final ``### SESSION`` line (also included in
+timeout/stall errors); ``--resume <uuid>`` re-attaches the next round (or a retry after a
+kill) to that session with all its discovered context intact. Unless ``--no-repo-map`` is
+given, the prompt is prefixed with the repo's ``repo_scope_short.md`` (or a git top-level
+summary) so codex starts oriented instead of exploring from zero.
 
 Concurrency + quota awareness: each ``delegate`` first runs a **quota preflight** — it reads
 the Codex ``rate_limits`` (5h + weekly) from ``$CODEX_HOME/sessions/**/rollout-*.jsonl`` and,
@@ -89,10 +99,28 @@ SLOT_DIR = Path(
 # Default wall timeout for one delegate round, keyed by reasoning effort. Higher
 # effort reasons (and therefore explores) far longer: a fixed 600s default made
 # every xhigh run on a non-trivial repo time out during discovery.
+# ``-t 0`` disables the wall entirely (the idle watchdog still guards stalls).
 DEFAULT_TIMEOUTS = {"low": 600, "medium": 900, "high": 1500, "xhigh": 2700}
 # Kill a run after this long with NO output at all (network hang / wedged CLI),
 # clamped to the wall timeout. 0 disables.
 DEFAULT_IDLE_TIMEOUT = 900
+
+# Heartbeat files for in-flight delegate runs (see ``runs``): one small JSON per
+# running delegate, refreshed every few seconds, removed on exit. Lets a caller
+# check progress cheaply (one file read) instead of tailing full transcripts.
+RUNS_DIR = Path(
+    os.environ.get(
+        "CODEX_IN_CLAUDE_RUNS_DIR",
+        str(Path.home() / ".config" / "codex-in-claude" / "runs"),
+    )
+)
+
+# codex exec prints its session id in the startup banner; captured so a later
+# round (or a retry after a kill) can `codex exec resume <id>` with the
+# session's discovered context intact.
+_SESSION_RE = re.compile(
+    r"session id:\s*([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+)
 
 # delegate exit codes
 EX_OK, EX_USAGE = 0, 2
@@ -101,10 +129,45 @@ EX_QUOTA = 8  # skipped: Codex quota exhausted (>=100% used on a live window)
 
 
 def _effective_timeout(explicit: int | None, effort: str) -> int:
-    """The wall timeout for a round: the explicit ``-t`` value, else effort-scaled."""
+    """Wall timeout for a round: explicit ``-t`` (0 = unlimited), else effort-scaled."""
     if explicit is not None:
-        return explicit
+        return max(0, explicit)
     return DEFAULT_TIMEOUTS.get(effort, DEFAULT_TIMEOUTS["medium"])
+
+
+def _session_id_of(text: str) -> str | None:
+    """The codex session UUID from a run's stderr banner, if present."""
+    match = _SESSION_RE.search(text)
+    return match.group(1) if match else None
+
+
+def _write_heartbeat(
+    path: Path,
+    meta: dict[str, Any],
+    started: float,
+    last_activity: float,
+    out_buf: list[str],
+    err_buf: list[str],
+) -> None:
+    """Atomically refresh one run's heartbeat JSON (never fatal)."""
+    now = time.monotonic()
+    last_line = next((line.strip() for line in reversed(err_buf or out_buf) if line.strip()), "")
+    payload = {
+        "pid": os.getpid(),
+        **meta,
+        "elapsed_s": int(now - started),
+        "idle_s": int(now - last_activity),
+        "lines": len(out_buf) + len(err_buf),
+        "last_line": last_line[:200],
+        "updated": int(time.time()),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
 
 
 class CodexStalledError(RuntimeError):
@@ -122,6 +185,8 @@ def _exec_codex(
     env: dict[str, str],
     timeout: int,
     idle_timeout: int = 0,
+    heartbeat_path: Path | None = None,
+    heartbeat_meta: dict[str, Any] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``codex exec`` supervised; the process TREE can never outlive us.
 
@@ -198,14 +263,20 @@ def _exec_codex(
         for sig in (signal.SIGTERM, signal.SIGINT):
             previous[sig] = signal.signal(sig, relay)
     start = time.monotonic()
+    tick = 0
     try:
         while True:
+            if heartbeat_path is not None and tick % 5 == 0:
+                _write_heartbeat(
+                    heartbeat_path, heartbeat_meta or {}, start, last_activity[0], out_buf, err_buf
+                )
+            tick += 1
             try:
                 proc.wait(timeout=1)
                 break
             except subprocess.TimeoutExpired:
                 now = time.monotonic()
-                if now - start >= timeout:
+                if timeout and now - start >= timeout:
                     kill_group()
                     raise subprocess.TimeoutExpired(
                         cmd, timeout, output="".join(out_buf), stderr="".join(err_buf)
@@ -220,12 +291,63 @@ def _exec_codex(
         kill_group()
         for signum, handler in previous.items():
             signal.signal(signum, handler)
+        if heartbeat_path is not None:
+            with contextlib.suppress(OSError):
+                heartbeat_path.unlink()
+            with contextlib.suppress(OSError):
+                heartbeat_path.with_suffix(".tmp").unlink()
 
 
 def _stderr_tail(text: str, lines: int = 8) -> str:
     """The last few non-empty stderr lines — what codex was doing when killed."""
     kept = [line for line in text.splitlines() if line.strip()]
     return "\n".join(kept[-lines:])
+
+
+def _repo_map(cwd: str | None, limit: int = 4000) -> str | None:
+    """A compact orientation map of the repo, injected into the delegate prompt.
+
+    Discovery is what burns delegate wall-clock: a run that has to find its way
+    around a repo can spend its whole budget exploring. Prefer the repo's own
+    ``repo_scope_short.md`` (a human-curated map); otherwise fall back to a
+    top-level tracked-file summary from git. Never fatal — returns None when
+    nothing useful exists.
+    """
+    if not cwd:
+        return None
+    root = Path(cwd)
+    with contextlib.suppress(OSError):
+        scope = root / "repo_scope_short.md"
+        if scope.is_file():
+            text = scope.read_text(encoding="utf-8", errors="replace").strip()
+            if text:
+                return (
+                    "REPO MAP (from repo_scope_short.md — trust it for orientation):\n"
+                    + text[:limit]
+                )
+    try:
+        listing = subprocess.run(
+            ["git", "-C", str(root), "ls-files"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if not listing.strip():
+        return None
+    counts: dict[str, int] = {}
+    top_files: list[str] = []
+    for line in listing.splitlines():
+        if "/" in line:
+            top = line.split("/", 1)[0] + "/"
+            counts[top] = counts.get(top, 0) + 1
+        else:
+            top_files.append(line)
+    entries = [f"{d} ({n} files)" for d, n in sorted(counts.items(), key=lambda kv: -kv[1])]
+    entries += top_files
+    return "REPO MAP (top-level tracked entries):\n" + "\n".join(entries[:40])
 
 
 # Codex usage (rate-limit) reading — Codex has no usage API; it writes a rate_limits
@@ -697,6 +819,14 @@ _SCOUT_CONTRACT = (
 )
 
 
+_DISCIPLINE = (
+    " Work with discovery discipline either way: when the TASK names files, functions, or "
+    "line numbers, open those FIRST and trust them; prefer targeted searches over repo-wide "
+    "exploration; leave time to implement and verify. A verified partial result beats an "
+    "unfinished perfect one."
+)
+
+
 def _build_delegate_prompt(
     task: str,
     *,
@@ -706,25 +836,33 @@ def _build_delegate_prompt(
     scout: bool = False,
     budget_minutes: int | None = None,
     idle_minutes: int | None = None,
+    repo_map: str | None = None,
 ) -> str:
-    """Compose the Codex prompt: contract header + time budget + task (+ feedback)."""
+    """Compose the Codex prompt: contract + time budget + repo map + task (+ feedback)."""
     header = _SCOUT_CONTRACT if scout else (_WRITE_CONTRACT if write else _PATCH_CONTRACT)
     parts = [header]
+    idle_part = (
+        f" The run IS killed after ~{idle_minutes} minutes with NO output at all."
+        if idle_minutes
+        else ""
+    )
     if budget_minutes:
-        idle_part = (
-            f" It is also killed after ~{idle_minutes} minutes with NO output at all."
-            if idle_minutes
-            else ""
-        )
         parts += [
             f"\nTIME BUDGET: ~{budget_minutes} minutes of wall-clock for this ENTIRE run, "
             "enforced externally — overrunning yields NOTHING, not a partial result."
             + idle_part
-            + " Budget discovery accordingly: when the TASK names files, functions, or line "
-            "numbers, open those FIRST and trust them; prefer targeted searches over "
-            "repo-wide exploration; leave time to implement and verify. A verified partial "
-            "result beats an unfinished perfect one.\n",
+            + _DISCIPLINE
+            + "\n",
         ]
+    elif idle_minutes:
+        parts += [
+            "\nTIME: no hard wall-clock limit on this run — take the time the task needs."
+            + idle_part
+            + _DISCIPLINE
+            + "\n",
+        ]
+    if repo_map:
+        parts += ["\n---\n", repo_map.strip(), "\n"]
     parts += ["\n---\nTASK:\n", task.strip(), "\n"]
     if feedback and feedback.strip():
         parts += [
@@ -947,6 +1085,47 @@ def _concurrency_slot(ceiling: int, poll: float = 3.0) -> Iterator[None]:
             handle.close()
 
 
+def cmd_runs(args: argparse.Namespace) -> int:
+    """List in-flight delegate runs from their heartbeat files (one cheap read each).
+
+    The supervised runner refreshes a tiny JSON per run every ~5s and removes it
+    on exit, so this shows elapsed/idle time, output volume, and the last output
+    line of every live delegate WITHOUT reading any transcript. Heartbeats whose
+    process is gone (crash, SIGKILL) are cleaned up on sight.
+    """
+    rows: list[dict[str, Any]] = []
+    for path in sorted(RUNS_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+        except (OSError, ValueError, KeyError, json.JSONDecodeError):
+            continue
+        try:
+            os.kill(pid, 0)  # liveness probe only
+        except ProcessLookupError:
+            with contextlib.suppress(OSError):
+                path.unlink()  # stale heartbeat from a killed run
+            continue
+        except PermissionError:
+            pass
+        rows.append(data)
+    if args.json:
+        print(json.dumps(rows))
+        return EX_OK
+    if not rows:
+        print("no active delegate runs.")
+        return EX_OK
+    for data in rows:
+        elapsed, idle = int(data.get("elapsed_s", 0)), int(data.get("idle_s", 0))
+        print(
+            f"pid {data['pid']} · {data.get('model', '?')}/{data.get('effort', '?')}"
+            f"{' · write' if data.get('write') else ''} · {data.get('repo', '?')} · "
+            f"elapsed {elapsed // 60}m{elapsed % 60:02d}s · idle {idle}s · "
+            f"{data.get('lines', 0)} lines · last: {data.get('last_line', '')!r}"
+        )
+    return EX_OK
+
+
 def cmd_usage(args: argparse.Namespace) -> int:
     """Print the current Codex rate-limit usage (5h + weekly windows)."""
     windows = _codex_usage_windows()
@@ -1004,17 +1183,23 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     sandbox = "workspace-write" if write else "read-only"
     wall_timeout = _effective_timeout(args.timeout, shown_effort)
     idle_flag = getattr(args, "idle_timeout", None)
-    idle_timeout = (
-        min(DEFAULT_IDLE_TIMEOUT, wall_timeout) if idle_flag is None else max(0, idle_flag)
-    )
+    if idle_flag is not None:
+        idle_timeout = max(0, idle_flag)
+    elif wall_timeout:
+        idle_timeout = min(DEFAULT_IDLE_TIMEOUT, wall_timeout)
+    else:
+        idle_timeout = DEFAULT_IDLE_TIMEOUT  # unlimited wall still guards stalls
+    resume = getattr(args, "resume", None)
+    repo_map = None if (resume or getattr(args, "no_repo_map", False)) else _repo_map(args.cwd)
     prompt = _build_delegate_prompt(
         args.prompt,
         write=write,
         feedback=args.feedback,
         round_no=args.round,
         scout=args.scout,
-        budget_minutes=max(1, wall_timeout // 60),
+        budget_minutes=(max(1, wall_timeout // 60) if wall_timeout else None),
         idle_minutes=(max(1, idle_timeout // 60) if idle_timeout else None),
+        repo_map=repo_map,
     )
     env = dict(os.environ)
     env["CCC_NO_CODEX"] = "1"  # never re-trigger the plan/k8s automation
@@ -1023,37 +1208,66 @@ def cmd_delegate(args: argparse.Namespace) -> int:
 
     with tempfile.NamedTemporaryFile("r", suffix=".txt", delete=False) as handle:
         out_path = handle.name
-    cmd = ["codex", "exec", "-s", sandbox, "--skip-git-repo-check", "-o", out_path, "-m", model]
+    if resume:
+        # Resume a prior round's session: codex re-attaches with its discovered
+        # context intact. Sandbox and workdir are inherited from that session
+        # (`codex exec resume` has no -s/-C flags).
+        target = ["--last"] if resume == "last" else [resume]
+        cmd = ["codex", "exec", "resume", *target, "--skip-git-repo-check", "-o", out_path]
+        cmd += ["-m", model]
+    else:
+        cmd = ["codex", "exec", "-s", sandbox, "--skip-git-repo-check", "-o", out_path]
+        cmd += ["-m", model]
+        if args.cwd:
+            cmd += ["-C", args.cwd]
     if effort:
         cmd += ["-c", f"model_reasoning_effort={effort}"]
-    if args.cwd:
-        cmd += ["-C", args.cwd]
     cmd.append(prompt)
 
+    heartbeat = RUNS_DIR / f"{os.getpid()}.json"
+    heartbeat_meta = {
+        "model": model,
+        "effort": shown_effort,
+        "repo": args.cwd or os.getcwd(),
+        "write": write,
+    }
     try:
         # Take one concurrency slot before launching codex; the rest of a fan-out waits.
         with _concurrency_slot(_max_concurrent(args.max_concurrent)):
             # When Codex may write, snapshot the worktree so the caller reviews ONLY its diff.
             before = _git_status(args.cwd) if write else None
             try:
-                proc = _exec_codex(cmd, env=env, timeout=wall_timeout, idle_timeout=idle_timeout)
+                proc = _exec_codex(
+                    cmd,
+                    env=env,
+                    timeout=wall_timeout,
+                    idle_timeout=idle_timeout,
+                    heartbeat_path=heartbeat,
+                    heartbeat_meta=heartbeat_meta,
+                )
             except FileNotFoundError:
                 print("ERROR: `codex` CLI not found on PATH.", file=sys.stderr)
                 return EX_NO_CODEX
             except subprocess.TimeoutExpired as exc:
-                tail = _stderr_tail(str(exc.stderr or ""))
+                stderr_text = str(exc.stderr or "")
+                tail = _stderr_tail(stderr_text)
+                session = _session_id_of(stderr_text)
+                resume_hint = f" Resume its context with --resume {session}." if session else ""
                 print(
                     f"ERROR: Codex hit the {wall_timeout}s wall timeout (whole process tree "
-                    "killed). Retry with a larger -t, a lower effort, or a tighter task."
-                    + (f" Last output:\n{tail}" if tail else ""),
+                    "killed). Retry with a larger -t (or -t 0), a tighter task, or lower "
+                    "effort." + resume_hint + (f" Last output:\n{tail}" if tail else ""),
                     file=sys.stderr,
                 )
                 return EX_TIMEOUT
             except CodexStalledError as exc:
                 tail = _stderr_tail(exc.stderr_text)
+                session = _session_id_of(exc.stderr_text)
+                resume_hint = f" Resume its context with --resume {session}." if session else ""
                 print(
                     f"ERROR: Codex stalled — no output for {exc.idle_seconds}s (whole process "
                     "tree killed). Likely a hung network/CLI; retry, or tune --idle-timeout."
+                    + resume_hint
                     + (f" Last output:\n{tail}" if tail else ""),
                     file=sys.stderr,
                 )
@@ -1070,6 +1284,9 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         print(f"ERROR: Codex exited {proc.returncode}:\n{proc.stderr.strip()}", file=sys.stderr)
         return EX_CODEX_FAIL
     print(reply or proc.stdout.strip())
+    session = _session_id_of(proc.stderr or "")
+    if session:
+        print(f"\n### SESSION\n{session}")
     if write:
         after = _git_status(args.cwd)
         changed = sorted(set(after) - set(before or []))
@@ -1213,7 +1430,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="wall-clock seconds before the run is killed (default scales with effort: "
-        "low 600, medium 900, high 1500, xhigh 2700)",
+        "low 600, medium 900, high 1500, xhigh 2700; 0 = no wall limit — the idle "
+        "watchdog still guards stalls)",
     )
     p_del.add_argument(
         "-i",
@@ -1222,7 +1440,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECS",
         help="kill the run after this long with NO codex output "
-        "(default min(900, wall timeout); 0 disables the stall watchdog)",
+        "(default min(900, wall timeout), or 900 with -t 0; 0 disables the stall watchdog)",
+    )
+    p_del.add_argument(
+        "-R",
+        "--resume",
+        default=None,
+        metavar="SESSION",
+        help="resume a previous round's codex session (UUID from the ### SESSION line, "
+        "or 'last') — keeps its discovered context; sandbox/cwd inherit from that session",
+    )
+    p_del.add_argument(
+        "-M",
+        "--no-repo-map",
+        action="store_true",
+        help="do not inject the repo orientation map (repo_scope_short.md or a git "
+        "top-level summary) into the prompt",
     )
     p_del.add_argument(
         "-j",
@@ -1244,6 +1477,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_usage = sub.add_parser("usage", help="show current Codex rate-limit usage (5h + weekly)")
     p_usage.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_usage.set_defaults(func=cmd_usage)
+
+    p_runs = sub.add_parser(
+        "runs", help="list in-flight delegate runs (elapsed/idle/last output, one line each)"
+    )
+    p_runs.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_runs.set_defaults(func=cmd_runs)
     return parser
 
 
