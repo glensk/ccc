@@ -40,6 +40,19 @@ in a large repo can burn its whole wall clock exploring, while the same round wi
 finishes in minutes. One targeted grep on your side to pin the site is not "reading the
 codebase" — it is the cheapest token you'll spend all round. For genuinely surgical work
 also consider `-e high`: xhigh mostly buys depth of exploration you just made unnecessary.
+(The engine reminds you: a pointered task at config-default xhigh prints a `consider -e
+high` hint on stderr.)
+
+## Decision rules — pick BEFORE round 1 (not negotiable mid-loop)
+
+| Situation                                        | Do                                                        |
+| :----------------------------------------------- | :-------------------------------------------------------- |
+| Task names exact files/lines (surgical)          | pointers in `$TASK` + `-e high`; skip the scout            |
+| Big, vague, or UI/behaviour-described task       | one `--scout` round first, then implement from its PLAN    |
+| Duration unknown, no real deadline (the default) | `-t 0` — the idle watchdog still guards stalls             |
+| Hard deadline exists                             | keep the effort-scaled `-t` default or set one explicitly  |
+| Round 2+ (feedback or post-kill retry)           | `-R <session>` + `-f` — never restart discovery from zero  |
+| Repo map noisy/missing for this task             | `-P <file>` to inject a curated map, or `-M` for none      |
 
 ## Modes (from the command's flags)
 

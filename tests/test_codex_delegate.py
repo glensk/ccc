@@ -336,6 +336,44 @@ def test_delegate_runs_lists_live_and_cleans_dead(
     assert not (tmp_path / "dead.json").exists()  # stale heartbeat cleaned
 
 
+def test_repo_map_explicit_file_wins(cic: ModuleType, tmp_path: Path) -> None:
+    (tmp_path / "repo_scope_short.md").write_text("auto map", encoding="utf-8")
+    curated = tmp_path / "curated.md"
+    curated.write_text("curated context only", encoding="utf-8")
+    result = cic._repo_map(str(tmp_path), explicit=str(curated))
+    assert result is not None and "curated context only" in result and "auto map" not in result
+    # unreadable explicit file -> warning path, no map, no crash
+    assert cic._repo_map(str(tmp_path), explicit=str(tmp_path / "missing.md")) is None
+
+
+def test_delegate_show_prompt_dry_run(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def boom(*_: object, **__: object) -> None:
+        raise AssertionError("codex must not launch on --show-prompt")
+
+    monkeypatch.setattr(cic, "_exec_codex", boom)
+    assert cic.cmd_delegate(_ns(show_prompt=True, prompt="do the thing")) == cic.EX_OK
+    out = capsys.readouterr().out
+    assert "### DRY RUN" in out and "do the thing" in out and "command: codex exec" in out
+
+
+def test_delegate_pointer_hint_for_xhigh(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        Path(cmd[cmd.index("-o") + 1]).write_text("ok", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
+    # config default resolves to xhigh, task has a file:line pointer -> hint
+    assert cic.cmd_delegate(_ns(prompt="fix bin/tool.py:82 crash")) == cic.EX_OK
+    assert "consider -e high" in capsys.readouterr().err
+    # explicit effort chosen -> the caller decided; no second-guessing
+    assert cic.cmd_delegate(_ns(prompt="fix bin/tool.py:82 crash", effort="xhigh")) == cic.EX_OK
+    assert "consider -e high" not in capsys.readouterr().err
+
+
 def test_exec_codex_writes_and_removes_heartbeat(cic: ModuleType, tmp_path: Path) -> None:
     import threading
 

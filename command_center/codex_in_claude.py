@@ -304,15 +304,25 @@ def _stderr_tail(text: str, lines: int = 8) -> str:
     return "\n".join(kept[-lines:])
 
 
-def _repo_map(cwd: str | None, limit: int = 4000) -> str | None:
+def _repo_map(cwd: str | None, explicit: str | None = None, limit: int = 4000) -> str | None:
     """A compact orientation map of the repo, injected into the delegate prompt.
 
     Discovery is what burns delegate wall-clock: a run that has to find its way
-    around a repo can spend its whole budget exploring. Prefer the repo's own
-    ``repo_scope_short.md`` (a human-curated map); otherwise fall back to a
-    top-level tracked-file summary from git. Never fatal — returns None when
-    nothing useful exists.
+    around a repo can spend its whole budget exploring. ``explicit`` (the
+    ``--repo-map FILE`` flag) wins — the caller curates exactly the context
+    codex gets; else prefer the repo's own ``repo_scope_short.md`` (a
+    human-curated map); else fall back to a top-level tracked-file summary from
+    git. Never fatal — returns None when nothing useful exists.
     """
+    if explicit:
+        try:
+            text = Path(explicit).read_text(encoding="utf-8", errors="replace").strip()
+        except OSError as exc:
+            print(f"WARNING: --repo-map {explicit} unreadable ({exc}); no map.", file=sys.stderr)
+            return None
+        if not text:
+            return None
+        return f"REPO MAP (from {Path(explicit).name} — trust it for orientation):\n{text[:limit]}"
     if not cwd:
         return None
     root = Path(cwd)
@@ -1190,7 +1200,22 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     else:
         idle_timeout = DEFAULT_IDLE_TIMEOUT  # unlimited wall still guards stalls
     resume = getattr(args, "resume", None)
-    repo_map = None if (resume or getattr(args, "no_repo_map", False)) else _repo_map(args.cwd)
+    repo_map = (
+        None
+        if (resume or getattr(args, "no_repo_map", False))
+        else _repo_map(args.cwd, explicit=getattr(args, "repo_map", None))
+    )
+    # Advisory only: pointered tasks rarely need xhigh's exploration depth.
+    if (
+        args.effort is None
+        and shown_effort == "xhigh"
+        and re.search(r"\.\w{1,5}:\d+|\blines? \d+", args.prompt)
+    ):
+        print(
+            "hint: the task contains file:line pointers — xhigh mostly buys exploration "
+            "depth those pointers make unnecessary; consider -e high.",
+            file=sys.stderr,
+        )
     prompt = _build_delegate_prompt(
         args.prompt,
         write=write,
@@ -1223,6 +1248,17 @@ def cmd_delegate(args: argparse.Namespace) -> int:
     if effort:
         cmd += ["-c", f"model_reasoning_effort={effort}"]
     cmd.append(prompt)
+
+    if getattr(args, "show_prompt", False):
+        # Dry run: show exactly what codex WOULD receive, then stop. Lets a
+        # caller sanity-check the assembled contract/budget/repo-map cheaply.
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
+        print("### DRY RUN (no codex launched)")
+        print("command: " + " ".join(cmd[:-1]) + " <PROMPT>")
+        print("--- PROMPT ---")
+        print(prompt)
+        return EX_OK
 
     heartbeat = RUNS_DIR / f"{os.getpid()}.json"
     heartbeat_meta = {
@@ -1456,6 +1492,20 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not inject the repo orientation map (repo_scope_short.md or a git "
         "top-level summary) into the prompt",
+    )
+    p_del.add_argument(
+        "-P",
+        "--repo-map",
+        default=None,
+        metavar="FILE",
+        help="inject THIS file as the repo orientation map instead of the automatic "
+        "repo_scope_short.md / git-summary choice (caller-curated context)",
+    )
+    p_del.add_argument(
+        "-n",
+        "--show-prompt",
+        action="store_true",
+        help="dry run: print the assembled codex command and prompt, launch nothing",
     )
     p_del.add_argument(
         "-j",

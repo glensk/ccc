@@ -619,6 +619,23 @@ codex-in-claude.py set-effort high                     # low|medium|high|xhigh|d
 codex-in-claude.py get-model --for debate
 ```
 
+`delegate` runs are **supervised**: `codex exec` lives in its own process group (killed whole
+on timeout, stall, or parent death — never an orphan editing the workspace), the wall timeout
+scales with effort (low 600s … xhigh 2700s; `-t 0` = no wall, the recommended mode when a task
+just takes as long as it takes), and an idle watchdog (`-i`, default 900s of silence) culls
+hung runs. Each run heartbeats a tiny JSON and reports its codex session as `### SESSION`:
+
+```commands
+codex-in-claude.py delegate -t 0 --write -C <repo> "task…"   # unbounded, stall-guarded
+codex-in-claude.py runs                                # one line per in-flight run (cheap check)
+codex-in-claude.py delegate -R <session> -f "fix X"    # resume that session's context (round 2+)
+codex-in-claude.py delegate -P notes/map.md "task…"    # curated repo map (-M = no map)
+codex-in-claude.py delegate -n "task…"                 # dry run: show assembled prompt, launch nothing
+```
+
+The prompt is auto-prefixed with the repo's `repo_scope_short.md` (else a git top-level
+summary) so codex starts oriented, and it is told its time budget explicitly.
+
 The same selector powers **future jobs**: a `new-job -j codex` / `-j codex-write` draft (or the
 TUI "Run as" menu) launches straight into `/codex-implement-task-and-claude-review`, so a parked
 task gets done by Codex and verified by Claude when you start it.
