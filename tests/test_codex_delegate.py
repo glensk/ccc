@@ -9,7 +9,9 @@ monkeypatched.
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
+import time
 from pathlib import Path
 from types import ModuleType
 
@@ -114,6 +116,7 @@ def _ns(**kw: object) -> argparse.Namespace:
         model=None,
         effort=None,
         timeout=600,
+        idle_timeout=0,  # unit tests: no stall watchdog
         # 0 disables the flock concurrency gate (limit <= 0 short-circuits in
         # _concurrency_slot), so these unit tests never touch the real slot dir.
         max_concurrent=0,
@@ -133,7 +136,7 @@ def test_delegate_prints_model_first_and_assembles_cmd(
         Path(out_path).write_text("### SELF-CHECK\nok\n### DIFF\n```diff\n```\n", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(cic.subprocess, "run", fake_run)
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
     rc = cic.cmd_delegate(_ns())
     out = capsys.readouterr().out
     assert rc == cic.EX_OK
@@ -153,7 +156,7 @@ def test_delegate_write_mode_uses_workspace_write(
         Path(cmd[cmd.index("-o") + 1]).write_text("done", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(cic.subprocess, "run", fake_run)
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
     monkeypatch.setattr(cic, "_git_status", lambda _cwd: [])
     assert cic.cmd_delegate(_ns(write=True)) == cic.EX_OK
     assert "workspace-write" in captured["cmd"]
@@ -168,7 +171,7 @@ def test_delegate_scout_is_readonly_plan(cic: ModuleType, monkeypatch: pytest.Mo
         Path(cmd[cmd.index("-o") + 1]).write_text("### PLAN\n1. ...", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(cic.subprocess, "run", fake_run)
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
     # scout wins over write → read-only sandbox, and the prompt is the scout contract
     assert cic.cmd_delegate(_ns(scout=True, write=True)) == cic.EX_OK
     assert "read-only" in captured["cmd"] and "workspace-write" not in captured["cmd"]
@@ -186,7 +189,7 @@ def test_delegate_effort(
         Path(cmd[cmd.index("-o") + 1]).write_text("ok", encoding="utf-8")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
-    monkeypatch.setattr(cic.subprocess, "run", fake_run)
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
     # no -e flag -> the config-default effort (xhigh) resolves, so the -c override IS
     # passed and the first line reflects it (shown_effort comes from config, not catalog).
     assert cic.cmd_delegate(_ns()) == cic.EX_OK
@@ -216,17 +219,100 @@ def test_delegate_exit_codes(cic: ModuleType, monkeypatch: pytest.MonkeyPatch) -
     def raise_notfound(*_: object, **__: object) -> None:
         raise FileNotFoundError
 
-    monkeypatch.setattr(cic.subprocess, "run", raise_notfound)
+    monkeypatch.setattr(cic, "_exec_codex", raise_notfound)
     assert cic.cmd_delegate(_ns()) == cic.EX_NO_CODEX
 
     def raise_timeout(*_: object, **__: object) -> None:
         raise subprocess.TimeoutExpired("codex", 1)
 
-    monkeypatch.setattr(cic.subprocess, "run", raise_timeout)
+    monkeypatch.setattr(cic, "_exec_codex", raise_timeout)
+    assert cic.cmd_delegate(_ns()) == cic.EX_TIMEOUT
+
+    def raise_stalled(*_: object, **__: object) -> None:
+        raise cic.CodexStalledError(120, "codex› last thing it said\n")
+
+    monkeypatch.setattr(cic, "_exec_codex", raise_stalled)
     assert cic.cmd_delegate(_ns()) == cic.EX_TIMEOUT
 
     assert cic.cmd_delegate(_ns(model="bogus")) == cic.EX_INVALID_MODEL
     assert cic.cmd_delegate(_ns(prompt="   ")) == cic.EX_USAGE
+
+
+# --------------------------- timeouts / budget / supervision --------------------------- #
+def test_effective_timeout_scales_with_effort(cic: ModuleType) -> None:
+    assert cic._effective_timeout(None, "low") == 600
+    assert cic._effective_timeout(None, "medium") == 900
+    assert cic._effective_timeout(None, "high") == 1500
+    assert cic._effective_timeout(None, "xhigh") == 2700
+    assert cic._effective_timeout(None, "unknown") == 900  # falls back to medium
+    assert cic._effective_timeout(42, "xhigh") == 42  # explicit -t always wins
+
+
+def test_prompt_time_budget_note(cic: ModuleType) -> None:
+    prompt = cic._build_delegate_prompt(
+        "do x", write=True, feedback=None, round_no=1, budget_minutes=45, idle_minutes=15
+    )
+    assert "TIME BUDGET: ~45 minutes" in prompt
+    assert "~15 minutes with NO output" in prompt
+    assert "open those FIRST" in prompt
+    # no budget -> no note (back-compat for direct callers)
+    bare = cic._build_delegate_prompt("do x", write=True, feedback=None, round_no=1)
+    assert "TIME BUDGET" not in bare
+
+
+def _fake_codex(tmp_path: Path, body: str) -> str:
+    """An executable stand-in for the codex CLI."""
+    script = tmp_path / "fake-codex.sh"
+    script.write_text("#!/bin/bash\n" + body)
+    script.chmod(0o755)
+    return str(script)
+
+
+def _wait_gone(pids: list[int], timeout_s: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        alive = []
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                alive.append(pid)
+            except ProcessLookupError:
+                pass
+        if not alive:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def test_exec_codex_wall_timeout_kills_process_tree(cic: ModuleType, tmp_path: Path) -> None:
+    """On wall timeout the WHOLE group dies — including the fixer's own children."""
+    pidfile = tmp_path / "pids"
+    fake = _fake_codex(tmp_path, f'sleep 300 &\necho "$$ $!" > "{pidfile}"\nsleep 300\n')
+    with pytest.raises(subprocess.TimeoutExpired):
+        cic._exec_codex([fake], env=dict(os.environ), timeout=2, idle_timeout=0)
+    pids = [int(p) for p in pidfile.read_text().split()]
+    assert len(pids) == 2 and _wait_gone(pids)
+
+
+def test_exec_codex_idle_watchdog_kills_stalled_run(cic: ModuleType, tmp_path: Path) -> None:
+    """A run that goes silent is killed by the idle watchdog, tree and all."""
+    pidfile = tmp_path / "pids"
+    fake = _fake_codex(
+        tmp_path,
+        f'sleep 300 &\necho "$$ $!" > "{pidfile}"\necho "one line then silence"\nsleep 300\n',
+    )
+    with pytest.raises(cic.CodexStalledError):
+        cic._exec_codex([fake], env=dict(os.environ), timeout=60, idle_timeout=1)
+    pids = [int(p) for p in pidfile.read_text().split()]
+    assert len(pids) == 2 and _wait_gone(pids)
+
+
+def test_exec_codex_happy_path_captures_output(cic: ModuleType, tmp_path: Path) -> None:
+    fake = _fake_codex(tmp_path, 'echo "reply on stdout"\necho "progress" >&2\nexit 0\n')
+    result = cic._exec_codex([fake], env=dict(os.environ), timeout=30, idle_timeout=0)
+    assert result.returncode == 0
+    assert "reply on stdout" in result.stdout
+    assert "progress" in result.stderr
 
 
 # --------------------------- skill/command description markers --------------------------- #

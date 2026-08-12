@@ -33,6 +33,14 @@ provide:
 
 That's the whole task string `$TASK`. Writing it needs zero file reads.
 
+**Exception — surgical tasks in a big repo.** When the fix is small and its location is
+known or cheaply findable, put exact pointers — file paths, line numbers, function names —
+INTO `$TASK`. Discovery is what times rounds out: an xhigh round hunting for one spawn site
+in a large repo can burn its whole wall clock exploring, while the same round with pointers
+finishes in minutes. One targeted grep on your side to pin the site is not "reading the
+codebase" — it is the cheapest token you'll spend all round. For genuinely surgical work
+also consider `-e high`: xhigh mostly buys depth of exploration you just made unnecessary.
+
 ## Modes (from the command's flags)
 
 - **patch** (default) — Codex is read-only; returns `### SELF-CHECK` + a git-apply-able `### DIFF`. You apply + verify.
@@ -82,11 +90,17 @@ For `round` = 1, 2, 3:
    Run this as a **background** Bash task (`run_in_background: true`). **Do not sleep, poll, or
    guess a wait time** — a backgrounded task runs across turns and the harness **re-invokes you
    the moment Codex exits** (that IS the "hand back when done" signal). When re-invoked, read its
-   captured output (the `model:` line + `### SELF-CHECK` and `### DIFF`/edits). Keep `-t` (default
-   600s) only as a safety ceiling. On non-zero exit branch on the code: `4` codex missing/auth →
-   tell the user `codex login`; `5` timeout → retry once with a larger `-t`; `6` codex error → show
-   stderr, stop; `8` quota-exhausted → the preflight skipped it (didn't launch); the reset time is
-   already in the engine's error line — relay it and resume after reset, do NOT retry in a loop.
+   captured output (the `model:` line + `### SELF-CHECK` and `### DIFF`/edits). The wall
+   timeout `-t` defaults by effort (low 600s, medium 900s, high 1500s, xhigh 2700s) and an
+   idle watchdog (`-i`, default 900s of total silence) kills hung runs; codex's live progress
+   streams into the background task's output file (`codex›` lines), so tail it mid-run to
+   see whether codex is exploring, editing, or stuck. On non-zero exit branch on the code:
+   `4` codex missing/auth → tell the user `codex login`; `5` timeout/stall → read the
+   streamed progress tail first, then pick ONE: sharpen `$TASK` with file:line pointers (if
+   it died exploring), retry with a larger `-t` (if it died mid-implementation), or drop to
+   `-e high`; `6` codex error → show stderr, stop; `8` quota-exhausted → the preflight
+   skipped it (didn't launch); the reset time is already in the engine's error line — relay
+   it and resume after reset, do NOT retry in a loop.
 
 2. **Verify — run the checks FIRST (this is codebase-blind):** run the project's tests + lint +
    build and read the exit codes. You do **not** need to understand the code to do this.

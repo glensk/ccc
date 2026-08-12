@@ -32,8 +32,16 @@ marker into the codex skill/command descriptions (see ``sync-skills``), so the m
 Claude Code's slash-command help never drifts from the config.
 
 ``delegate`` exit codes (the skill branches on these):
-  0 ok | 2 usage | 3 invalid-model | 4 codex-missing-or-auth | 5 timeout |
+  0 ok | 2 usage | 3 invalid-model | 4 codex-missing-or-auth | 5 timeout-or-stall |
   6 codex-nonzero | 7 bad-patch (reserved) | 8 quota-exhausted (skipped, see below).
+
+Supervision: ``codex exec`` runs in its own process group and the WHOLE tree is killed on
+wall timeout, idle stall, or parent SIGTERM/SIGINT — a killed delegate can never leave
+codex editing the workspace behind the caller's back. The wall timeout defaults by effort
+(``DEFAULT_TIMEOUTS``: low 600 s .. xhigh 2700 s; ``-t`` overrides), an idle watchdog
+(``-i``, default 900 s of total silence) converts hangs into fast failures, codex stderr is
+streamed through (``codex› `` prefix) for live progress, and the prompt itself tells codex
+its time budget so it spends the clock implementing instead of exploring.
 
 Concurrency + quota awareness: each ``delegate`` first runs a **quota preflight** — it reads
 the Codex ``rate_limits`` (5h + weekly) from ``$CODEX_HOME/sessions/**/rollout-*.jsonl`` and,
@@ -53,14 +61,16 @@ import fcntl
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from collections.abc import Iterator
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 DEFAULT_MODEL = "gpt-5.6-sol"  # newest/best per the Codex catalog
 COMMANDS = ("delegate-review", "debate")  # codex-related commands this manager governs
@@ -76,10 +86,147 @@ SLOT_DIR = Path(
     )
 )
 
+# Default wall timeout for one delegate round, keyed by reasoning effort. Higher
+# effort reasons (and therefore explores) far longer: a fixed 600s default made
+# every xhigh run on a non-trivial repo time out during discovery.
+DEFAULT_TIMEOUTS = {"low": 600, "medium": 900, "high": 1500, "xhigh": 2700}
+# Kill a run after this long with NO output at all (network hang / wedged CLI),
+# clamped to the wall timeout. 0 disables.
+DEFAULT_IDLE_TIMEOUT = 900
+
 # delegate exit codes
 EX_OK, EX_USAGE = 0, 2
 EX_INVALID_MODEL, EX_NO_CODEX, EX_TIMEOUT, EX_CODEX_FAIL, EX_BAD_PATCH = 3, 4, 5, 6, 7
 EX_QUOTA = 8  # skipped: Codex quota exhausted (>=100% used on a live window)
+
+
+def _effective_timeout(explicit: int | None, effort: str) -> int:
+    """The wall timeout for a round: the explicit ``-t`` value, else effort-scaled."""
+    if explicit is not None:
+        return explicit
+    return DEFAULT_TIMEOUTS.get(effort, DEFAULT_TIMEOUTS["medium"])
+
+
+class CodexStalledError(RuntimeError):
+    """Codex produced no output for longer than the idle watchdog allows."""
+
+    def __init__(self, idle_seconds: int, stderr_text: str) -> None:
+        super().__init__(f"no codex output for {idle_seconds}s")
+        self.idle_seconds = idle_seconds
+        self.stderr_text = stderr_text
+
+
+def _exec_codex(
+    cmd: list[str],
+    *,
+    env: dict[str, str],
+    timeout: int,
+    idle_timeout: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Run ``codex exec`` supervised; the process TREE can never outlive us.
+
+    Differences from a bare ``subprocess.run``:
+
+    - the child gets its own process group (``start_new_session``) and the whole
+      group is killed (SIGTERM, 2 s grace, SIGKILL) on wall timeout, idle stall,
+      parent SIGTERM/SIGINT, or any exception — a killed delegate previously
+      left ``codex exec`` (and its shell-tool children) running detached, still
+      editing the workspace in ``--write`` mode;
+    - codex's stderr is streamed line-by-line to our stderr (prefixed
+      ``codex› ``) so a caller watching the output file can SEE whether codex is
+      exploring, editing, or hung — instead of total silence until the end;
+    - an idle watchdog (``idle_timeout`` seconds with no output on either
+      stream) converts a wedged run into a fast, diagnosable failure.
+
+    Raises FileNotFoundError (binary missing), subprocess.TimeoutExpired (wall),
+    or CodexStalledError (idle) — partial output attached to the last two.
+    """
+    proc = subprocess.Popen(  # pylint: disable=consider-using-with  # lifetime managed by the finally sweep
+        cmd,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    out_buf: list[str] = []
+    err_buf: list[str] = []
+    last_activity = [time.monotonic()]
+
+    def reader(stream: Any, buf: list[str], tee: bool) -> None:
+        for line in stream:
+            buf.append(line)
+            last_activity[0] = time.monotonic()
+            if tee:
+                shown = line if len(line) <= 400 else line[:400] + "…\n"
+                sys.stderr.write("codex› " + shown)
+                sys.stderr.flush()
+        stream.close()
+
+    threads = [
+        threading.Thread(target=reader, args=(proc.stdout, out_buf, False), daemon=True),
+        threading.Thread(target=reader, args=(proc.stderr, err_buf, True), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    def kill_group() -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+
+    previous: dict[int, Any] = {}
+
+    def relay(signum: int, _frame: Any) -> None:
+        kill_group()
+        signal.signal(signum, previous[signum])  # restore, then re-deliver
+        os.kill(os.getpid(), signum)
+
+    # Signal handlers are only legal in the main thread; elsewhere the finally
+    # sweep still covers every non-signal exit path.
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            previous[sig] = signal.signal(sig, relay)
+    start = time.monotonic()
+    try:
+        while True:
+            try:
+                proc.wait(timeout=1)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now - start >= timeout:
+                    kill_group()
+                    raise subprocess.TimeoutExpired(
+                        cmd, timeout, output="".join(out_buf), stderr="".join(err_buf)
+                    ) from None
+                if idle_timeout and now - last_activity[0] >= idle_timeout:
+                    kill_group()
+                    raise CodexStalledError(int(now - last_activity[0]), "".join(err_buf)) from None
+        for thread in threads:
+            thread.join(timeout=2)
+        return subprocess.CompletedProcess(cmd, proc.returncode, "".join(out_buf), "".join(err_buf))
+    finally:
+        kill_group()
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+def _stderr_tail(text: str, lines: int = 8) -> str:
+    """The last few non-empty stderr lines — what codex was doing when killed."""
+    kept = [line for line in text.splitlines() if line.strip()]
+    return "\n".join(kept[-lines:])
+
 
 # Codex usage (rate-limit) reading — Codex has no usage API; it writes a rate_limits
 # block onto token_count events in $CODEX_HOME/sessions/**/rollout-*.jsonl.
@@ -551,11 +698,34 @@ _SCOUT_CONTRACT = (
 
 
 def _build_delegate_prompt(
-    task: str, *, write: bool, feedback: str | None, round_no: int, scout: bool = False
+    task: str,
+    *,
+    write: bool,
+    feedback: str | None,
+    round_no: int,
+    scout: bool = False,
+    budget_minutes: int | None = None,
+    idle_minutes: int | None = None,
 ) -> str:
-    """Compose the Codex prompt: contract header + task (+ revision feedback)."""
+    """Compose the Codex prompt: contract header + time budget + task (+ feedback)."""
     header = _SCOUT_CONTRACT if scout else (_WRITE_CONTRACT if write else _PATCH_CONTRACT)
-    parts = [header, "\n---\nTASK:\n", task.strip(), "\n"]
+    parts = [header]
+    if budget_minutes:
+        idle_part = (
+            f" It is also killed after ~{idle_minutes} minutes with NO output at all."
+            if idle_minutes
+            else ""
+        )
+        parts += [
+            f"\nTIME BUDGET: ~{budget_minutes} minutes of wall-clock for this ENTIRE run, "
+            "enforced externally — overrunning yields NOTHING, not a partial result."
+            + idle_part
+            + " Budget discovery accordingly: when the TASK names files, functions, or line "
+            "numbers, open those FIRST and trust them; prefer targeted searches over "
+            "repo-wide exploration; leave time to implement and verify. A verified partial "
+            "result beats an unfinished perfect one.\n",
+        ]
+    parts += ["\n---\nTASK:\n", task.strip(), "\n"]
     if feedback and feedback.strip():
         parts += [
             f"\n--- REVISION (round {round_no}). Claude reviewed your previous attempt and it "
@@ -832,12 +1002,19 @@ def cmd_delegate(args: argparse.Namespace) -> int:
 
     write = args.write and not args.scout  # scouting is always read-only (plan, no edits)
     sandbox = "workspace-write" if write else "read-only"
+    wall_timeout = _effective_timeout(args.timeout, shown_effort)
+    idle_flag = getattr(args, "idle_timeout", None)
+    idle_timeout = (
+        min(DEFAULT_IDLE_TIMEOUT, wall_timeout) if idle_flag is None else max(0, idle_flag)
+    )
     prompt = _build_delegate_prompt(
         args.prompt,
         write=write,
         feedback=args.feedback,
         round_no=args.round,
         scout=args.scout,
+        budget_minutes=max(1, wall_timeout // 60),
+        idle_minutes=(max(1, idle_timeout // 60) if idle_timeout else None),
     )
     env = dict(os.environ)
     env["CCC_NO_CODEX"] = "1"  # never re-trigger the plan/k8s automation
@@ -853,33 +1030,41 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         cmd += ["-C", args.cwd]
     cmd.append(prompt)
 
-    # Take one concurrency slot before launching codex; the rest of a fan-out waits.
-    with _concurrency_slot(_max_concurrent(args.max_concurrent)):
-        # When Codex may write, snapshot the worktree so the caller reviews ONLY Codex's diff.
-        before = _git_status(args.cwd) if write else None
-        try:
-            proc = subprocess.run(
-                cmd, env=env, capture_output=True, text=True, timeout=args.timeout, check=False
-            )
-        except FileNotFoundError:
-            print("ERROR: `codex` CLI not found on PATH.", file=sys.stderr)
-            return EX_NO_CODEX
-        except subprocess.TimeoutExpired:
-            print(
-                f"ERROR: Codex timed out after {args.timeout}s "
-                "(slow/flaky connection? retry or raise --timeout).",
-                file=sys.stderr,
-            )
-            return EX_TIMEOUT
     try:
-        reply = Path(out_path).read_text(encoding="utf-8").strip()
-    except OSError:
-        reply = ""
-    finally:
+        # Take one concurrency slot before launching codex; the rest of a fan-out waits.
+        with _concurrency_slot(_max_concurrent(args.max_concurrent)):
+            # When Codex may write, snapshot the worktree so the caller reviews ONLY its diff.
+            before = _git_status(args.cwd) if write else None
+            try:
+                proc = _exec_codex(cmd, env=env, timeout=wall_timeout, idle_timeout=idle_timeout)
+            except FileNotFoundError:
+                print("ERROR: `codex` CLI not found on PATH.", file=sys.stderr)
+                return EX_NO_CODEX
+            except subprocess.TimeoutExpired as exc:
+                tail = _stderr_tail(str(exc.stderr or ""))
+                print(
+                    f"ERROR: Codex hit the {wall_timeout}s wall timeout (whole process tree "
+                    "killed). Retry with a larger -t, a lower effort, or a tighter task."
+                    + (f" Last output:\n{tail}" if tail else ""),
+                    file=sys.stderr,
+                )
+                return EX_TIMEOUT
+            except CodexStalledError as exc:
+                tail = _stderr_tail(exc.stderr_text)
+                print(
+                    f"ERROR: Codex stalled — no output for {exc.idle_seconds}s (whole process "
+                    "tree killed). Likely a hung network/CLI; retry, or tune --idle-timeout."
+                    + (f" Last output:\n{tail}" if tail else ""),
+                    file=sys.stderr,
+                )
+                return EX_TIMEOUT
         try:
-            os.unlink(out_path)
+            reply = Path(out_path).read_text(encoding="utf-8").strip()
         except OSError:
-            pass
+            reply = ""
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(out_path)
 
     if not reply and proc.returncode != 0:
         print(f"ERROR: Codex exited {proc.returncode}:\n{proc.stderr.strip()}", file=sys.stderr)
@@ -1023,7 +1208,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="override reasoning effort (else config/model default)",
     )
     p_del.add_argument(
-        "-t", "--timeout", type=int, default=600, help="seconds before giving up (default 600)"
+        "-t",
+        "--timeout",
+        type=int,
+        default=None,
+        help="wall-clock seconds before the run is killed (default scales with effort: "
+        "low 600, medium 900, high 1500, xhigh 2700)",
+    )
+    p_del.add_argument(
+        "-i",
+        "--idle-timeout",
+        type=int,
+        default=None,
+        metavar="SECS",
+        help="kill the run after this long with NO codex output "
+        "(default min(900, wall timeout); 0 disables the stall watchdog)",
     )
     p_del.add_argument(
         "-j",
