@@ -19,6 +19,8 @@ recolour, and its ``$ITERM_SESSION_ID`` may since have been recycled.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
@@ -67,15 +69,63 @@ def _assign(tab_slug: str, rgb: tuple[int, int, int]) -> bool:
     return True
 
 
-def _resolved_tabs(sessions: Iterable[Session]) -> list[tuple[str, tuple[int, int, int]]]:
-    """``(slug, rgb)`` per distinct TAB, oldest session first; unresolvable ones dropped.
+def _repaint_enabled() -> bool:
+    """Real terminal repaints are suppressed in sandboxed runs (tests, ``ccc demo``).
+
+    The ``CCC_TAB_RGB_DIR`` override marks exactly those runs: the colour cache is
+    redirected away from the real one, so escapes must not reach a real tab either.
+    """
+    return "CCC_TAB_RGB_DIR" not in os.environ
+
+
+def _pane_tty(pid: int | None) -> str | None:
+    """The tty DEVICE of *pid*'s pane (``/dev/ttysNNN``), or ``None``.
+
+    Writing the tab-colour escapes to the pane's device recolours the real tab at
+    once — the session's own status line may not re-render for a long time on an
+    idle session, and its subprocess has no controlling terminal anyway.
+    """
+    if not pid:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603  (fixed argv, no shell)
+            ["/bin/ps", "-o", "tty=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return f"/dev/{out}" if out and out != "??" else None
+
+
+def _repaint(tty_device: str, rgb: tuple[int, int, int]) -> None:
+    """Write the iTerm tab-colour OSC escapes to *tty_device* (best-effort)."""
+    red, green, blue = rgb
+    seq = (
+        f"\033]6;1;bg;red;brightness;{red}\a"
+        f"\033]6;1;bg;green;brightness;{green}\a"
+        f"\033]6;1;bg;blue;brightness;{blue}\a"
+    )
+    try:
+        with open(tty_device, "w", encoding="ascii") as handle:
+            handle.write(seq)
+    except OSError:
+        pass
+
+
+def _resolved_tabs(
+    sessions: Iterable[Session],
+) -> list[tuple[str, tuple[int, int, int], int | None]]:
+    """``(slug, rgb, pid)`` per distinct TAB, oldest session first; unresolvable ones dropped.
 
     Keyed by tab, not by session: two sessions sharing one ``$ITERM_SESSION_ID`` (a nested
     ``claude``, a resume that re-used the tab) are ONE tab wearing ONE colour — counting
     them twice would make them collide with themselves and churn the cache every pass.
     """
     order = sorted(sessions, key=lambda s: (s.created_at, s.session_id))
-    tabs: list[tuple[str, tuple[int, int, int]]] = []
+    tabs: list[tuple[str, tuple[int, int, int], int | None]] = []
     seen: set[str] = set()
     for session in order:
         iid = session.iterm_session_id
@@ -85,7 +135,7 @@ def _resolved_tabs(sessions: Iterable[Session]) -> list[tuple[str, tuple[int, in
         if rgb is None:
             continue  # unmapped folder and no cached colour — nothing to collide with
         seen.add(slug(iid))
-        tabs.append((slug(iid), rgb))
+        tabs.append((slug(iid), rgb, session.last_seen_pid))
     return tabs
 
 
@@ -99,19 +149,27 @@ def dedupe_live(sessions: Iterable[Session]) -> list[str]:
 
     Idempotent: a recoloured tab resolves to its own cached colour on the next pass, so the
     group no longer collides and nothing is written.
+
+    A rewritten tab is also repainted at once through its pane's tty device (resolved
+    from the session's pid): an idle session's status line may not re-render for a long
+    time, and it would otherwise keep wearing the stale colour until it does.
     """
     tabs = _resolved_tabs(sessions)
-    groups: dict[tuple[int, int, int], list[str]] = {}
-    for tab_slug, rgb in tabs:
-        groups.setdefault(rgb, []).append(tab_slug)
+    groups: dict[tuple[int, int, int], list[tuple[str, int | None]]] = {}
+    for tab_slug, rgb, pid in tabs:
+        groups.setdefault(rgb, []).append((tab_slug, pid))
     used = set(groups)
     recoloured: list[str] = []
     for group in groups.values():
-        for tab_slug in group[1:]:  # group[0] is the oldest tab — it keeps the colour
+        for tab_slug, pid in group[1:]:  # group[0] is the oldest tab — it keeps the colour
             free = next((rgb for rgb in PALETTE if rgb not in used), None)
             if free is None:
                 break  # palette exhausted: the rest keep the shared colour
             if _assign(tab_slug, free):
                 used.add(free)
                 recoloured.append(tab_slug)
+                if _repaint_enabled():
+                    tty_device = _pane_tty(pid)
+                    if tty_device:
+                        _repaint(tty_device, free)
     return recoloured

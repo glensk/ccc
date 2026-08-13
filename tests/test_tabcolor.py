@@ -126,3 +126,53 @@ def test_palette_is_distinct_and_ample() -> None:
     assert len(set(tabcolor.PALETTE)) == len(tabcolor.PALETTE)  # no duplicate colours
     assert len(tabcolor.PALETTE) >= 12  # enough slots for a busy screen of same-repo tabs
     assert all(len(rgb) == 3 and all(0 <= c <= 255 for c in rgb) for rgb in tabcolor.PALETTE)
+
+
+def test_recolour_repaints_the_pane_tty(
+    _tmp_rgb_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A recoloured tab is repainted at once through its pane's tty device.
+
+    The session's own status line may not re-render for a long time on an idle session
+    (and its subprocess has no controlling terminal), so dedupe writes the tab-colour
+    escapes itself. The tty is faked with a file; production resolves it from the pid.
+    """
+    monkeypatch.setattr(colors, "folder_rgb", lambda _cwd: (7, 8, 9))
+    fake_tty = tmp_path / "ttys999"
+    fake_tty.touch()
+    monkeypatch.setattr(tabcolor, "_repaint_enabled", lambda: True)
+    monkeypatch.setattr(tabcolor, "_pane_tty", lambda pid: str(fake_tty) if pid else None)
+    sessions = [
+        _session("aaaa", "w0t0p0:A", created_at=1000),
+        _session("bbbb", "w0t1p0:B", created_at=2000),
+    ]
+    sessions[1].last_seen_pid = 4242
+
+    assert tabcolor.dedupe_live(sessions) == ["w0t1p0_B"]
+
+    red, green, blue = colors.tab_rgb("w0t1p0:B") or (0, 0, 0)
+    assert fake_tty.read_text(encoding="ascii") == (
+        f"\033]6;1;bg;red;brightness;{red}\a"
+        f"\033]6;1;bg;green;brightness;{green}\a"
+        f"\033]6;1;bg;blue;brightness;{blue}\a"
+    )
+
+
+def test_repaint_suppressed_in_sandboxed_runs(
+    _tmp_rgb_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With CCC_TAB_RGB_DIR redirected (tests, demo), no escape may reach a real tty."""
+    assert tabcolor._repaint_enabled() is False  # the autouse fixture sets the override
+
+    def _boom(_pid: int | None) -> str | None:
+        raise AssertionError("repaint path must not be entered in sandboxed runs")
+
+    monkeypatch.setattr(colors, "folder_rgb", lambda _cwd: (7, 8, 9))
+    monkeypatch.setattr(tabcolor, "_pane_tty", _boom)
+    sessions = [
+        _session("aaaa", "w0t0p0:A", created_at=1000),
+        _session("bbbb", "w0t1p0:B", created_at=2000),
+    ]
+    sessions[1].last_seen_pid = 4242
+
+    assert tabcolor.dedupe_live(sessions) == ["w0t1p0_B"]  # recolour still happens, silently

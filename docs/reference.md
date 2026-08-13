@@ -1067,8 +1067,12 @@ every one but the oldest is assigned an unused colour from a distinct-hue palett
 itself and the Claude Code status line follow: the assignment is written to the per-tab
 `iterm-tab-rgb` cache plus a `<slug>.manual` marker, and with that marker present the
 status-line wrapper takes the cached colour as authoritative and repaints the real tab to it
-on its next render — no terminal API involved. It runs on every TUI refresh, writes only on a
-real collision, and is idempotent (a recoloured tab already resolves distinct next pass).
+on its next render — no terminal API involved. The recoloured tab is also repainted
+immediately: dedupe resolves the session's pane tty from its pid (`ps -o tty=`) and writes
+the colour escapes straight to that device, so even an idle session — whose status line may
+not re-render for a long time — wears the new colour at once. It runs on every TUI refresh,
+writes only on a real collision, and is idempotent (a recoloured tab already resolves
+distinct next pass).
 
 Badges come from a palette spanning **six shapes** (circle / square / diamond /
 triangle / heart / star) across well-separated colors. Assignment is **greedy and
