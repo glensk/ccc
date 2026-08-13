@@ -196,7 +196,7 @@ _DONE_STYLE = "green3"
 _GOLD = "#ffaf00"
 # Prompt-cache TTL countdown colours (see cachettl). Hex values equal xterm-256 40/208/196
 # so this column renders pixel-identically to the ``ccc ls`` version; orange is #ff8700.
-_CACHE_STYLE = {"green": "#00d700", "orange": "#ff8700", "red": "#ff0000"}
+_CACHE_STYLE = {"green": "#00d700", "orange": "#ff8700", "red": "#ff0000", "running": "#00d700"}
 _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt preview
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
@@ -2509,6 +2509,10 @@ class CommandCenterApp(App[None]):
             icon_glyph, icon_style = STATUS_ICON[Status.WORKING], _STATUS_STYLE[Status.WORKING]
         else:
             icon_glyph, icon_style = STATUS_ICON.get(row.status, "?"), base
+        # Busy (green ▶, incl. the subagent branch above). Drives BOTH the model column's
+        # ▶-instead-of-♨ cell (a running session re-warms its cache every request, so the
+        # countdown says nothing — see cachettl) and the whole-line recede further down.
+        working = icon_glyph == STATUS_ICON[Status.WORKING] and not session.draft
         # A row with an UNSATISFIED dependency wears the red |--> marker starting at column
         # 0 (col0 = "|", col1 = "--", col2 = ">" + the status icon), pushing the icon into
         # the ver cell; cell_padding=0 renders them contiguous ("|-->✎"). Placement (whether
@@ -2604,11 +2608,15 @@ class CommandCenterApp(App[None]):
             # OBSERVED model·effort the session ran on, with the prompt-cache TTL countdown
             # prepended BEFORE the account glyph (how long the session's Anthropic prompt
             # cache stays warm — transcript mtime + TTL). Done rows skip it, mirroring the
-            # statusline's ♨/❄ readout (see cachettl).
+            # statusline's ♨/❄ readout (see cachettl); a busy row reads ▶ instead, since a
+            # running session re-warms its cache continuously (the ♨ is for rows waiting on
+            # you, where "still cheap to resume?" is a real question).
             style = _DONE_STYLE if done else "grey50"
             model_cell = Text(" ", style=style)
             if not done:
-                cache_text, cache_level = cachettl.countdown_for(self.adapter, session)
+                cache_text, cache_level = cachettl.countdown_for(
+                    self.adapter, session, running=working
+                )
                 if cache_text:
                     model_cell.append(cache_text + " ", style=_CACHE_STYLE[cache_level])
             model_cell.append(home + model_effort_cell(session.model, session.effort), style=style)
@@ -2682,7 +2690,7 @@ class CommandCenterApp(App[None]):
         # only the green ▶ keeps its colour ("running, hands off"). Covers Status.WORKING plus
         # the has_subagent branch (both paint ▶); marked (red-dep) rows are excluded so their
         # dependency marker stays untouched. stylize() appends an overriding span by design.
-        running = not session.draft and not marked and icon_glyph == STATUS_ICON[Status.WORKING]
+        running = working and not marked
         if running:
             for cell in (
                 imp,

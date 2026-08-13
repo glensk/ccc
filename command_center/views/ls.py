@@ -55,7 +55,7 @@ _STATUS_COLOR: dict[Status, int] = {
 _SEVERITY_COLOR = {"green": 35, "amber": 214, "red": 196, "none": 244}
 # Prompt-cache TTL countdown colours (see cachettl). Orange is 208 (#ff8700) to match the
 # TUI's own #ff8700; green/red reuse the palette's clear bright green / severity red.
-_CACHE_COLOR = {"green": 40, "orange": 208, "red": 196}
+_CACHE_COLOR = {"green": 40, "orange": 208, "red": 196, "running": 40}
 _DIM = 240
 _WHITE = 15
 _BLACK = 16
@@ -209,10 +209,14 @@ def _render_row(
     )
     # Prompt-cache TTL countdown, prepended BEFORE the account glyph: how long this
     # session's Anthropic prompt cache stays warm (transcript mtime + TTL). Skipped on
-    # drafts (never ran) and done rows, mirroring the statusline's ♨/❄ readout (cachettl).
+    # drafts (never ran) and done rows, mirroring the statusline's ♨/❄ readout (cachettl);
+    # a busy row reads ▶ instead — it re-warms its cache every request, so the countdown is
+    # only meaningful on the rows waiting on you (or parked). Mirrors the TUI.
     cache_cell = ""
     if adapter is not None and not session.draft and status is not Status.DONE:
-        cache_text, cache_level = cachettl.countdown_for(adapter, session)
+        cache_text, cache_level = cachettl.countdown_for(
+            adapter, session, running=status is Status.WORKING
+        )
         if cache_text:
             cache_cell = _paint(_CACHE_COLOR[cache_level], cache_text, enabled) + " "
     model_cell = cache_cell + home + _paint(_DIM, model_text, enabled)

@@ -289,3 +289,47 @@ def test_env_ttl_override_applies_to_countdown_for(
     path = _write(tmp_path / "t.jsonl", [_assistant(now - 600)], mtime=now)
     # ttl 1800, 600 s since the last turn → 1200 s remaining → green.
     assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now) == ("♨ 20:00", "green")
+
+
+# --------------------------------------------------------------------------- running rows
+def test_countdown_for_running_row_is_play_icon(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A busy row reads ``▶`` (level ``running``) instead of a countdown — even warm."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 300)], mtime=now)
+    adapter = _FakeAdapter(path)
+    # Same session, same transcript: warm without the flag, ▶ with it.
+    assert cachettl.countdown_for(adapter, _session(), now=now) == ("♨ 55:00", "green")
+    assert cachettl.countdown_for(adapter, _session(), now=now, running=True) == ("▶", "running")
+
+
+def test_countdown_for_running_row_matches_working_status_icon() -> None:
+    """The busy glyph stays the WORKING status icon (cachettl deliberately avoids the import)."""
+    from command_center.models import STATUS_ICON, Status
+
+    assert cachettl._RUNNING_GLYPH == STATUS_ICON[Status.WORKING]
+
+
+def test_countdown_for_running_row_reads_no_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The short-circuit happens before any stat/read — busy rows cost no transcript I/O."""
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    now = 1_000_000.0
+    path = _write(tmp_path / "t.jsonl", [_assistant(now - 300)], mtime=now)
+
+    def _no_open(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a running row must not open the transcript")
+
+    def _no_stat(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a running row must not stat the transcript")
+
+    monkeypatch.setattr(Path, "open", _no_open)
+    monkeypatch.setattr(Path, "stat", _no_stat)
+    assert cachettl.countdown_for(_FakeAdapter(path), _session(), now=now, running=True) == (
+        "▶",
+        "running",
+    )
+    assert path not in cachettl._ANCHOR_CACHE

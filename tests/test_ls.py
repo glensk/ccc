@@ -297,6 +297,45 @@ def test_render_row_cache_countdown_before_home_glyph(
     assert line.index("♨") < line.index("🏠")
 
 
+def test_render_row_cache_countdown_is_play_icon_while_working(tmp_path: Path) -> None:
+    """A busy (▶ WORKING) row shows ▶ in the model column, not the ♨ countdown."""
+    session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+    line = ls_view._render_row(
+        Row(session, None, Status.WORKING, 0, 0),
+        True,
+        2,
+        50,
+        _MULTI_MARKERS,
+        cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
+    )[0]
+    assert "♨" not in line
+    assert "▶" in line
+    assert accounts._HOME_GLYPH in line
+
+
+def test_render_row_cache_countdown_kept_on_every_non_working_status(tmp_path: Path) -> None:
+    """Every other live/parked status keeps the ♨ countdown (waiting, idle, snoozed, …)."""
+    transcript = _fresh_transcript(tmp_path)
+    for status in (
+        Status.WAITING_INPUT,
+        Status.IDLE,
+        Status.SNOOZED,
+        Status.HALTED,
+        Status.WAITING_CODEX,
+        Status.PARKED,
+    ):
+        session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
+        line = ls_view._render_row(
+            Row(session, None, status, 0, 0),
+            True,
+            2,
+            50,
+            _MULTI_MARKERS,
+            cast(Adapter, _FakeAdapter(transcript)),
+        )[0]
+        assert "♨" in line, status
+
+
 def test_render_row_cache_countdown_absent_without_transcript() -> None:
     """No transcript → empty cell (no ♨), glyph still rendered."""
     session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")

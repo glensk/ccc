@@ -32,6 +32,13 @@ countdown" block); the thresholds/colours here are authoritative:
 * remaining ≤ 0 → ``❄ cold`` **red**
 * no transcript (missing / draft / done row) → empty cell
 
+A **busy** row is the exception: a session that is mid-turn re-warms its cache on every
+request, so its countdown just idles near the full TTL and answers a question nobody is
+asking (you are not deciding whether to resume a session that is already running). Busy
+rows therefore read ``▶`` (level ``"running"``) — the countdown is reserved for the rows
+that are waiting on you (or parked), where "is this still cheap to resume?" is the
+actual question. See :func:`countdown_for`'s *running* flag.
+
 :func:`countdown` is a pure function of ``(anchor, now)`` — it returns a ``(text, level)``
 pair where ``level`` is a colour-agnostic name (``"green"``/``"orange"``/``"red"``/``""``).
 Each view maps that level to its own palette (``ccc ls`` uses xterm-256 codes, the TUI uses
@@ -65,6 +72,12 @@ _ORANGE_MIN_S = 600
 # Warm/cold glyphs (kept identical to the statusline's ♨ / ❄).
 _WARM_GLYPH = "♨"
 _COLD_TEXT = "❄ cold"
+
+# Busy-row cell: the WORKING status glyph, with its own colour level so each view can paint
+# it like its ▶ status icon (models.STATUS_ICON[Status.WORKING] — kept in sync by
+# test_cachettl.py rather than imported, to keep this module free of a models import).
+_RUNNING_GLYPH = "▶"
+_RUNNING_LEVEL = "running"
 
 # Backwards-read chunk sizing. We scan the transcript tail from EOF toward the start in
 # chunks, doubling each step (capped) until a qualifying assistant line is found or the
@@ -264,13 +277,22 @@ def transcript_anchor(adapter: object, session: Session, now: float, ttl: int) -
     return anchor
 
 
-def countdown_for(adapter: object, session: Session, now: float | None = None) -> tuple[str, str]:
+def countdown_for(
+    adapter: object, session: Session, now: float | None = None, *, running: bool = False
+) -> tuple[str, str]:
     """:func:`countdown` for *session* — resolve its cache anchor, then format.
 
     A convenience the views call once per (non-draft, non-done) row; *now* defaults to the
     wall clock and is injectable for tests. The draft/done gating stays in the views (they
     already branch on it) — this only turns a live/parked/waiting row into a cell.
+
+    *running* (the row is mid-turn — the green ▶ status icon) short-circuits to
+    ``("▶", "running")``: a busy session keeps re-warming its cache, so the countdown is
+    both meaningless and misleading there. It returns before any ``stat``/read, so busy
+    rows also cost no transcript I/O per refresh.
     """
+    if running:
+        return (_RUNNING_GLYPH, _RUNNING_LEVEL)
     now = time.time() if now is None else now
     ttl = cache_ttl_seconds()
     return countdown(transcript_anchor(adapter, session, now, ttl), now, ttl=ttl)

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -2415,6 +2416,59 @@ def test_marked_codex_ver_cell_width_over_all_status_icons(
                 assert icon.plain == "|"
                 assert imp.plain == "--"
                 assert ver.plain.startswith(">")
+
+    asyncio.run(scenario())
+
+
+def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Model column: ▶ on a busy row, the ♨ TTL countdown on every other live/parked row."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
+    from command_center.core import Row
+    from command_center.models import Session, Status
+    from command_center.views.tui import CommandCenterApp, SessionTable
+
+    # A transcript whose newest line is a fresh main-chain assistant turn → warm cache.
+    now = time.time()
+    stamp = datetime.fromtimestamp(now - 60, tz=UTC).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    transcript = tmp_path / "warm.jsonl"
+    transcript.write_text(
+        json.dumps({"type": "assistant", "timestamp": stamp}, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.update_detail = lambda: None  # type: ignore[method-assign]  # skip the highlight→detail side-effect
+            monkeypatch.setattr(
+                app.adapter, "transcript_path", lambda *_a, **_kw: transcript, raising=False
+            )
+            table = app.query_one("#sessions", SessionTable)
+            for status in (
+                Status.WORKING,
+                Status.WAITING_INPUT,
+                Status.IDLE,
+                Status.SNOOZED,
+                Status.HALTED,
+                Status.PARKED,
+            ):
+                table.clear()
+                sid = f"cache-{status.value}"
+                session = Session(session_id=sid, cwd="/repo", aim="x")
+                app._add_session_row(table, Row(session, None, status, 0, 0))
+                model_cell = table.get_row_at(table.get_row_index(sid))[5]
+                assert isinstance(model_cell, Text)
+                if status is Status.WORKING:
+                    # Busy: it re-warms its cache every request, so the countdown says nothing.
+                    assert "▶" in model_cell.plain, model_cell.plain
+                    assert "♨" not in model_cell.plain
+                else:
+                    assert "♨" in model_cell.plain, f"{status}: {model_cell.plain!r}"
+                    assert "▶" not in model_cell.plain
 
     asyncio.run(scenario())
 
