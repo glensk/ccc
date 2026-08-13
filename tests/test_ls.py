@@ -297,6 +297,25 @@ def test_render_row_cache_countdown_before_home_glyph(
     assert line.index("♨") < line.index("🏠")
 
 
+def test_render_row_draft_id_cell_matches_live_id_width() -> None:
+    """A FUTURE (draft) row's short 4-hex id pads to the live rows' id width.
+
+    Regression: the draft branch emitted the bare hash, so every column after the id sat 4
+    screen columns left of the live rows' — the whole line was misaligned.
+    """
+    sid = "01a1f554-c8a7-446f-82d5-a0a0a0000000"
+    lines = [
+        ls_view._render_row(
+            Row(Session(session_id=sid, cwd="/repo", aim="x", draft=draft), None, st, 0, 0),
+            False,
+            2,
+            50,
+        )[0]
+        for draft, st in ((False, Status.PARKED), (True, Status.PARKED))
+    ]
+    assert len({line.index("🟦") for line in lines}) == 1, lines
+
+
 def test_render_row_cache_countdown_is_play_icon_while_working(tmp_path: Path) -> None:
     """A busy (▶ WORKING) row shows ▶ in the model column, not the ♨ countdown."""
     session = Session(session_id="p", cwd="/repo", aim="x", config_dir="/home/u/.claude")
@@ -309,8 +328,43 @@ def test_render_row_cache_countdown_is_play_icon_while_working(tmp_path: Path) -
         cast(Adapter, _FakeAdapter(_fresh_transcript(tmp_path))),
     )[0]
     assert "♨" not in line
-    assert "▶" in line
+    # Twice: the status icon at the start of the line AND the model column's cache cell.
+    assert line.count("▶") == 2
     assert accounts._HOME_GLYPH in line
+    # Painted in the WORKING status colour, exactly like the status icon.
+    assert line.count(f"\x1b[38;5;{ls_view._STATUS_COLOR[Status.WORKING]}m▶") == 2
+
+
+def test_render_row_cache_cell_is_fixed_width_across_rows(tmp_path: Path) -> None:
+    """The cache cell reserves the same width on EVERY row, so the model text stays aligned.
+
+    ♨ M:SS, ❄ cold, ▶ and a skipped cell (draft / done) must all leave the account glyph and
+    the model·effort text at the identical column — a column that changes width per row is
+    the bug this pins (see README "Column alignment").
+    """
+    warm = _fresh_transcript(tmp_path)
+    cases = [
+        (Status.WORKING, warm, False),  # ▶
+        (Status.WAITING_INPUT, warm, False),  # ♨ M:SS
+        (Status.PARKED, None, False),  # no transcript → blank cell
+        (Status.DONE, warm, False),  # skipped on done rows
+        (Status.PARKED, warm, True),  # skipped on drafts
+    ]
+    offsets = set()
+    for status, transcript, draft in cases:
+        session = Session(
+            session_id="p", cwd="/repo", aim="x", draft=draft, config_dir="/home/u/.claude"
+        )
+        line = ls_view._render_row(
+            Row(session, None, status, 0, 0),
+            False,  # colour off → plain text, so indices are display columns
+            2,
+            50,
+            _MULTI_MARKERS,
+            cast(Adapter, _FakeAdapter(transcript)),
+        )[0]
+        offsets.add(line.index(accounts._HOME_GLYPH))
+    assert len(offsets) == 1, f"model column not aligned across rows: {sorted(offsets)}"
 
 
 def test_render_row_cache_countdown_kept_on_every_non_working_status(tmp_path: Path) -> None:

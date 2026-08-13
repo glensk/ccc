@@ -2428,7 +2428,7 @@ def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
     monkeypatch.delenv("CC_CACHE_TTL_S", raising=False)
     from command_center.core import Row
     from command_center.models import Session, Status
-    from command_center.views.tui import CommandCenterApp, SessionTable
+    from command_center.views.tui import _STATUS_STYLE, CommandCenterApp, SessionTable
 
     # A transcript whose newest line is a fresh main-chain assistant turn → warm cache.
     now = time.time()
@@ -2448,17 +2448,20 @@ def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
                 app.adapter, "transcript_path", lambda *_a, **_kw: transcript, raising=False
             )
             table = app.query_one("#sessions", SessionTable)
-            for status in (
-                Status.WORKING,
-                Status.WAITING_INPUT,
-                Status.IDLE,
-                Status.SNOOZED,
-                Status.HALTED,
-                Status.PARKED,
+            starts = set()
+            for status, draft in (
+                (Status.WORKING, False),
+                (Status.WAITING_INPUT, False),
+                (Status.IDLE, False),
+                (Status.SNOOZED, False),
+                (Status.HALTED, False),
+                (Status.PARKED, False),
+                (Status.DONE, False),
+                (Status.PARKED, True),  # a FUTURE job: no cache cell, width still reserved
             ):
                 table.clear()
-                sid = f"cache-{status.value}"
-                session = Session(session_id=sid, cwd="/repo", aim="x")
+                sid = f"cache-{status.value}-{draft}"
+                session = Session(session_id=sid, cwd="/repo", aim="x", draft=draft)
                 app._add_session_row(table, Row(session, None, status, 0, 0))
                 model_cell = table.get_row_at(table.get_row_index(sid))[5]
                 assert isinstance(model_cell, Text)
@@ -2466,9 +2469,23 @@ def test_model_column_shows_play_icon_while_working_and_ttl_otherwise(
                     # Busy: it re-warms its cache every request, so the countdown says nothing.
                     assert "▶" in model_cell.plain, model_cell.plain
                     assert "♨" not in model_cell.plain
+                    # …and that ▶ wears the SAME green as the status icon, surviving the
+                    # whole-line recede a running row gets (applied after it).
+                    offset = model_cell.plain.index("▶")
+                    covering = [
+                        span.style for span in model_cell.spans if span.start <= offset < span.end
+                    ]
+                    assert covering[-1] == _STATUS_STYLE[Status.WORKING], covering
+                elif status is Status.DONE or draft:
+                    assert "♨" not in model_cell.plain and "▶" not in model_cell.plain
                 else:
                     assert "♨" in model_cell.plain, f"{status}: {model_cell.plain!r}"
                     assert "▶" not in model_cell.plain
+                # Fixed-width cache cell → the model text starts at the same column on
+                # EVERY row (♨ M:SS, ▶, and the blank cells alike). See README "Column
+                # alignment": a column that changes width per row is a bug.
+                starts.add(model_cell.plain.index(session.llm_overseer if draft else "—"))
+            assert len(starts) == 1, f"model column not aligned across rows: {sorted(starts)}"
 
     asyncio.run(scenario())
 

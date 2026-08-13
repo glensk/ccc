@@ -55,7 +55,13 @@ _STATUS_COLOR: dict[Status, int] = {
 _SEVERITY_COLOR = {"green": 35, "amber": 214, "red": 196, "none": 244}
 # Prompt-cache TTL countdown colours (see cachettl). Orange is 208 (#ff8700) to match the
 # TUI's own #ff8700; green/red reuse the palette's clear bright green / severity red.
-_CACHE_COLOR = {"green": 40, "orange": 208, "red": 196, "running": 40}
+_CACHE_COLOR = {
+    "green": 40,
+    "orange": 208,
+    "red": 196,
+    # Busy rows show ▶ here — same colour as the ▶ status icon (_STATUS_COLOR[WORKING]).
+    "running": _STATUS_COLOR[Status.WORKING],
+}
 _DIM = 240
 _WHITE = 15
 _BLACK = 16
@@ -64,6 +70,10 @@ _BLUE = 39  # the unresolved-drift dot
 # account's reset. 40 = the WORKING green ("this one runs again by itself").
 _RESUME_GREEN = 40
 _FOLDER_WIDTH = 34
+# Width of the id column: short_id's own fixed field, read from it so the two can't drift.
+# A draft row shows the shorter 4-hex display hash and pads out to this — every column after
+# the id must start at the same screen column on a draft and a live row alike.
+_ID_WIDTH = len(short_id(""))
 _OAI_BADGE_FG = 16
 _OAI_BADGE_BG = 15
 
@@ -177,9 +187,13 @@ def _render_row(
     if session.draft:
         # Future job: show the 4-hex display hash, clickable once it has synced to
         # a future-job file (mirrors the TUI id column / `oo` chord).
-        sid = _paint(_DIM, display_hash(session.session_id), enabled)
+        hash_text = display_hash(session.session_id)
+        sid = _paint(_DIM, hash_text, enabled)
         if session.future_file:
             sid = osc8_link(obsidian_uri(session.future_file), sid)
+        # Pad OUTSIDE the link (trailing blanks must not be clickable) up to the live rows'
+        # id width, so a draft's line does not sit 4 columns left of every other row.
+        sid += " " * max(0, _ID_WIDTH - len(hash_text))
     else:
         sid = _paint(_DIM, short_id(session.session_id), enabled)
     # Claude Code version patch (e.g. 193 of 2.1.193), or the OAI badge for Codex workflow rows.
@@ -211,14 +225,18 @@ def _render_row(
     # session's Anthropic prompt cache stays warm (transcript mtime + TTL). Skipped on
     # drafts (never ran) and done rows, mirroring the statusline's ♨/❄ readout (cachettl);
     # a busy row reads ▶ instead — it re-warms its cache every request, so the countdown is
-    # only meaningful on the rows waiting on you (or parked). Mirrors the TUI.
-    cache_cell = ""
+    # only meaningful on the rows waiting on you (or parked). Mirrors the TUI. The cell is
+    # FIXED WIDTH on every row — skipped/empty ones pad to a full-width blank — so the
+    # account glyph, the model text and everything after them stay column-aligned. Padding
+    # is measured on the RAW text and appended outside _paint (ANSI codes are not width).
+    cache_text, cache_level = "", ""
     if adapter is not None and not session.draft and status is not Status.DONE:
         cache_text, cache_level = cachettl.countdown_for(
             adapter, session, running=status is Status.WORKING
         )
-        if cache_text:
-            cache_cell = _paint(_CACHE_COLOR[cache_level], cache_text, enabled) + " "
+    cache_cell = (
+        _paint(_CACHE_COLOR[cache_level], cache_text, enabled) if cache_text else ""
+    ) + cachettl.cell_padding(cache_text)
     model_cell = cache_cell + home + _paint(_DIM, model_text, enabled)
     line1 = (
         f"{icon} {sid}  {ver}  {badge_cell}{folder}  {bar_cell}  "

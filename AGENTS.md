@@ -42,6 +42,15 @@ derived from its `COMMANDS` registry. When you add or change a TUI command:
    enforces it) and may be fractional to slot between neighbours;
 3. add it to the README `## Commands` list (and, if it's substantial, docs/reference.md).
 
+## Column alignment (do not regress)
+
+Every cell in the TUI table and in `ccc ls` reserves a **fixed width — blank cells
+included** — so the columns after it never shift between rows (live / waiting / parked /
+done / future alike). Pad the raw text (ANSI + OSC 8 have zero width; `💤 😴 🏠 💼` are two
+cells), and pin it with a test that asserts one identical offset across statuses. Full rule
+
++ worked example (`cachettl.CELL_WIDTH` / `cell_padding`): README § "Column alignment".
+
 ## Internal-style vs TUI commands
 
 Not every CLI subcommand is a TUI key. **Internal-style** commands (e.g. `score-aim`,
@@ -123,24 +132,24 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
 
 ## Trying it / screenshots
 
-- `ccc demo [--ls] [--clean]` seeds a throwaway fake-data home (never the real
++ `ccc demo [--ls] [--clean]` seeds a throwaway fake-data home (never the real
   `CLAUDE_HOME`) and opens the TUI/list — the fastest way to see a change in context.
-- `tools/gen_screenshots.py` regenerates `docs/img/*.svg` from that same demo data (driven
++ `tools/gen_screenshots.py` regenerates `docs/img/*.svg` from that same demo data (driven
   headlessly via Textual's `run_test`), so the README screenshots never go stale.
 
 ## Where the plumbing lives
 
-- **Installer layer** — `command_center/install.py` owns the hook + status-line wiring
++ **Installer layer** — `command_center/install.py` owns the hook + status-line wiring
   merged into `$CLAUDE_HOME/settings.json` (`ccc install-hooks` / `install-statusline`;
   symlink-safe atomic writes with timestamped backups, idempotent). `doctor.py` is the
   read-only `ccc doctor` health check.
-- **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
++ **Onboarding layer** — `wizard.py` (`ccc init`) is the first-run flow (env detection,
   consent checklist, minimal `config.toml`, then the installers, incl. `install-shell`).
   `install_commands.py` (`ccc install-commands`) copies the slash commands; `obsidian.py`
   (`ccc obsidian-setup`) seeds the vault folders, dashboards and shellcommands entries;
   `shell_install.py` (`ccc install-shell`) writes the opt-in shell rc block (AIM-at-startup
   wrapper + cross-terminal OSC tab badges).
-- **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,
++ **Platform seam** — `service.py` is the ONE place that decides launchd (macOS,
   `launchd.py`) vs systemd `--user` (Linux, `systemdunit.py`) for the `ccc daemon`
   service, so `cli.py`/`doctor.py` stay platform-agnostic. `notify.py`'s `"auto"` channel
   resolves to `osascript` (macOS) / `notify-send` (Linux). Deterministic per-repo tab
@@ -148,7 +157,7 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   overrides where present); `tabcolor.dedupe_live` recolours open tabs that would share one
   id-chip colour, writing only the per-tab colour cache + its `.manual` marker (the two files
   the status line already honours). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
-- **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
++ **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data.
 
 ## Private/local notes

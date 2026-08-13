@@ -333,3 +333,30 @@ def test_countdown_for_running_row_reads_no_transcript(
         "running",
     )
     assert path not in cachettl._ANCHOR_CACHE
+
+
+# --------------------------------------------------------------------------- fixed width
+def test_cell_padding_reserves_a_constant_width() -> None:
+    """Every possible cell — countdown, cold, busy, empty — pads to the same width."""
+    for text in ("♨ 59:26", "♨ 9:59", "❄ cold", "▶", ""):
+        assert len(text) + len(cachettl.cell_padding(text)) == cachettl.CELL_WIDTH, text
+
+
+def test_cell_padding_never_truncates_over_wide_content() -> None:
+    """A longer cell (custom CC_CACHE_TTL_S past 99 min) keeps at least the separator space."""
+    wide = "♨ 120:00"
+    assert len(wide) >= cachettl.CELL_WIDTH
+    assert cachettl.cell_padding(wide) == " "
+
+
+def test_cell_width_measured_by_len_matches_terminal_cells() -> None:
+    """``len()`` is a valid width measure here: every glyph this cell holds is one cell wide.
+
+    Pins the assumption :data:`cachettl.CELL_WIDTH` rests on — if a future glyph is wide
+    (an emoji-presentation variant, say), padding by ``len()`` would silently misalign the
+    column and this fails first.
+    """
+    from rich.cells import cell_len
+
+    for text in ("♨ 59:26", "❄ cold", cachettl._RUNNING_GLYPH):
+        assert cell_len(text) == len(text), text

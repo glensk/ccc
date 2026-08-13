@@ -79,6 +79,15 @@ _COLD_TEXT = "❄ cold"
 _RUNNING_GLYPH = "▶"
 _RUNNING_LEVEL = "running"
 
+# The cell is FIXED-WIDTH: every row reserves the same space so the account glyph and the
+# model·effort text after it start at the identical column, whatever this cell says (or does
+# not say — an empty cell pads to a full-width blank). 8 = the widest content, ``♨ 59:26``
+# (7), plus the 1-space separator. Longer content (a custom CC_CACHE_TTL_S past 99 min) is
+# never truncated — it keeps the bare separator space and that one row runs wide.
+# ``len()`` measures it because every glyph this cell can hold (♨ ❄ ▶, digits, ':') is a
+# single-cell code point — ``test_cachettl.py`` pins that against ``rich.cells.cell_len``.
+CELL_WIDTH = 8
+
 # Backwards-read chunk sizing. We scan the transcript tail from EOF toward the start in
 # chunks, doubling each step (capped) until a qualifying assistant line is found or the
 # file start is reached — so a multi-MB transcript is never loaded whole just to read its
@@ -144,6 +153,17 @@ def countdown(anchor: float | None, now: float, *, ttl: int | None = None) -> tu
     if remaining >= _ORANGE_MIN_S:
         return (text, "orange")
     return (text, "red")
+
+
+def cell_padding(text: str) -> str:
+    """The spaces that pad a rendered cell *text* out to :data:`CELL_WIDTH`.
+
+    Returned separately from the text (never merged into it) so each view can paint the
+    glyph and leave the padding unstyled — ``ccc ls`` wraps its text in ANSI codes, which
+    would defeat any width measurement done after painting. Always at least one space (the
+    column separator), so over-wide content is padded, not truncated.
+    """
+    return " " * max(1, CELL_WIDTH - len(text))
 
 
 def _parse_iso(ts: str) -> float | None:

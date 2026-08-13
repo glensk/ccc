@@ -196,7 +196,14 @@ _DONE_STYLE = "green3"
 _GOLD = "#ffaf00"
 # Prompt-cache TTL countdown colours (see cachettl). Hex values equal xterm-256 40/208/196
 # so this column renders pixel-identically to the ``ccc ls`` version; orange is #ff8700.
-_CACHE_STYLE = {"green": "#00d700", "orange": "#ff8700", "red": "#ff0000", "running": "#00d700"}
+_CACHE_STYLE = {
+    "green": "#00d700",
+    "orange": "#ff8700",
+    "red": "#ff0000",
+    # Busy rows show ▶ here — in the SAME green as the ▶ status icon at the start of the
+    # line (one source: _STATUS_STYLE), which is also what the recede pass repaints it to.
+    "running": _STATUS_STYLE[Status.WORKING],
+}
 _DRAFT_BLUE = "#5fafff"  # FUTURE (draft) jobs: section header, ✎ icon, prompt preview
 # Per-model colours for the draft `<overseer> ▸ <executor>` readout (the /next-step cell).
 _LLM_STYLE: dict[str, str] = {
@@ -2600,25 +2607,36 @@ class CommandCenterApp(App[None]):
         # marker map is identity-corrected per render, so a drifted login shows the account the
         # row TRULY bills, not the one its config dir is named after.
         home = accounts.home_marker_from(session.config_dir or "", self._account_markers)
+        # Cache-cell span (start, end) inside model_cell, when this row shows the ▶ busy
+        # glyph — the recede pass below repaints exactly that slice back to the status ▶'s
+        # green. None on every other row (nothing to exempt from the recede).
+        running_span: tuple[int, int] | None = None
         if session.draft:
             # Future job: it never ran, so show the CONFIGURED overseer ▸ executor model
             # pair (colour-coded, single name when they match) instead of an observed "—".
-            model_cell = _models_cell(session, prefix=" " + home)
+            # The (empty) cache cell is still reserved so the pair starts at the same column
+            # as every live row's model·effort text.
+            model_cell = _models_cell(session, prefix=" " + cachettl.cell_padding("") + home)
         else:
             # OBSERVED model·effort the session ran on, with the prompt-cache TTL countdown
             # prepended BEFORE the account glyph (how long the session's Anthropic prompt
             # cache stays warm — transcript mtime + TTL). Done rows skip it, mirroring the
             # statusline's ♨/❄ readout (see cachettl); a busy row reads ▶ instead, since a
             # running session re-warms its cache continuously (the ♨ is for rows waiting on
-            # you, where "still cheap to resume?" is a real question).
+            # you, where "still cheap to resume?" is a real question). The cell is FIXED
+            # WIDTH on every row — blank included — so the account glyph and model text
+            # never shift between a ♨ 59:26, a ❄ cold, a ▶ and an empty cell.
             style = _DONE_STYLE if done else "grey50"
             model_cell = Text(" ", style=style)
-            if not done:
-                cache_text, cache_level = cachettl.countdown_for(
-                    self.adapter, session, running=working
-                )
-                if cache_text:
-                    model_cell.append(cache_text + " ", style=_CACHE_STYLE[cache_level])
+            cache_text, cache_level = (
+                ("", "") if done else cachettl.countdown_for(self.adapter, session, running=working)
+            )
+            if cache_text:
+                start = len(model_cell.plain)
+                model_cell.append(cache_text, style=_CACHE_STYLE[cache_level])
+                if cache_level == "running":
+                    running_span = (start, len(model_cell.plain))
+            model_cell.append(cachettl.cell_padding(cache_text), style=style)
             model_cell.append(home + model_effort_cell(session.model, session.effort), style=style)
         low_score = low_aim_score(session.aim, session.aim_score, self.cfg.aim_score_threshold)
         aim_style = _DONE_STYLE if done else (_GOLD if session.aim else "grey50")
@@ -2687,9 +2705,11 @@ class CommandCenterApp(App[None]):
         if drift_unresolved(session):  # impartial checker flagged sub-goal drift (unresolved)
             progress.append(" ●", style="#5fafff")
         # A running session (green ▶) isn't actionable, so the whole line recedes to gray;
-        # only the green ▶ keeps its colour ("running, hands off"). Covers Status.WORKING plus
-        # the has_subagent branch (both paint ▶); marked (red-dep) rows are excluded so their
-        # dependency marker stays untouched. stylize() appends an overriding span by design.
+        # only the green ▶ keeps its colour ("running, hands off") — BOTH of them: the status
+        # icon (never receded, it is not in the loop) and the model column's ▶, repainted to
+        # the identical green right after. Covers Status.WORKING plus the has_subagent branch
+        # (both paint ▶); marked (red-dep) rows are excluded so their dependency marker stays
+        # untouched. stylize() appends an overriding span by design, so the later green wins.
         running = working and not marked
         if running:
             for cell in (
@@ -2705,6 +2725,10 @@ class CommandCenterApp(App[None]):
                 progress,
             ):
                 cell.stylize("not bold grey42")
+        if running_span is not None:
+            # Applied AFTER the recede so it overrides it: the model column's ▶ wears the
+            # very same green as the status-icon ▶ at the start of the line.
+            model_cell.stylize(_STATUS_STYLE[Status.WORKING], *running_span)
         table.add_row(
             icon,
             imp,

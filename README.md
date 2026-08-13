@@ -228,6 +228,31 @@ full phone story: [docs/roadmap-mobile-grapheneos.md](docs/roadmap-mobile-graphe
   uses the equivalents — **systemd** user units, **`notify-send`**, and **OSC** terminal
   tab badges.
 
+## Column alignment (a hard rule for every contributor, human or LLM)
+
+Both views — the TUI table and `ccc ls` — are **columns**, and a column has ONE width. The
+whole point of the list is that your eye scans straight down it; a cell that changes width
+with its content drags every column after it sideways and destroys that.
+
+So, whenever you add or change anything that renders into a row:
+
+- **Reserve the cell's width unconditionally** — including when the cell has nothing to
+  say. An empty/skipped cell pads to a full-width blank; it never collapses to zero. The
+  prompt-cache cell is the worked example: `cachettl.CELL_WIDTH` + `cachettl.cell_padding()`
+  keep `♨ 59:26`, `❄ cold`, `▶` and "nothing at all" all exactly 8 columns wide, on live,
+  parked, done and future rows alike.
+- **Measure the width, don't assume it.** Pad on the *raw* text: ANSI colour codes and OSC 8
+  hyperlinks have zero width, so `ccc ls` must pad outside `_paint()` / `osc8_link()` (and
+  trailing blanks must not be clickable). Many glyphs are two cells wide (`💤 😴 🏠 💼`) —
+  if a cell can hold one, measure with `rich.cells.cell_len`, not `len()`.
+- **A different row type is not an excuse.** Future (draft) and done rows share the same
+  columns as live rows; if they render a shorter id or skip a cell, they pad to match.
+- **Pin it with a test.** Render the same column across several statuses (live / waiting /
+  parked / done / draft) and assert the following column starts at one identical offset —
+  see `test_ls.py::test_render_row_cache_cell_is_fixed_width_across_rows`. Alignment
+  regressions are invisible to unit tests that only assert "the glyph is somewhere in the
+  line", which is exactly how they get shipped.
+
 ## Docs
 
 - [docs/reference.md](docs/reference.md) — the full feature reference (TUI keys, peek/jump,
