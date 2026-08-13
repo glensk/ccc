@@ -66,6 +66,11 @@ def _styled_fragments(text: Text, style: str) -> list[str]:
     return [text.plain[span.start : span.end] for span in text.spans if str(span.style) == style]
 
 
+def _plain(cell: object) -> str:
+    """A table cell's text, whether it is a Rich ``Text`` or a bare value."""
+    return cell.plain if isinstance(cell, Text) else str(cell)
+
+
 def test_tui_mounts_lists_and_marks_done(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     sid = _seed(tmp_path)
@@ -416,12 +421,13 @@ def test_close_done_session_stays_done(tmp_path: Path, monkeypatch: pytest.Monke
     assert session.status == "done"  # not clobbered to "parked"
 
 
-def test_row_shows_per_tab_badge_before_folder(
+def test_row_shows_per_tab_badge_in_symbol_column(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A LIVE session whose iTerm tab has a claimed badge shows that emoji before the repo.
+    """A LIVE session whose iTerm tab has a claimed badge shows that emoji in the symbol column.
 
-    The badge is gated on liveness: a parked/finished row's badge no longer maps to any
+    The badge rides its own column (between folder and id), NOT the folder cell. The live
+    cache badge is gated on liveness: a parked/finished row's badge no longer maps to any
     open tab, so only a live row renders it (see ``test_parked_row_hides_badge``).
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
@@ -442,10 +448,11 @@ def test_row_shows_per_tab_badge_before_folder(
         encoding="utf-8",
     )
     badge = tabsymbol.assign("w0t0p0:UUID-A")
+    assert badge is not None
 
-    from command_center.views.tui import CommandCenterApp, SessionTable
+    from command_center.views.tui import _FOLDER_COL, _SYMBOL_COL, CommandCenterApp, SessionTable
 
-    folder_col: list[str] = []
+    rows: list[tuple[str, str]] = []
 
     async def scenario() -> None:
         app = CommandCenterApp()
@@ -453,11 +460,13 @@ def test_row_shows_per_tab_badge_before_folder(
             await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
-                cell = table.get_row_at(i)[3]  # folder column (after icon, !, ver)
-                folder_col.append(cell.plain if hasattr(cell, "plain") else str(cell))
+                cells = table.get_row_at(i)
+                rows.append((_plain(cells[_FOLDER_COL]), _plain(cells[_SYMBOL_COL])))
 
     asyncio.run(scenario())
-    assert any(f"{badge} repo-a" in cell for cell in folder_col)
+    assert any(folder.strip() == "repo-a" and badge in symbol for folder, symbol in rows)
+    # The badge left the folder cell — it must not be duplicated there.
+    assert all(badge not in folder for folder, _symbol in rows)
 
 
 def test_parked_row_shows_deterministic_badge_not_live_cache(
@@ -486,9 +495,9 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
     deterministic = tabsymbol.symbol_for_repo(cwd)
     assert live_badge is not None and deterministic and live_badge != deterministic
 
-    from command_center.views.tui import CommandCenterApp, SessionTable
+    from command_center.views.tui import _FOLDER_COL, _SYMBOL_COL, CommandCenterApp, SessionTable
 
-    folder_col: list[str] = []
+    rows: list[tuple[str, str]] = []
 
     async def scenario() -> None:
         app = CommandCenterApp()
@@ -496,12 +505,111 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
             await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
-                cell = table.get_row_at(i)[3]  # folder column (after icon, !, ver)
-                folder_col.append(cell.plain if hasattr(cell, "plain") else str(cell))
+                cells = table.get_row_at(i)
+                rows.append((_plain(cells[_FOLDER_COL]), _plain(cells[_SYMBOL_COL])))
 
     asyncio.run(scenario())
-    assert any(f"{deterministic} repo-a" in cell for cell in folder_col)  # deterministic shown
-    assert all(live_badge not in cell for cell in folder_col)  # live cache badge NOT shown
+    # Deterministic symbol in the symbol column, next to the repo's folder cell.
+    assert any(folder.strip() == "repo-a" and deterministic in symbol for folder, symbol in rows)
+    assert all(live_badge not in symbol for _folder, symbol in rows)  # live cache badge NOT shown
+
+
+def test_symbol_and_id_cells_share_tab_colour_background(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The symbol + 4-char id cells are painted on the tab colour (statusline mimicry)."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
+    from command_center import tabsymbol
+
+    rgb_dir = tmp_path / "iterm-tab-rgb"
+    rgb_dir.mkdir(parents=True)
+    (rgb_dir / "w0t0p0_UUID-A").write_text("10;20;30\n", encoding="utf-8")  # dark → white text
+
+    base = _BASE
+    cwd = f"{base}/home/repo-a"
+    sid = "abcd1234-1111-2222-3333-444444444444"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure(sid, cwd=cwd)
+    store.update_fields(sid, status="idle", aim="ship it", iterm_session_id="w0t0p0:UUID-A")
+    store.close()
+    _seed_live_registry(tmp_path, sid, os.getpid())  # alive pid → live row, tab cache wins
+    badge = tabsymbol.assign("w0t0p0:UUID-A")
+    assert badge is not None
+    # A stray `claude` descendant of pytest would flip the row to "running" and dim it.
+    from command_center.adapters.claude import ClaudeAdapter
+
+    monkeypatch.setattr(ClaudeAdapter, "has_subagent", lambda self, pid: False)
+
+    from command_center.views.tui import (
+        _ID_COL,
+        _SYMBOL_COL,
+        CommandCenterApp,
+        SessionTable,
+        _bg_style,
+    )
+
+    cells: list[Text] = []
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            row = table.get_row_at(table.get_row_index(sid))
+            cells.extend([row[_SYMBOL_COL], row[_ID_COL]])
+
+    asyncio.run(scenario())
+    symbol, id_cell = cells[0], cells[1]
+    style = _bg_style((10, 20, 30))
+    assert style == "bright_white on #0a141e"  # low luminance → light foreground
+    assert _styled_fragments(symbol, style) == [f" {badge} "]
+    assert id_cell.plain == "   abcd "  # 2-space lead, then the 4-char id padded by the bg
+    assert _styled_fragments(id_cell, style) == [" abcd "]
+
+
+def test_done_row_id_cell_stays_unpainted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A finished row gets no coloured background — the whole line must keep receding."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
+
+    rgb_dir = tmp_path / "iterm-tab-rgb"
+    rgb_dir.mkdir(parents=True)
+    (rgb_dir / "w0t0p0_UUID-A").write_text("10;20;30\n", encoding="utf-8")
+
+    sid = "abcd1234-1111-2222-3333-444444444444"
+    store = Store(tmp_path / "command-center" / "state.db")
+    store.ensure(sid, cwd=f"{_BASE}/home/repo-a")
+    store.update_fields(sid, status="done", done=1, iterm_session_id="w0t0p0:UUID-A")
+    store.close()
+
+    from command_center.views.tui import (
+        _DONE_STYLE,
+        _ID_COL,
+        _SYMBOL_COL,
+        CommandCenterApp,
+        SessionTable,
+    )
+
+    cells: list[Text] = []
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            app.action_toggle_finished()  # the done block is hidden by default (td chord)
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            row = table.get_row_at(table.get_row_index(sid))
+            cells.extend([row[_SYMBOL_COL], row[_ID_COL]])
+
+    asyncio.run(scenario())
+    symbol, id_cell = cells[0], cells[1]
+    assert "on #" not in str(symbol.style) and all("on #" not in str(s.style) for s in symbol.spans)
+    assert id_cell.plain == "  abcd"  # no background → no padding spaces around the id
+    assert id_cell.style == _DONE_STYLE
 
 
 def test_list_groups_by_category_with_nested_repos(
@@ -524,7 +632,7 @@ def test_list_groups_by_category_with_nested_repos(
     store.update_fields("c", status="parked")  # sdsc, no AIM — must stay under the sdsc header
     store.close()
 
-    from command_center.views.tui import CommandCenterApp, SessionTable
+    from command_center.views.tui import _FOLDER_COL, CommandCenterApp, SessionTable
 
     folder_col: list[str] = []
 
@@ -534,32 +642,19 @@ def test_list_groups_by_category_with_nested_repos(
             await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
-                cell = table.get_row_at(i)[3]  # folder column (after icon, importance, version)
-                folder_col.append(cell.plain if hasattr(cell, "plain") else str(cell))
+                folder_col.append(_plain(table.get_row_at(i)[_FOLDER_COL]))
 
     asyncio.run(scenario())
 
-    # home header → its repo, then ONE sdsc header → both repos nested (AIM-first).
-    # Each repo row shows the DETERMINISTIC per-repo badge before the name (no iTerm cache
-    # here, so cell_for falls back to symbol_for_repo(cwd)). Category headers now carry a
-    # trailing full-width divider ("home ───…") and a FUTURE separator line is always
-    # appended; normalise both out so this test stays focused on the grouping (one header
-    # per category, repos nested, AIM-first) rather than divider styling.
-    from command_center import tabsymbol
-
-    def _badge(cwd: str) -> str:
-        return tabsymbol.cell_for(None, cwd, live=False)
-
+    # home header → its repo, then ONE sdsc header → both repos nested (AIM-first). The
+    # per-repo badge rides its own column now, so the folder cell is indent + name only.
+    # Category headers carry a trailing full-width divider ("home ───…") and a FUTURE
+    # separator line is always appended; normalise both out so this test stays focused on
+    # the grouping (one header per category, repos nested, AIM-first) not divider styling.
     cleaned = [c.split(" ─", 1)[0].rstrip() for c in folder_col if "FUTURE" not in c]
     # AIM session (repo-a) sorts first within sdsc; the no-AIM repo-c stays under the SAME
-    # sdsc header. Each repo row leads with its deterministic per-repo badge cell.
-    assert cleaned == [
-        "home",
-        f"  {_badge(f'{base}/home/repo-b')}repo-b",
-        "sdsc",
-        f"  {_badge(f'{base}/sdsc/repo-a')}repo-a",
-        f"  {_badge(f'{base}/sdsc/repo-c')}repo-c",
-    ]
+    # sdsc header.
+    assert cleaned == ["home", "  repo-b", "sdsc", "  repo-a", "  repo-c"]
 
 
 def test_column_cursor_navigates_columns_and_edits(

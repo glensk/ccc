@@ -253,6 +253,7 @@ _HEADERS: list[tuple[str, str]] = [
     # No leading space: the `folder` heading starts at the folder column's left edge,
     # aligning with the category divider word (── private ──) which sits there too.
     ("", "folder"),
+    ("", ""),  # tab symbol (💙/🔵/…) — no heading; painted on the id's tab colour
     ("  ", "id"),
     ("  ", "model"),  # OBSERVED model·effort the session ran on (not the job config)
     ("  ", "/aim"),
@@ -269,6 +270,10 @@ _AIM_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "/aim")
 # Column indices derived from _HEADERS so inserting/reordering a column never desyncs
 # the separator-row placement (_FOLDER_COL) or the editable-column cursor (_EDIT_COLS).
 _FOLDER_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "folder")
+_ID_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "id")
+# The tab-symbol column carries no heading (it shares the id cell's background), so it
+# is located relative to id — it always sits immediately left of it.
+_SYMBOL_COL = _ID_COL - 1
 _MODEL_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "model")
 _NEXT_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "/next-step")
 _PROGRESS_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "progress")
@@ -370,6 +375,41 @@ def _with_tags(text: str, base_style: str) -> Text:
         else:
             out.append(part, style=base_style)
     return out
+
+
+def _id_bg_rgb(session: Session, live: bool) -> tuple[int, int, int] | None:
+    """Tab colour for the id/symbol background: live tab cache, else the repo colour.
+
+    Same resolution chain as the status line (and ``peek._id_rgb``), so a row's id is
+    painted with the background the user already sees in that tab's Claude Code.
+    """
+    rgb = colors.tab_rgb(session.iterm_session_id) if live else None
+    return rgb or colors.folder_rgb(session.cwd)
+
+
+def _bg_style(rgb: tuple[int, int, int]) -> str:
+    """``<fg> on #rrggbb`` for *rgb*, foreground picked by luminance (statusline rule)."""
+    red, green, blue = rgb
+    lum = (299 * red + 587 * green + 114 * blue) // 1000
+    fore = "black" if lum > 128 else "bright_white"
+    return f"{fore} on #{red:02x}{green:02x}{blue:02x}"
+
+
+def _symbol_cell(session: Session, *, live: bool, rgb: tuple[int, int, int] | None) -> Text:
+    """The tab-symbol column: ``" <emoji> "`` on *rgb* (the row's tab colour, or unpainted).
+
+    Same badge the iTerm tab title and the status line show (live tab cache, else the
+    deterministic per-repo symbol — see :func:`tabsymbol.cell_for`), lifted out of the
+    folder cell into its own column so it shares the id cell's background. A badge-less
+    row gets equal-width blanks so the column stays aligned.
+    """
+    badge = tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live).strip()
+    cell = Text(" ")
+    if not badge:
+        cell.append("    ")  # width of " <emoji> " (the emoji is 2 cells wide)
+        return cell
+    cell.append(f" {badge} ", style=_bg_style(rgb) if rgb else "")
+    return cell
 
 
 def _draft_id_cell(session: Session) -> Text:
@@ -2515,26 +2555,22 @@ class CommandCenterApp(App[None]):
             if done and not row.uses_codex_workflow:
                 ver.stylize(_DONE_STYLE, 0, len(ver))
         folder_style = _DONE_STYLE if done else colors.folder_style(session.cwd, self.cfg, root)
-        # Per-repo colored badge before the folder so same-folder sessions are
-        # distinguishable and a screenshot matches the user's tabs; unstyled so the
-        # emoji keeps its own color. A LIVE row shows its iTerm tab's claimed badge;
-        # every other row (parked/finished/demo, or a plain terminal with no iTerm
-        # cache) falls back to the deterministic per-repo symbol (see cell_for).
         if indent_repo:
             # Nested under its category header: indent and show only the repo (+ sub-path).
             _cat, leaf = colors.folder_split(session.cwd, root)
             folder = Text("  ")
-            folder.append(
-                tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=row.is_open)
-            )
             folder.append(leaf, style=folder_style)
         else:
             # Flat done block: full ``category/repo`` as before.
             folder = Text(" ")
-            folder.append(
-                tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=row.is_open)
-            )
             folder.append(colors.short_folder(session.cwd, root), style=folder_style)
+        # The per-tab badge rides its own column (right of folder, left of id) so it can
+        # share the id cell's tab-colour background — the statusline's ` <badge> <id> `
+        # pairing. It also keeps same-folder sessions distinguishable and makes a
+        # screenshot match the user's tabs. The colour is resolved ONCE so both cells are
+        # painted identically; a done row resolves to None and stays receded.
+        id_rgb = None if done else _id_bg_rgb(session, row.is_open)
+        symbol = _symbol_cell(session, live=row.is_open, rgb=id_rgb)
         if row.dep_depth > 0:
             # Hoisted dependent: indent the folder cell 2 spaces per nesting level so the
             # tree structure reads (the row already sits directly under its parent).
@@ -2546,7 +2582,16 @@ class CommandCenterApp(App[None]):
             # display hash instead (the start_when note rides the next-step column).
             sid = _draft_id_cell(session)
         else:
-            sid = Text("  " + short_id(session.session_id), style=_DONE_STYLE if done else "grey50")
+            # 4 chars painted on the tab colour, mirroring the Claude Code status line.
+            # Unpainted (grey/done styling) when the tab colour is unknown or the row is done.
+            if id_rgb is not None:
+                sid = Text("  ")
+                sid.append(f" {short_id(session.session_id, 4)} ", style=_bg_style(id_rgb))
+            else:
+                sid = Text(
+                    "  " + short_id(session.session_id, 4),
+                    style=_DONE_STYLE if done else "grey50",
+                )
         # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
         # only); every other row gets an equal-width blank so the model text stays aligned. The
         # marker map is identity-corrected per render, so a drifted login shows the account the
@@ -2636,13 +2681,26 @@ class CommandCenterApp(App[None]):
         # dependency marker stays untouched. stylize() appends an overriding span by design.
         running = not session.draft and not marked and icon_glyph == STATUS_ICON[Status.WORKING]
         if running:
-            for cell in (imp, ver, folder, sid, model_cell, aim, nxt, age, git_cell, progress):
+            for cell in (
+                imp,
+                ver,
+                folder,
+                symbol,
+                sid,
+                model_cell,
+                aim,
+                nxt,
+                age,
+                git_cell,
+                progress,
+            ):
                 cell.stylize("not bold grey42")
         table.add_row(
             icon,
             imp,
             ver,
             folder,
+            symbol,
             sid,
             model_cell,
             aim,

@@ -256,7 +256,12 @@ on-disk transcript shows blank. A session using
 including manually-invoked workflow sessions detected from the transcript. That column's
 header carries the **`head:`** label — it both names
 the version column and, like the footer's `keys:`, names the whole column-header line (which is why
-the importance `!`/`!!`/`!!!` column to its left has no heading of its own). The **`/aim` column
+the importance `!`/`!!`/`!!!` column to its left has no heading of its own). Right of the repo
+name sit two unlabelled-then-`id` columns that mimic the Claude Code status line: the tab's
+**emoji badge** and the **first 4 chars of the session id**, both painted on that tab's
+**colour** (the per-tab `iterm-tab-rgb` cache, else the repo colour) with black or white text
+picked by luminance. A `done` row is left unpainted so the finished line keeps receding, and a
+future job shows its blue 4-hex display hash there instead. The **`/aim` column
 auto-stretches** to fill the leftover row width so the trailing **`progress` column is
 pinned flush to the right edge** (it crops the AIM text to whatever fits and re-fits on
 resize). The `/aim`, `/next-step` and
@@ -1041,13 +1046,16 @@ Several Claude Code sessions running in the **same folder** look identical in th
 list. Each iTerm tab is therefore given a distinct **colored emoji badge** shown
 in two places that always agree:
 
-- in the TUI, immediately **before the repo name** in the folder column, and
+- in the TUI, in its **own column** between the repo name and the session id, painted on
+  the tab's colour together with the id (`ccc ls` keeps it inline before the repo name), and
 - prepended to the **iTerm tab title**, so a row maps to its tab at a glance.
 
-The TUI shows a badge **only for live rows**. Once a session is parked or finished
-its process is gone, so no open tab wears that emoji — and its `$ITERM_SESSION_ID`
-may since have been recycled by an unrelated shell — so the badge would point at a
-tab that isn't there. Non-live rows render a blank, same-width cell instead.
+A **live** row shows the badge its iTerm tab actually claimed (keyed by
+`$ITERM_SESSION_ID`). Every other row — parked, finished, a future job, or a session in a
+plain terminal with no iTerm cache — falls back to the **deterministic per-repo symbol**, so
+a row (and a screenshot) always carries a glyph. The live cache is deliberately not trusted
+there: that process is gone, so no open tab wears the emoji, and its `$ITERM_SESSION_ID` may
+since have been recycled by an unrelated shell.
 
 Badges come from a palette spanning **six shapes** (circle / square / diamond /
 triangle / heart / star) across well-separated colors. Assignment is **greedy and
