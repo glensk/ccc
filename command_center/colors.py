@@ -47,6 +47,15 @@ def _tab_rgb_dir() -> Path:
     return Path(env) if env else Path.home() / ".cache" / "iterm-tab-rgb"
 
 
+def tab_rgb_dir() -> Path:
+    """The per-tab colour cache directory — the one :func:`tab_rgb` reads.
+
+    Public so a *writer* (:mod:`command_center.tabcolor`, which reassigns colliding
+    tab colours) can never drift from the reader's location.
+    """
+    return _tab_rgb_dir()
+
+
 def tab_rgb(iterm_session_id: str | None) -> tuple[int, int, int] | None:
     """RGB the status line uses as the *session-id background*, or ``None``.
 

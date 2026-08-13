@@ -145,7 +145,9 @@ runs it in CI. `tools/seed_from_private.py`, `tools/SEED_STATE.json` and any
   service, so `cli.py`/`doctor.py` stay platform-agnostic. `notify.py`'s `"auto"` channel
   resolves to `osascript` (macOS) / `notify-send` (Linux). Deterministic per-repo tab
   symbols live in `tabsymbol.symbol_for_repo` / `cell_for` (the live iTerm cache still
-  overrides where present). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
+  overrides where present); `tabcolor.dedupe_live` recolours open tabs that would share one
+  id-chip colour, writing only the per-tab colour cache + its `.manual` marker (the two files
+  the status line already honours). Linux hotkey samples: `assets/hotkeys-linux/` (keyd/xremap).
 - **Packaging** — the wheel ships three console entry points (`ccc`, `codex-in-claude`,
   `claude-session-continue`) and the `command_center/assets/` package data.
 

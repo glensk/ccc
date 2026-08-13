@@ -131,7 +131,9 @@ def test_table_row_paints_only_low_aim_score_red(
             aim_cell = table.get_row_at(table.get_row_index(sid))[_AIM_COL]
             assert isinstance(aim_cell, Text)
             assert "20% improve things" in aim_cell.plain
-            assert _styled_fragments(aim_cell, "bold red") == ["20% "]
+            # The chip is right-aligned in a fixed 4-cell field so the AIM text starts at
+            # the same column whatever the score's width ('-1' … '100%').
+            assert _styled_fragments(aim_cell, "bold red") == [" 20% "]
 
     asyncio.run(scenario())
 
@@ -421,14 +423,15 @@ def test_close_done_session_stays_done(tmp_path: Path, monkeypatch: pytest.Monke
     assert session.status == "done"  # not clobbered to "parked"
 
 
-def test_row_shows_per_tab_badge_in_symbol_column(
+def test_row_shows_per_tab_badge_in_id_cell(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A LIVE session whose iTerm tab has a claimed badge shows that emoji in the symbol column.
+    """A LIVE session whose iTerm tab has a claimed badge shows that emoji in the id cell.
 
-    The badge rides its own column (between folder and id), NOT the folder cell. The live
+    The badge opens the id cell (one ``<badge> <id>`` chip), NOT the folder cell. The live
     cache badge is gated on liveness: a parked/finished row's badge no longer maps to any
-    open tab, so only a live row renders it (see ``test_parked_row_hides_badge``).
+    open tab, so only a live row renders it (see
+    ``test_parked_row_shows_deterministic_badge_not_live_cache``).
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
@@ -450,7 +453,7 @@ def test_row_shows_per_tab_badge_in_symbol_column(
     badge = tabsymbol.assign("w0t0p0:UUID-A")
     assert badge is not None
 
-    from command_center.views.tui import _FOLDER_COL, _SYMBOL_COL, CommandCenterApp, SessionTable
+    from command_center.views.tui import _FOLDER_COL, _ID_COL, CommandCenterApp, SessionTable
 
     rows: list[tuple[str, str]] = []
 
@@ -461,12 +464,12 @@ def test_row_shows_per_tab_badge_in_symbol_column(
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
                 cells = table.get_row_at(i)
-                rows.append((_plain(cells[_FOLDER_COL]), _plain(cells[_SYMBOL_COL])))
+                rows.append((_plain(cells[_FOLDER_COL]), _plain(cells[_ID_COL])))
 
     asyncio.run(scenario())
-    assert any(folder.strip() == "repo-a" and badge in symbol for folder, symbol in rows)
+    assert any(folder.strip() == "repo-a" and badge in id_cell for folder, id_cell in rows)
     # The badge left the folder cell — it must not be duplicated there.
-    assert all(badge not in folder for folder, _symbol in rows)
+    assert all(badge not in folder for folder, _id_cell in rows)
 
 
 def test_parked_row_shows_deterministic_badge_not_live_cache(
@@ -476,11 +479,17 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
 
     The live iTerm-tab cache badge is gated on liveness (the tab is gone, its
     $ITERM_SESSION_ID may be recycled); the deterministic symbol_for_repo(cwd) fallback
-    still renders so a screenshot / list always shows a per-repo symbol.
+    still renders so a screenshot / list always shows a per-repo symbol. A parked row also
+    gets NO background: the chip's colour means "this tab is open right now".
     """
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
     from command_center import tabsymbol
+
+    rgb_dir = tmp_path / "iterm-tab-rgb"
+    rgb_dir.mkdir(parents=True)
+    (rgb_dir / "w0t0p0_UUID-A").write_text("10;20;30\n", encoding="utf-8")  # a colour IS cached
 
     base = _BASE
     cwd = f"{base}/home/repo-a"
@@ -495,9 +504,9 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
     deterministic = tabsymbol.symbol_for_repo(cwd)
     assert live_badge is not None and deterministic and live_badge != deterministic
 
-    from command_center.views.tui import _FOLDER_COL, _SYMBOL_COL, CommandCenterApp, SessionTable
+    from command_center.views.tui import _FOLDER_COL, _ID_COL, CommandCenterApp, SessionTable
 
-    rows: list[tuple[str, str]] = []
+    rows: list[tuple[str, Text]] = []
 
     async def scenario() -> None:
         app = CommandCenterApp()
@@ -506,18 +515,23 @@ def test_parked_row_shows_deterministic_badge_not_live_cache(
             table = app.query_one("#sessions", SessionTable)
             for i in range(table.row_count):
                 cells = table.get_row_at(i)
-                rows.append((_plain(cells[_FOLDER_COL]), _plain(cells[_SYMBOL_COL])))
+                rows.append((_plain(cells[_FOLDER_COL]), cells[_ID_COL]))
 
     asyncio.run(scenario())
-    # Deterministic symbol in the symbol column, next to the repo's folder cell.
-    assert any(folder.strip() == "repo-a" and deterministic in symbol for folder, symbol in rows)
-    assert all(live_badge not in symbol for _folder, symbol in rows)  # live cache badge NOT shown
+    parked = [cell for folder, cell in rows if folder.strip() == "repo-a"]
+    assert len(parked) == 1
+    # Deterministic symbol opening the id cell; the live cache badge is never shown.
+    assert deterministic in parked[0].plain
+    assert all(live_badge not in cell.plain for _folder, cell in rows)
+    # No open tab → no background anywhere in the cell, cached tab colour notwithstanding.
+    assert "on #" not in str(parked[0].style)
+    assert all("on #" not in str(span.style) for span in parked[0].spans)
 
 
-def test_symbol_and_id_cells_share_tab_colour_background(
+def test_badge_and_id_share_one_tab_colour_chip(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The symbol + 4-char id cells are painted on the tab colour (statusline mimicry)."""
+    """Badge + 4-char id ride ONE background run on the tab colour (statusline mimicry)."""
     monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
     monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
     monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
@@ -542,13 +556,7 @@ def test_symbol_and_id_cells_share_tab_colour_background(
 
     monkeypatch.setattr(ClaudeAdapter, "has_subagent", lambda self, pid: False)
 
-    from command_center.views.tui import (
-        _ID_COL,
-        _SYMBOL_COL,
-        CommandCenterApp,
-        SessionTable,
-        _bg_style,
-    )
+    from command_center.views.tui import _ID_COL, CommandCenterApp, SessionTable, _bg_style
 
     cells: list[Text] = []
 
@@ -557,16 +565,74 @@ def test_symbol_and_id_cells_share_tab_colour_background(
         async with app.run_test() as pilot:
             await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
-            row = table.get_row_at(table.get_row_index(sid))
-            cells.extend([row[_SYMBOL_COL], row[_ID_COL]])
+            cells.append(table.get_row_at(table.get_row_index(sid))[_ID_COL])
 
     asyncio.run(scenario())
-    symbol, id_cell = cells[0], cells[1]
+    id_cell = cells[0]
     style = _bg_style((10, 20, 30))
     assert style == "bright_white on #0a141e"  # low luminance → light foreground
-    assert _styled_fragments(symbol, style) == [f" {badge} "]
-    assert id_cell.plain == "   abcd "  # 2-space lead, then the 4-char id padded by the bg
-    assert _styled_fragments(id_cell, style) == [" abcd "]
+    # 2-space lead, then ONE painted run holding badge + id (no uncoloured gap between them).
+    assert id_cell.plain == f"   {badge} abcd "
+    assert _styled_fragments(id_cell, style) == [f" {badge} abcd "]
+
+
+def test_two_open_tabs_same_colour_get_deduped_backgrounds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two OPEN tabs cached to one colour are deduped before the rows are drawn.
+
+    The whole point of the coloured chip is telling same-repo sessions apart, so the
+    refresh reassigns one of them an unused palette colour (tabcolor.dedupe_live) and
+    the two id cells come out with DIFFERENT backgrounds.
+    """
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setenv("CCC_TAB_SYMBOL_DIR", str(tmp_path / "iterm-tab-symbol"))
+    monkeypatch.setenv("CCC_TAB_RGB_DIR", str(tmp_path / "iterm-tab-rgb"))
+
+    rgb_dir = tmp_path / "iterm-tab-rgb"
+    rgb_dir.mkdir(parents=True)
+    for slug in ("w0t0p0_UUID-A", "w0t1p0_UUID-B"):
+        (rgb_dir / slug).write_text("10;20;30\n", encoding="utf-8")  # same colour → collision
+
+    cwd = f"{_BASE}/home/repo-a"
+    first = "abcd1234-1111-2222-3333-444444444444"
+    second = "ef561234-1111-2222-3333-444444444444"
+    store = Store(tmp_path / "command-center" / "state.db")
+    for sid, iterm in ((first, "w0t0p0:UUID-A"), (second, "w0t1p0:UUID-B")):
+        store.ensure(sid, cwd=cwd)
+        store.update_fields(sid, status="idle", aim="ship it", iterm_session_id=iterm)
+    store.close()
+    # Two DIFFERENT alive pids (this process and its parent) → both rows are open.
+    _seed_live_registry(tmp_path, first, os.getpid())
+    _seed_live_registry(tmp_path, second, os.getppid())
+    from command_center.adapters.claude import ClaudeAdapter
+
+    monkeypatch.setattr(ClaudeAdapter, "has_subagent", lambda self, pid: False)
+
+    from command_center import tabcolor
+    from command_center.views.tui import _ID_COL, CommandCenterApp, SessionTable, _bg_style
+
+    cells: dict[str, Text] = {}
+
+    async def scenario() -> None:
+        app = CommandCenterApp()
+        async with app.run_test() as pilot:
+            await settle(pilot)
+            table = app.query_one("#sessions", SessionTable)
+            for sid in (first, second):
+                cells[sid] = table.get_row_at(table.get_row_index(sid))[_ID_COL]
+
+    asyncio.run(scenario())
+    backgrounds = {
+        sid: [str(span.style) for span in cell.spans if "on #" in str(span.style)]
+        for sid, cell in cells.items()
+    }
+    assert all(len(styles) == 1 for styles in backgrounds.values())  # each row IS painted
+    assert backgrounds[first] != backgrounds[second]  # ... and no longer identically
+    # One kept the cached colour; the other now carries a palette colour, cache and all.
+    painted = {styles[0] for styles in backgrounds.values()}
+    assert _bg_style((10, 20, 30)) in painted
+    assert any(_bg_style(rgb) in painted for rgb in tabcolor.PALETTE)
 
 
 def test_done_row_id_cell_stays_unpainted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -585,10 +651,10 @@ def test_done_row_id_cell_stays_unpainted(tmp_path: Path, monkeypatch: pytest.Mo
     store.update_fields(sid, status="done", done=1, iterm_session_id="w0t0p0:UUID-A")
     store.close()
 
+    from command_center.tabsymbol import symbol_for_repo
     from command_center.views.tui import (
         _DONE_STYLE,
         _ID_COL,
-        _SYMBOL_COL,
         CommandCenterApp,
         SessionTable,
     )
@@ -602,14 +668,17 @@ def test_done_row_id_cell_stays_unpainted(tmp_path: Path, monkeypatch: pytest.Mo
             app.action_toggle_finished()  # the done block is hidden by default (td chord)
             await settle(pilot)
             table = app.query_one("#sessions", SessionTable)
-            row = table.get_row_at(table.get_row_index(sid))
-            cells.extend([row[_SYMBOL_COL], row[_ID_COL]])
+            cells.append(table.get_row_at(table.get_row_index(sid))[_ID_COL])
 
     asyncio.run(scenario())
-    symbol, id_cell = cells[0], cells[1]
-    assert "on #" not in str(symbol.style) and all("on #" not in str(s.style) for s in symbol.spans)
-    assert id_cell.plain == "  abcd"  # no background → no padding spaces around the id
-    assert id_cell.style == _DONE_STYLE
+    id_cell = cells[0]
+    badge = symbol_for_repo(f"{_BASE}/home/repo-a")
+    # No background anywhere: the badge keeps the id at the painted rows' column, and the
+    # id itself carries the receded done style.
+    assert id_cell.plain == f"   {badge} abcd"  # no bg → no padding space after the id
+    assert "on #" not in str(id_cell.style)
+    assert all("on #" not in str(span.style) for span in id_cell.spans)
+    assert _styled_fragments(id_cell, _DONE_STYLE) == ["abcd"]
 
 
 def test_list_groups_by_category_with_nested_repos(
@@ -1161,7 +1230,11 @@ def test_sh_chord_shows_subgoal_history(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_draft_id_cell_bare_hash() -> None:
-    """The draft id cell is always the bare 4-hex hash; no link without a file."""
+    """The draft id cell is always the bare 4-hex hash; no link without a file.
+
+    Unpadded — the row composes the badge part of the id chip, which is what puts the
+    hash at the same column as a session id.
+    """
     from command_center.models import Session
     from command_center.views.tui import _DRAFT_BLUE, _draft_id_cell
 
@@ -1170,17 +1243,17 @@ def test_draft_id_cell_bare_hash() -> None:
     session = Session(session_id=sid, cwd="/repo", draft=True, start_when="tomorrow evening")
 
     cell = _draft_id_cell(session)
-    assert cell.plain == "  3a8b"
+    assert cell.plain == "3a8b"
     assert cell.style == _DRAFT_BLUE
     assert cell.spans == []  # no future_file yet → no link span
 
     # No start_when at all → still just the bare hash.
     bare = _draft_id_cell(Session(session_id=sid, cwd="/repo", draft=True))
-    assert bare.plain == "  3a8b"
+    assert bare.plain == "3a8b"
 
     # A long start_when never widens the bare-hash id cell.
     long_session = Session(session_id=sid, cwd="/repo", draft=True, start_when="x" * 40)
-    assert _draft_id_cell(long_session).plain == "  3a8b"
+    assert _draft_id_cell(long_session).plain == "3a8b"
 
 
 def test_draft_id_cell_links_hash_when_future_file_set() -> None:
@@ -1200,10 +1273,10 @@ def test_draft_id_cell_links_hash_when_future_file_set() -> None:
     )
 
     cell = _draft_id_cell(session)
-    assert cell.plain == "  3a8b"
+    assert cell.plain == "3a8b"
     assert len(cell.spans) == 1
     span = cell.spans[0]
-    assert (span.start, span.end) == (2, 6)  # "3a8b" right after the 2-space prefix
+    assert (span.start, span.end) == (0, 4)  # the whole (unpadded) hash is the link
     assert getattr(span.style, "link", None) == future_files.obsidian_uri(relpath)
 
 
@@ -2037,7 +2110,7 @@ def test_draft_id_cell_scheduled_shows_bare_hash() -> None:
         start_when="return from Slovenia",
         start_date="2026-08-11",
     )
-    assert _draft_id_cell(session).plain == "  3a8b"  # start_when suppressed too
+    assert _draft_id_cell(session).plain == "3a8b"  # start_when suppressed too
     # The compact D.M.YY label that spans the !!! and head: columns; its head slice
     # (first 3 chars) fits the importance column, the tail (≤5) fits the ver column.
     label = short_date_label(date(2026, 8, 11))

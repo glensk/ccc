@@ -73,6 +73,7 @@ from .. import (
     repos,
     resume,
     routing,
+    tabcolor,
     tabsymbol,
     tags,
     terminal,
@@ -253,9 +254,8 @@ _HEADERS: list[tuple[str, str]] = [
     # No leading space: the `folder` heading starts at the folder column's left edge,
     # aligning with the category divider word (── private ──) which sits there too.
     ("", "folder"),
-    ("", ""),  # tab symbol (💙/🔵/…) — no heading; painted on the id's tab colour
-    ("  ", "id"),
-    ("  ", "model"),  # OBSERVED model·effort the session ran on (not the job config)
+    ("  ", "id"),  # tab badge + 4-char id, one chip painted on the tab colour
+    (" ", "model"),  # OBSERVED model·effort the session ran on (not the job config)
     ("  ", "/aim"),
     ("  ", "/next-step"),
     ("  ", "age"),
@@ -271,9 +271,6 @@ _AIM_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "/aim")
 # the separator-row placement (_FOLDER_COL) or the editable-column cursor (_EDIT_COLS).
 _FOLDER_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "folder")
 _ID_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "id")
-# The tab-symbol column carries no heading (it shares the id cell's background), so it
-# is located relative to id — it always sits immediately left of it.
-_SYMBOL_COL = _ID_COL - 1
 _MODEL_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "model")
 _NEXT_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "/next-step")
 _PROGRESS_COL = next(i for i, (_lead, word) in enumerate(_HEADERS) if word == "progress")
@@ -377,14 +374,15 @@ def _with_tags(text: str, base_style: str) -> Text:
     return out
 
 
-def _id_bg_rgb(session: Session, live: bool) -> tuple[int, int, int] | None:
-    """Tab colour for the id/symbol background: live tab cache, else the repo colour.
+def _id_bg_rgb(session: Session) -> tuple[int, int, int] | None:
+    """Tab colour for the id chip's background: live tab cache, else the repo colour.
 
     Same resolution chain as the status line (and ``peek._id_rgb``), so a row's id is
-    painted with the background the user already sees in that tab's Claude Code.
+    painted with the background the user already sees in that tab's Claude Code. Only
+    ever called for a row with an OPEN tab — a row with no tab is left unpainted, so
+    the background reads as "this one is on screen right now".
     """
-    rgb = colors.tab_rgb(session.iterm_session_id) if live else None
-    return rgb or colors.folder_rgb(session.cwd)
+    return colors.tab_rgb(session.iterm_session_id) or colors.folder_rgb(session.cwd)
 
 
 def _bg_style(rgb: tuple[int, int, int]) -> str:
@@ -395,21 +393,13 @@ def _bg_style(rgb: tuple[int, int, int]) -> str:
     return f"{fore} on #{red:02x}{green:02x}{blue:02x}"
 
 
-def _symbol_cell(session: Session, *, live: bool, rgb: tuple[int, int, int] | None) -> Text:
-    """The tab-symbol column: ``" <emoji> "`` on *rgb* (the row's tab colour, or unpainted).
+def _id_badge(session: Session, *, live: bool) -> str:
+    """The row's tab badge — live tab cache, else the deterministic per-repo symbol.
 
-    Same badge the iTerm tab title and the status line show (live tab cache, else the
-    deterministic per-repo symbol — see :func:`tabsymbol.cell_for`), lifted out of the
-    folder cell into its own column so it shares the id cell's background. A badge-less
-    row gets equal-width blanks so the column stays aligned.
+    Two spaces stand in when there is nothing to key on (no cwd), so the id lands at the
+    same column on every row (an emoji is 2 cells wide).
     """
-    badge = tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live).strip()
-    cell = Text(" ")
-    if not badge:
-        cell.append("    ")  # width of " <emoji> " (the emoji is 2 cells wide)
-        return cell
-    cell.append(f" {badge} ", style=_bg_style(rgb) if rgb else "")
-    return cell
+    return tabsymbol.cell_for(session.iterm_session_id, session.cwd, live=live).strip() or "  "
 
 
 def _draft_id_cell(session: Session) -> Text:
@@ -423,13 +413,15 @@ def _draft_id_cell(session: Session) -> Text:
     future-job file (``session.future_file`` set), the hash span carries a Rich
     ``Style(link=...)`` so Textual (8.2.7+) emits an OSC 8 hyperlink that opens the
     file in Obsidian — the same guaranteed path as the `oo` chord.
+
+    Carries no leading padding of its own: the caller composes the badge part of the id
+    chip, so the hash starts at the same column as a session id (see _add_session_row).
     """
-    prefix = "  "
     hash_ = future_files.display_hash(session.session_id)
-    text = Text(prefix + hash_, style=_DRAFT_BLUE)
+    text = Text(hash_, style=_DRAFT_BLUE)
     if session.future_file:
         uri = future_files.obsidian_uri(session.future_file)
-        text.stylize(Style(link=uri), len(prefix), len(prefix) + len(hash_))
+        text.stylize(Style(link=uri), 0, len(hash_))
     return text
 
 
@@ -2158,6 +2150,15 @@ class CommandCenterApp(App[None]):
         # one .claude.json read, so a drifted login shows the TRUE billing glyph on every row
         # (accounts.effective_home_markers) without re-reading it per session.
         self._account_markers = accounts.effective_home_markers(self._account_dirs)
+        # Two open tabs resolving to the SAME id-chip colour (typically the same repo) defeat
+        # the colour, so all but one are reassigned an unused one BEFORE the rows are drawn —
+        # the row, the tab and the status line then all read the same rewritten cache. A few
+        # small file reads per rebuild; it writes only on a real collision. Best-effort: a
+        # dedupe failure must never cost a repaint.
+        try:
+            tabcolor.dedupe_live([r.session for r in rows if r.is_open])
+        except Exception:  # noqa: BLE001  # pylint: disable=broad-exception-caught
+            pass
         self._rows = {r.session.session_id: r for r in rows}
         self._sep_seq = 0
         self._sep_category = {}
@@ -2561,37 +2562,35 @@ class CommandCenterApp(App[None]):
             folder = Text("  ")
             folder.append(leaf, style=folder_style)
         else:
-            # Flat done block: full ``category/repo`` as before.
-            folder = Text(" ")
+            # Flat done/draft block: full ``category/repo``, at the nested rows' left edge.
+            folder = Text("  ")
             folder.append(colors.short_folder(session.cwd, root), style=folder_style)
-        # The per-tab badge rides its own column (right of folder, left of id) so it can
-        # share the id cell's tab-colour background — the statusline's ` <badge> <id> `
-        # pairing. It also keeps same-folder sessions distinguishable and makes a
-        # screenshot match the user's tabs. The colour is resolved ONCE so both cells are
-        # painted identically; a done row resolves to None and stays receded.
-        id_rgb = None if done else _id_bg_rgb(session, row.is_open)
-        symbol = _symbol_cell(session, live=row.is_open, rgb=id_rgb)
+        # The badge shares the id cell so both ride ONE background run — the statusline's
+        # ` <badge> <id> ` chip, with no uncoloured gap between them. It also keeps
+        # same-folder sessions distinguishable and makes a screenshot match the user's tabs.
+        # ONLY a row with an open tab is painted: a parked/finished/draft row has no tab on
+        # screen to match a colour to, so it stays receded.
+        id_rgb = _id_bg_rgb(session) if (row.is_open and not done) else None
+        badge = _id_badge(session, live=row.is_open)
         if row.dep_depth > 0:
             # Hoisted dependent: indent the folder cell 2 spaces per nesting level so the
             # tree structure reads (the row already sits directly under its parent).
             indented = Text("  " * row.dep_depth)
             indented.append_text(folder)
             folder = indented
+        sid = Text("  ")
         if session.draft:
             # Future job: the internal UUID is meaningless to the user — show the bare
             # display hash instead (the start_when note rides the next-step column).
-            sid = _draft_id_cell(session)
+            sid.append(f" {badge} ")
+            sid.append_text(_draft_id_cell(session))
+        elif id_rgb is not None:
+            # Badge + 4 id chars in ONE painted run, mirroring the Claude Code status line.
+            sid.append(f" {badge} {short_id(session.session_id, 4)} ", style=_bg_style(id_rgb))
         else:
-            # 4 chars painted on the tab colour, mirroring the Claude Code status line.
-            # Unpainted (grey/done styling) when the tab colour is unknown or the row is done.
-            if id_rgb is not None:
-                sid = Text("  ")
-                sid.append(f" {short_id(session.session_id, 4)} ", style=_bg_style(id_rgb))
-            else:
-                sid = Text(
-                    "  " + short_id(session.session_id, 4),
-                    style=_DONE_STYLE if done else "grey50",
-                )
+            # No open tab: the badge keeps the id at the painted rows' column, unpainted.
+            sid.append(f" {badge} ")
+            sid.append(short_id(session.session_id, 4), style=_DONE_STYLE if done else "grey50")
         # A little home icon marks rows billing to the `private` (cpriv) account (multi-account
         # only); every other row gets an equal-width blank so the model text stays aligned. The
         # marker map is identity-corrected per render, so a drifted login shows the account the
@@ -2600,14 +2599,14 @@ class CommandCenterApp(App[None]):
         if session.draft:
             # Future job: it never ran, so show the CONFIGURED overseer ▸ executor model
             # pair (colour-coded, single name when they match) instead of an observed "—".
-            model_cell = _models_cell(session, prefix="  " + home)
+            model_cell = _models_cell(session, prefix=" " + home)
         else:
             # OBSERVED model·effort the session ran on, with the prompt-cache TTL countdown
             # prepended BEFORE the account glyph (how long the session's Anthropic prompt
             # cache stays warm — transcript mtime + TTL). Done rows skip it, mirroring the
             # statusline's ♨/❄ readout (see cachettl).
             style = _DONE_STYLE if done else "grey50"
-            model_cell = Text("  ", style=style)
+            model_cell = Text(" ", style=style)
             if not done:
                 cache_text, cache_level = cachettl.countdown_for(self.adapter, session)
                 if cache_text:
@@ -2616,11 +2615,15 @@ class CommandCenterApp(App[None]):
         low_score = low_aim_score(session.aim, session.aim_score, self.cfg.aim_score_threshold)
         aim_style = _DONE_STYLE if done else (_GOLD if session.aim else "grey50")
         # Leading score chip ('NN%', or '-1' while unscored) so /aim quality is visible.
+        # Right-aligned in a fixed 4-cell field (and blanked to the same width when there
+        # is no chip) so a 2- ('-1') or 4-char ('100%') chip never shifts the AIM text.
         chip = aim_score_pct(session.aim, session.aim_score)
         chip_style = "bold red" if low_score else (_DONE_STYLE if done else "grey46")
         aim = Text("  ")
         if chip:
-            aim.append(chip + " ", style=chip_style)
+            aim.append(f"{chip:>4} ", style=chip_style)
+        else:
+            aim.append(" " * 5)
         # Show the compact short-AIM label (cheap-model) when present, else the full AIM.
         aim.append((_first_line(display_aim(session)) or "—")[:_AIM_MAX_CHARS], style=aim_style)
         if session.draft:
@@ -2685,7 +2688,6 @@ class CommandCenterApp(App[None]):
                 imp,
                 ver,
                 folder,
-                symbol,
                 sid,
                 model_cell,
                 aim,
@@ -2700,7 +2702,6 @@ class CommandCenterApp(App[None]):
             imp,
             ver,
             folder,
-            symbol,
             sid,
             model_cell,
             aim,
