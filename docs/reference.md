@@ -102,9 +102,11 @@ fallback), and the **working directory**. Below it are **three tabs**:
   permanently-scrollable pane. Each prompt is headed by a `(N) ───…` **rule line**
   (number + separator on one line, in a distinct blue) followed by a blank line; the
   **newest prompt renders pronounced in bold gold** so the current ask always stands
-  out. Background-task completion
-  notices (the `<task-notification>` blocks the harness injects as user records) are
-  **not** prompts and are filtered out — the list is what *you* typed only.
+  out. A prompt you typed **while Claude was working** is queued by the harness and
+  stored in a different transcript shape (a `queued_command` attachment, not a user
+  record) — it is listed too, at the point the queue delivered it. Background-task
+  completion notices (`<task-notification>`) and cross-session messages from a peer
+  session are **not** prompts and are filtered out — the list is what *you* typed only.
 - **session** — the **full conversation**, terminal-like: each `## (N) you` prompt
   (numbering matches the prompts tab), Claude's replies, and dim `⏺ Tool(input…)` /
   `⎿ result…` one-liners for every tool call (results truncated to a few lines; no

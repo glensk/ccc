@@ -138,6 +138,25 @@ _CODEX_WORKFLOW_CACHE: dict[str, tuple[float, bool]] = {}
 _OBSERVED_MODEL_CACHE: dict[str, tuple[float, str | None]] = {}
 
 
+def _prompt_payload_text(content: object) -> str | None:
+    """The human-readable text of a prompt payload, or ``None`` if it carries none.
+
+    A prompt is stored either as a plain string or — as soon as the human pasted an
+    image alongside it — as a block list, in which case only the ``text`` blocks are
+    prose (image blocks are skipped). Both ``user`` records and ``queued_command``
+    attachments use these two shapes, so both read them through here.
+    """
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return None
+    return " ".join(
+        str(block.get("text", ""))
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
 def _user_prompt_text(record: dict) -> str | None:
     """The human-typed text of a transcript record, or ``None`` if it is not one.
 
@@ -154,19 +173,59 @@ def _user_prompt_text(record: dict) -> str | None:
     if not isinstance(message, dict) or message.get("role") != "user":
         return None
     content = message.get("content")
-    if isinstance(content, str):
-        text = content
-    elif isinstance(content, list):
+    if isinstance(content, list):
         blocks = [block for block in content if isinstance(block, dict)]
         if blocks and all(block.get("type") == "tool_result" for block in blocks):
             return None  # a tool result fed back to the model, not a prompt
-        text = " ".join(
-            str(block.get("text", "")) for block in blocks if block.get("type") == "text"
-        )
-    else:
+    text = _prompt_payload_text(content)
+    if text is None:
         return None
     cleaned = _PROMPT_WRAPPER_RE.sub("", text).strip()
     return cleaned or None
+
+
+def _queued_prompt_text(record: dict) -> str | None:
+    """The human-typed text of a *queued* prompt record, or ``None`` if it is not one.
+
+    A prompt typed while Claude Code is still working is **queued**, and the queue
+    drains it into the conversation as an ``attachment`` record of type
+    ``queued_command`` — never as a ``user`` record. So :func:`_user_prompt_text`
+    alone silently drops every such turn (it was the whole reason a real ask went
+    missing from the ``ccc peek`` prompts tab). The record sits at the position where
+    the queue delivered it, so reading it in file order keeps the conversation order.
+
+    Two of the three flavours are not human prose and stay excluded: ``commandMode ==
+    "task-notification"`` is the harness's background-agent completion notice, and
+    ``origin.kind == "peer"`` is a ``<cross-session-message>`` injected by another
+    Claude session. A missing ``origin`` is human (older Claude Code wrote none).
+    """
+    if not isinstance(record, dict) or record.get("type") != "attachment":
+        return None
+    if record.get("isMeta") or record.get("isSidechain"):
+        return None
+    attachment = record.get("attachment")
+    if not isinstance(attachment, dict) or attachment.get("type") != "queued_command":
+        return None
+    if attachment.get("commandMode") != "prompt":
+        return None
+    origin = attachment.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return None
+    text = _prompt_payload_text(attachment.get("prompt"))
+    if text is None:
+        return None
+    cleaned = _PROMPT_WRAPPER_RE.sub("", text).strip()
+    return cleaned or None
+
+
+def _prompt_text(record: dict) -> str | None:
+    """The human prompt of *record* — typed at an idle prompt **or** queued while busy.
+
+    The single filter behind every prompt listing (``ccc peek``'s prompts tab, the
+    ``(N)`` indexing of its session tab, and the vault session mirrors), so the two
+    on-disk shapes a human turn can take never diverge between them.
+    """
+    return _user_prompt_text(record) or _queued_prompt_text(record)
 
 
 def _tool_result_text(content: object) -> str:
@@ -193,9 +252,10 @@ def events_in_file(path: Path) -> list[SessionEvent]:
     The single schema-aware walk behind the full-session rendering (vault session
     mirrors + the peek panel's session tab — see :mod:`command_center.sessionmd`):
 
-    * ``prompt`` events use the exact :func:`_user_prompt_text` filter, so they
-      align 1:1 with :meth:`ClaudeAdapter.all_user_prompts` (same ``(N)`` indexing
-      as the prompts tab).
+    * ``prompt`` events use the exact :func:`_prompt_text` filter — both the ``user``
+      records and the ``queued_command`` attachments a busy-typed prompt lands in — so
+      they align 1:1 with :meth:`ClaudeAdapter.all_user_prompts` (same ``(N)``
+      indexing as the prompts tab).
     * ``text`` events are main-chain assistant text blocks (thinking is skipped).
     * ``tool`` events are main-chain ``tool_use`` blocks; the later ``tool_result``
       record is paired back onto the event by ``tool_use_id`` (result stays ``None``
@@ -229,6 +289,12 @@ def _collect_events(
 ) -> None:
     """Append *record*'s events to *events* (helper of :func:`events_in_file`)."""
     rtype = record.get("type")
+    if rtype == "attachment":
+        # A prompt queued while Claude was busy — the only place it is recorded.
+        queued = _queued_prompt_text(record)
+        if queued is not None:
+            events.append(SessionEvent(kind="prompt", text=queued))
+        return
     if rtype == "user":
         prompt = _user_prompt_text(record)
         if prompt is not None:
@@ -511,9 +577,11 @@ class ClaudeAdapter:
 
         Walks the whole file — a prompt can sit far behind a long agentic turn, so
         the tail-only read used for halt detection is not enough here. Applies the
-        same :func:`_user_prompt_text` filter as the last-prompt case (meta /
-        sidechain / tool-result records are skipped, wrappers stripped). Cheap in
-        practice: run on demand for ``ccc peek``, not per refresh.
+        same :func:`_prompt_text` filter as the last-prompt case (meta / sidechain /
+        tool-result records are skipped, wrappers stripped), so a prompt typed while
+        Claude was busy — queued, and stored as a ``queued_command`` attachment rather
+        than a ``user`` record — is listed too. Cheap in practice: run on demand for
+        ``ccc peek``, not per refresh.
         """
         prompts: list[str] = []
         try:
@@ -526,7 +594,7 @@ class ClaudeAdapter:
                         record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    text = _user_prompt_text(record)
+                    text = _prompt_text(record)
                     if text is not None:
                         prompts.append(text)
         except OSError:

@@ -11,6 +11,7 @@ import pytest
 
 from command_center import peek
 from command_center.adapters import ClaudeAdapter
+from command_center.adapters.claude import events_in_file
 from command_center.store import Store
 
 
@@ -18,6 +19,19 @@ def _user(content: object, **extra: object) -> dict:
     record: dict = {"type": "user", "message": {"role": "user", "content": content}}
     record.update(extra)
     return record
+
+
+def _queued(prompt: object, mode: str = "prompt", origin: object = None) -> dict:
+    """A prompt typed while Claude was busy: an ``attachment``, not a ``user`` record."""
+    return {
+        "type": "attachment",
+        "attachment": {
+            "type": "queued_command",
+            "prompt": prompt,
+            "commandMode": mode,
+            "origin": origin,
+        },
+    }
 
 
 def _transcript(home: Path, cwd: str, session_id: str, records: list[dict]) -> Path:
@@ -162,6 +176,69 @@ def test_all_user_prompts_returns_every_human_turn_in_order(tmp_path: Path) -> N
         "third prompt",
     ]
     assert adapter.all_user_prompts("/Users/x/none", "missing") == []  # no transcript
+
+
+def test_queued_prompts_are_listed_in_conversation_order(tmp_path: Path) -> None:
+    # A prompt typed *while Claude is working* is queued, and the queue drains it into
+    # the transcript as a ``queued_command`` attachment — there is never a matching
+    # ``user`` record, so keying on ``type == "user"`` alone loses the whole turn.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    records = [
+        _user("first prompt"),
+        {"type": "assistant", "message": {"role": "assistant", "content": "working"}},
+        _queued("queued while busy", origin={"kind": "human"}),
+        _queued("queued, older schema with no origin"),
+        _user("typed at an idle prompt"),
+    ]
+    _transcript(tmp_path, "/Users/x/repo", "sid", records)
+    assert adapter.all_user_prompts("/Users/x/repo", "sid") == [
+        "first prompt",
+        "queued while busy",
+        "queued, older schema with no origin",
+        "typed at an idle prompt",
+    ]
+    assert adapter.last_user_prompt("/Users/x/repo", "sid") == "typed at an idle prompt"
+
+
+def test_queued_non_human_attachments_are_not_prompts(tmp_path: Path) -> None:
+    # Same record shape, machine origin: a background-task completion notice and a
+    # cross-session message from a peer session. Neither is something the human typed.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    records = [
+        _user("real prompt"),
+        _queued("<task-notification><task-id>x</task-id></task-notification>", "task-notification"),
+        _queued("<cross-session-message>status</cross-session-message>", origin={"kind": "peer"}),
+        _queued("", origin={"kind": "human"}),  # empty → nothing to show
+        {"type": "attachment", "attachment": {"type": "skill_listing"}},  # other kind
+    ]
+    _transcript(tmp_path, "/Users/x/repo", "sid", records)
+    assert adapter.all_user_prompts("/Users/x/repo", "sid") == ["real prompt"]
+
+
+def test_queued_prompt_with_pasted_image_is_a_block_list(tmp_path: Path) -> None:
+    # Paste an image into a queued prompt and ``prompt`` becomes a block list, not a
+    # string; only the text blocks are the ask.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    content = [{"type": "text", "text": "see [Image #1]"}, {"type": "image", "source": {}}]
+    _transcript(tmp_path, "/Users/x/repo", "sid", [_queued(content, origin={"kind": "human"})])
+    assert adapter.all_user_prompts("/Users/x/repo", "sid") == ["see [Image #1]"]
+
+
+def test_queued_prompts_keep_session_events_aligned(tmp_path: Path) -> None:
+    # The session tab / vault mirror number prompts (N) off ``events_in_file`` while the
+    # prompts tab numbers off ``all_user_prompts`` — a queued prompt must land in both
+    # or the two numberings drift apart.
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    records = [
+        _user("first prompt"),
+        {"type": "assistant", "message": {"role": "assistant", "content": "working"}},
+        _queued("queued while busy", origin={"kind": "human"}),
+        _queued("<task-notification><task-id>x</task-id></task-notification>", "task-notification"),
+    ]
+    path = _transcript(tmp_path, "/Users/x/repo", "sid", records)
+    events = [event.text for event in events_in_file(path) if event.kind == "prompt"]
+    assert events == adapter.all_user_prompts("/Users/x/repo", "sid")
+    assert events == ["first prompt", "queued while busy"]
 
 
 def test_resolve_peek_via_store_has_prompts_and_aim(
