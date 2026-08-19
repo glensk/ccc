@@ -4,10 +4,11 @@ Two providers, same two-window shape (a 5h session + a weekly window). Claude's
 numbers arrive via the status-line JSON (captured by ``ccc statusline
 --capture-usage``); Codex has no endpoint, so :func:`read_codex_usage` reads the
 ``rate_limits`` block Codex writes onto each ``token_count`` event in its session
-rollout files (``primary`` = 5h, ``secondary`` = weekly). Codex emits more than one
-block shape — ``limit_id: "codex"`` carries the windows, while short ``codex exec``
-runs log a windowless ``limit_id: "premium"`` block — so the reader skips windowless
-blocks and scans back through enough files to find the freshest one with real data.
+rollout files (the windows are identified by their duration, not primary/secondary
+position). Codex emits more than one block shape — ``limit_id: "codex"`` carries the
+windows, while short ``codex exec`` runs log a windowless ``limit_id: "premium"`` block
+— so the reader skips windowless blocks and scans back through enough files to find the
+freshest one with real data.
 
 Claude's data rides on every API response's ``anthropic-ratelimit-unified-{5h,7d}-*``
 headers (``rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`` in the
@@ -50,6 +51,11 @@ from pathlib import Path
 from rich.text import Text
 
 from . import config
+from .codex_in_claude import (
+    _FIVE_HOUR_MINUTES,
+    _SEVEN_DAY_MINUTES,
+    _latest_rate_limits_event,
+)
 
 # Statuses that mean a job is actively doing work — while any tracked session is in one
 # of these the *expensive* usage fetch (currently only Copilot's ``gh`` billing call)
@@ -760,74 +766,11 @@ def claude_usage_stale(account: str, refresh_sec: float, now: int | None = None)
     return (now - fetched) >= refresh_sec
 
 
-def _codex_window(raw: object) -> Window | None:
-    """A Codex ``rate_limits`` window (``used_percent`` / ``resets_at``)."""
-    if not isinstance(raw, dict):
-        return None
-    pct = raw.get("used_percent")
-    resets = raw.get("resets_at")
-    if pct is None or resets is None:
-        return None
-    try:
-        return Window(used_percentage=float(pct), resets_at=int(resets))
-    except (TypeError, ValueError):
-        return None
-
-
-def _dig_rate_limits(obj: object) -> dict | None:
-    """Pull the ``rate_limits`` dict out of a rollout line (it sits under ``payload``)."""
-    if not isinstance(obj, dict):
-        return None
-    for candidate in (obj.get("rate_limits"), (obj.get("payload") or {}).get("rate_limits")):
-        if isinstance(candidate, dict):
-            return candidate
-    return None
-
-
-def _has_window(rate_limits: dict) -> bool:
-    """True if a ``rate_limits`` block carries at least one usable 5h/weekly window.
-
-    Codex emits more than one block shape: ``limit_id: "codex"`` carries the real
-    ``primary`` (5h) / ``secondary`` (weekly) windows, but short ``codex exec`` runs
-    also log a ``limit_id: "premium"`` block whose ``primary``/``secondary`` are both
-    ``null`` (credits-based, no window data). The latter must be ignored, or the card
-    reads "(run Codex to populate)" whenever the newest event is one of them.
-    """
-    return (
-        _codex_window(rate_limits.get("primary")) is not None
-        or _codex_window(rate_limits.get("secondary")) is not None
-    )
-
-
-def _latest_rate_limits(path: Path) -> dict | None:
-    """Newest *usable* ``rate_limits`` block in a rollout JSONL, scanning from the end.
-
-    Skips windowless blocks (see :func:`_has_window`) so the freshest block that
-    actually has 5h/weekly data wins — even when a newer ``premium``/null block sits
-    after it in the same file. Returns ``None`` if the file has no usable block.
-    """
-    try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError:
-        return None
-    for line in reversed(lines):
-        if '"rate_limits"' not in line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        rate_limits = _dig_rate_limits(obj)
-        if rate_limits is not None and _has_window(rate_limits):
-            return rate_limits
-    return None
-
-
 def read_codex_usage(now: int | None = None) -> Usage | None:
     """Current Codex rate-limit snapshot, from the newest session rollout file.
 
-    Codex has no usage endpoint; it writes ``rate_limits`` (``primary`` = 5-hour,
-    ``secondary`` = weekly) onto each ``token_count`` event in
+    Codex has no usage endpoint; it writes duration-identified ``rate_limits`` windows
+    onto each ``token_count`` event in
     ``$CODEX_HOME/sessions/**/rollout-*.jsonl``. The data is account-global, so the
     freshest entry from any session is the live allocation. Parsing the newest file
     is cached by its ``(path, mtime)`` so the 5 s TUI refresh stays cheap when idle.
@@ -854,18 +797,23 @@ def read_codex_usage(now: int | None = None) -> Usage | None:
         return _codex_cache[2]
     snapshot: Usage | None = None
     for path in files[:_CODEX_SCAN_LIMIT]:
-        rate_limits = _latest_rate_limits(path)
-        if rate_limits is None:
+        rate_snapshot = _latest_rate_limits_event(path)
+        if rate_snapshot is None:
             continue
-        primary = _codex_window(rate_limits.get("primary"))
-        secondary = _codex_window(rate_limits.get("secondary"))
-        if primary is None and secondary is None:
-            continue
+        windows = {
+            minutes: Window(used_percentage=parsed.used_percent, resets_at=parsed.resets_at)
+            for minutes, parsed in rate_snapshot.windows.items()
+        }
+
         try:
             captured = int(path.stat().st_mtime)
         except OSError:
             captured = now
-        snapshot = Usage(captured_at=captured, five_hour=primary, seven_day=secondary)
+        snapshot = Usage(
+            captured_at=captured,
+            five_hour=windows.get(_FIVE_HOUR_MINUTES),
+            seven_day=windows.get(_SEVEN_DAY_MINUTES),
+        )
         break
     _codex_cache = (key[0], key[1], snapshot)
     return snapshot

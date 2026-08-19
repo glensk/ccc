@@ -1,0 +1,1 @@
+{"type":"event_msg","timestamp":2000000000,"payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":10.0,"window_minutes":300,"resets_at":2000007200},"secondary":{"used_percent":12.0,"resets_at":2000500000}}}}

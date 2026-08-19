@@ -9,6 +9,7 @@ monkeypatched.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import time
@@ -91,6 +92,126 @@ def test_valid_slug_and_effort(cic: ModuleType) -> None:
     assert cic.valid_slug("gpt-5.5") is True
     assert cic.valid_slug("nope") is False
     assert cic.effort_of("gpt-5.5") == "xhigh"
+
+
+# --------------------------- quota parsing / headroom --------------------------- #
+_HEADROOM_NOW = 2_000_000_000
+_HEADROOM_FIXTURES = Path(__file__).parent / "fixtures" / "codex_headroom"
+
+
+def _install_headroom_fixture(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    rollout = tmp_path / "sessions" / "2033" / "05" / "18" / "rollout-fixture.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text((_HEADROOM_FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "state", "allowed", "durations"),
+    [
+        ("one_window.jsonl", "allowed", True, [300]),
+        ("two_windows.jsonl", "allowed", True, [300, 10080]),
+        ("reordered_windows.jsonl", "reserve", False, [300, 10080]),
+        ("missing_window_duration.jsonl", "unknown", False, [300]),
+        ("stale.jsonl", "unknown", False, [300, 10080]),
+        ("no_data.jsonl", "unknown", False, []),
+    ],
+)
+def test_codex_headroom_jsonl_fixtures(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixture_name: str,
+    state: str,
+    allowed: bool,
+    durations: list[int],
+) -> None:
+    _install_headroom_fixture(cic, tmp_path, monkeypatch, fixture_name)
+    decision = cic.codex_headroom(now=_HEADROOM_NOW)
+    assert decision["state"] == state
+    assert decision["offload_allowed"] is allowed
+    assert [row["window_minutes"] for row in decision["windows"]] == durations
+
+
+def test_codex_windows_are_keyed_by_duration_not_position(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_headroom_fixture(cic, tmp_path, monkeypatch, "reordered_windows.jsonl")
+    windows = cic._codex_usage_windows(now=_HEADROOM_NOW)
+    assert windows["five_hour"] == (10.0, 2_000_007_200)
+    assert windows["seven_day"] == (80.0, 2_000_500_000)
+
+
+def test_headroom_reset_within_ten_minutes_counts_as_fresh(
+    cic: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    snapshot = cic._CodexRateSnapshot(
+        captured_at=_HEADROOM_NOW,
+        windows={
+            300: cic._CodexRateWindow(
+                used_percent=99.0,
+                resets_at=_HEADROOM_NOW + 600,
+                window_minutes=300,
+            )
+        },
+    )
+    monkeypatch.setattr(cic, "_codex_rate_snapshot", lambda: snapshot)
+    decision = cic.codex_headroom(now=_HEADROOM_NOW)
+    assert decision["state"] == "allowed"
+    assert decision["windows"][0]["reset_fresh"] is True
+
+
+@pytest.mark.parametrize(
+    ("fixture_name", "expected_exit", "expected_state"),
+    [
+        ("one_window.jsonl", 0, "allowed"),
+        ("reordered_windows.jsonl", 1, "reserve"),
+        ("stale.jsonl", 3, "unknown"),
+    ],
+)
+def test_headroom_cli_json_and_exit_codes(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    fixture_name: str,
+    expected_exit: int,
+    expected_state: str,
+) -> None:
+    _install_headroom_fixture(cic, tmp_path, monkeypatch, fixture_name)
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    assert cic.main(["headroom", "--json"]) == expected_exit
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["state"] == expected_state
+    assert payload["offload_allowed"] is (expected_exit == 0)
+
+
+def test_usage_json_carries_window_duration(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_headroom_fixture(cic, tmp_path, monkeypatch, "reordered_windows.jsonl")
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    assert cic.main(["usage", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["five_hour"]["window_minutes"] == 300
+    assert payload["five_hour"]["used_percent"] == 10.0
+    assert payload["seven_day"]["window_minutes"] == 10080
+    assert payload["seven_day"]["used_percent"] == 80.0
+
+
+def test_headroom_help_says_unknown_is_offload_only(cic: ModuleType) -> None:
+    help_text = cic.build_parser()._subparsers._group_actions[0].choices["headroom"].format_help()
+    normalized = " ".join(help_text.split())
+    assert "Missing/stale data fails closed" in normalized
+    assert "debates remain always allowed" in normalized
 
 
 # --------------------------- delegate prompt contract --------------------------- #

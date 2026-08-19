@@ -23,7 +23,8 @@ _RATE_LIMITS = {
 }
 _NOW = 1782302578  # 2026-06-24 14:02 CEST — between "now" and both resets
 
-# A realistic Codex rollout rate_limits block (verified shape): primary=5h, secondary=weekly.
+# A realistic Codex rollout rate_limits block (verified shape). Window duration, rather
+# than primary/secondary position, identifies the 5-hour and weekly quota buckets.
 _CODEX_RATE_LIMITS = {
     "limit_id": "codex",
     "primary": {"used_percent": 12.0, "window_minutes": 300, "resets_at": 1782320400},
@@ -525,7 +526,7 @@ def test_statusline_capture_usage_reads_stdin(
     assert snap.seven_day.used_percentage == 93
 
 
-def test_read_codex_usage_maps_primary_and_secondary(
+def test_read_codex_usage_maps_windows_by_duration(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
@@ -533,11 +534,36 @@ def test_read_codex_usage_maps_primary_and_secondary(
     _write_codex_rollout(tmp_path, _CODEX_RATE_LIMITS, name="a")
     snap = usage.read_codex_usage(now=_NOW)
     assert snap is not None
-    # primary (5h) → the session window; secondary (weekly) → the week window.
+    # The 300-minute window feeds Session; the 10080-minute window feeds Week.
     assert snap.five_hour is not None and snap.five_hour.used_percentage == 12.0
     assert snap.five_hour.resets_at == 1782320400
     assert snap.seven_day is not None and snap.seven_day.used_percentage == 45.0
     assert snap.seven_day.resets_at == 1782893849
+
+
+def test_read_codex_usage_primary_weekly_window_does_not_fill_five_hour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    usage._codex_cache = None
+    weekly_only = {
+        "limit_id": "codex",
+        "primary": {
+            "used_percent": 45.0,
+            "window_minutes": 10080,
+            "resets_at": 1782893849,
+        },
+        "secondary": None,
+        "plan_type": "team",
+    }
+    _write_codex_rollout(tmp_path, weekly_only, name="weekly-primary")
+    snap = usage.read_codex_usage(now=_NOW)
+    assert snap is not None
+    assert snap.five_hour is None
+    assert snap.seven_day == usage.Window(used_percentage=45.0, resets_at=1782893849)
+    plain = usage.render_codex_usage(snap, now=_NOW).plain
+    assert "Session: —" in plain
+    assert "Week: Resets in " in plain and "45%" in plain
 
 
 def test_read_codex_usage_none_when_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -555,8 +581,14 @@ def test_read_codex_usage_prefers_newest_file(
 ) -> None:
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     usage._codex_cache = None
-    old = dict(_CODEX_RATE_LIMITS, primary={"used_percent": 3.0, "resets_at": 1782320400})
-    new = dict(_CODEX_RATE_LIMITS, primary={"used_percent": 88.0, "resets_at": 1782320400})
+    old = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 3.0, "window_minutes": 300, "resets_at": 1782320400},
+    )
+    new = dict(
+        _CODEX_RATE_LIMITS,
+        primary={"used_percent": 88.0, "window_minutes": 300, "resets_at": 1782320400},
+    )
     _write_codex_rollout(tmp_path, old, name="old", mtime=1782300000)
     _write_codex_rollout(tmp_path, new, name="new", mtime=1782301000)
     snap = usage.read_codex_usage(now=_NOW)
@@ -584,8 +616,8 @@ def test_read_codex_usage_skips_trailing_windowless_block_in_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # A single rollout where a windowless ``premium`` block is logged AFTER the populated
-    # ``codex`` block — the exact real-world shape. _latest_rate_limits scans from the end,
-    # so it must skip the trailing null block and return the earlier populated one.
+    # ``codex`` block — the exact real-world shape. The shared duration-keyed event parser
+    # scans from the end, so it must skip the trailing null block and return the populated one.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     usage._codex_cache = None
     day = tmp_path / "sessions" / "2026" / "06" / "24"

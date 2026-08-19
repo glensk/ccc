@@ -15,6 +15,7 @@ command (``/codex-implement-task-and-claude-review`` and ``/codex-debate``):
 * ``delegate``    — run ONE Codex round, **printing the model as the first stdout line**,
                     then Codex's reply. Used by the codex-implement-task-and-claude-review skill.
 * ``usage``       — print the current Codex rate-limit usage (5h + weekly windows).
+* ``headroom``    — decide whether enough quota remains for optional offload work.
 
 Model source: ``codex debug models`` (``--refresh``), else the offline cache
 ``~/.codex/models_cache.json`` (fast / wifi-friendly default). Only models with
@@ -79,6 +80,8 @@ import threading
 import time
 import urllib.parse
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -365,6 +368,15 @@ def _repo_map(cwd: str | None, explicit: str | None = None, limit: int = 4000) -
 _CODEX_SCAN_LIMIT = (
     200  # newest rollout files to scan for a usable window (short runs log windowless)
 )
+
+# Optional offloads should leave room for interactive/debate work.  The function seam
+# below deliberately owns this bootstrap value so a learned reserve (3 x P95 debate-round
+# cost + 10% margin) can replace it without changing the decision/output machinery.
+_HEADROOM_BOOTSTRAP_RESERVE_PERCENT = 35.0
+_HEADROOM_STALE_AFTER_SECONDS = 6 * 3600
+_HEADROOM_RESET_FRESH_SECONDS = 10 * 60
+_FIVE_HOUR_MINUTES = 5 * 60
+_SEVEN_DAY_MINUTES = 7 * 24 * 60
 
 
 # --------------------------------------------------------------------------- #
@@ -897,17 +909,38 @@ def _codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
 
 
-def _codex_window(raw: object) -> tuple[float, int] | None:
-    """Parse one ``rate_limits`` window -> ``(used_percent, resets_at_epoch)`` or None."""
+@dataclass(frozen=True)
+class _CodexRateWindow:
+    """One duration-identified Codex quota window."""
+
+    used_percent: float
+    resets_at: int
+    window_minutes: int
+
+
+@dataclass(frozen=True)
+class _CodexRateSnapshot:
+    """The newest rollout rate-limit event and all duration-keyed windows it carries."""
+
+    captured_at: int
+    windows: dict[int, _CodexRateWindow]
+    malformed: bool = False
+
+
+def _parse_codex_window(raw: object) -> _CodexRateWindow | None:
+    """Parse a window, retaining the duration that identifies its quota bucket."""
     if not isinstance(raw, dict):
         return None
-    pct, resets = raw.get("used_percent"), raw.get("resets_at")
-    if pct is None or resets is None:
+    pct = raw.get("used_percent")
+    resets = raw.get("resets_at")
+    minutes = raw.get("window_minutes")
+    if pct is None or resets is None or minutes is None:
         return None
     try:
-        return (float(pct), int(resets))
+        parsed = _CodexRateWindow(float(pct), int(resets), int(minutes))
     except (TypeError, ValueError):
         return None
+    return parsed if parsed.window_minutes > 0 else None
 
 
 def _dig_rate_limits(obj: object) -> dict | None:
@@ -920,14 +953,51 @@ def _dig_rate_limits(obj: object) -> dict | None:
     return None
 
 
-def _latest_rate_limits(path: Path) -> dict | None:
-    """Newest *usable* ``rate_limits`` block in a rollout JSONL (scanning from the end).
+def _event_timestamp(obj: object, fallback: int) -> int:
+    """Return a rollout event's epoch timestamp, falling back to its file mtime."""
+    if not isinstance(obj, dict):
+        return fallback
+    raw = obj.get("timestamp")
+    try:
+        if isinstance(raw, (int, float)):
+            value = float(raw)
+            return int(value / 1000 if value > 10**12 else value)
+        if isinstance(raw, str):
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return int(parsed.timestamp())
+    except (OverflowError, ValueError):
+        pass
+    return fallback
+
+
+def _windows_by_duration(rate_limits: dict) -> tuple[dict[int, _CodexRateWindow], bool]:
+    """Parse primary/secondary without assigning either one a semantic position."""
+    windows: dict[int, _CodexRateWindow] = {}
+    malformed = False
+    for slot in ("primary", "secondary"):
+        raw = rate_limits.get(slot)
+        if raw is None:
+            continue
+        window = _parse_codex_window(raw)
+        if window is None or window.window_minutes in windows:
+            malformed = True
+            continue
+        windows[window.window_minutes] = window
+    return windows, malformed
+
+
+def _latest_rate_limits_event(path: Path) -> _CodexRateSnapshot | None:
+    """Newest non-windowless ``rate_limits`` event in a rollout JSONL.
 
     Skips windowless ``premium`` blocks (both windows null) that short ``codex exec``
-    runs log, so the freshest block with real 5h/weekly data wins.
+    runs log. A malformed non-null window is returned as such so safety decisions can
+    fail closed instead of silently falling back to an older, apparently healthy event.
     """
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        fallback = int(path.stat().st_mtime)
     except OSError:
         return None
     for line in reversed(lines):
@@ -938,12 +1008,35 @@ def _latest_rate_limits(path: Path) -> dict | None:
         except (json.JSONDecodeError, ValueError):
             continue
         rate_limits = _dig_rate_limits(obj)
-        if rate_limits is not None and (
-            _codex_window(rate_limits.get("primary")) is not None
-            or _codex_window(rate_limits.get("secondary")) is not None
-        ):
-            return rate_limits
+        if rate_limits is None:
+            continue
+        windows, malformed = _windows_by_duration(rate_limits)
+        if windows or malformed:
+            return _CodexRateSnapshot(
+                captured_at=_event_timestamp(obj, fallback),
+                windows=windows,
+                malformed=malformed,
+            )
     return None
+
+
+def _codex_rate_snapshot() -> _CodexRateSnapshot | None:
+    """Newest duration-keyed Codex quota event across recent rollout files."""
+    sessions = _codex_home() / "sessions"
+    try:
+        files = sorted(
+            sessions.glob("**/rollout-*.jsonl"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    snapshots = [
+        snapshot
+        for path in files[:_CODEX_SCAN_LIMIT]
+        if (snapshot := _latest_rate_limits_event(path)) is not None
+    ]
+    return max(snapshots, key=lambda item: item.captured_at, default=None)
 
 
 def _codex_usage_windows(now: int | None = None) -> dict[str, tuple[float, int] | None]:
@@ -954,28 +1047,20 @@ def _codex_usage_windows(now: int | None = None) -> dict[str, tuple[float, int] 
     else the gate would never reopen after a reset. All-None => usage unknown.
     """
     now_ts = int(time.time()) if now is None else now
-    sessions = _codex_home() / "sessions"
-    try:
-        files = sorted(
-            sessions.glob("**/rollout-*.jsonl"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except OSError:
+    snapshot = _codex_rate_snapshot()
+    if snapshot is None:
         return {"five_hour": None, "seven_day": None}
-    for path in files[:_CODEX_SCAN_LIMIT]:
-        rate_limits = _latest_rate_limits(path)
-        if rate_limits is None:
-            continue
 
-        def _live(win: tuple[float, int] | None) -> tuple[float, int] | None:
-            return win if (win is not None and win[1] > now_ts) else None
+    def _live(minutes: int) -> tuple[float, int] | None:
+        win = snapshot.windows.get(minutes)
+        if win is None or win.resets_at <= now_ts:
+            return None
+        return (win.used_percent, win.resets_at)
 
-        return {
-            "five_hour": _live(_codex_window(rate_limits.get("primary"))),
-            "seven_day": _live(_codex_window(rate_limits.get("secondary"))),
-        }
-    return {"five_hour": None, "seven_day": None}
+    return {
+        "five_hour": _live(_FIVE_HOUR_MINUTES),
+        "seven_day": _live(_SEVEN_DAY_MINUTES),
+    }
 
 
 def read_codex_usage(now: int | None = None) -> tuple[float | None, int | None]:
@@ -1001,6 +1086,82 @@ def _format_reset(resets_at: int, now: int | None = None) -> str:
         parts.append(f"{hours}h")
     parts.append(f"{mins}m")
     return "in " + " ".join(parts)
+
+
+def headroom_reserve_percent(window_minutes: int) -> float:
+    """Quota to hold back in one window; seam for a future learned reserve.
+
+    The planned learned policy is ``3 x P95 debate-round cost + 10% margin``. Until
+    enough cost history exists, every duration uses the judged 35% bootstrap reserve.
+    """
+    del window_minutes
+    return _HEADROOM_BOOTSTRAP_RESERVE_PERCENT
+
+
+def _format_window_duration(window_minutes: int) -> str:
+    """Compact human label for an arbitrary rate-limit duration."""
+    if window_minutes % (24 * 60) == 0:
+        return f"{window_minutes // (24 * 60)}d"
+    if window_minutes % 60 == 0:
+        return f"{window_minutes // 60}h"
+    return f"{window_minutes}m"
+
+
+def codex_headroom(now: int | None = None) -> dict[str, Any]:
+    """Structured quota-reserve decision for optional Codex offloads.
+
+    Missing, malformed, or older-than-six-hours quota data fails closed. This policy
+    governs optional offload work only; debate callers intentionally remain always allowed.
+    """
+    now_ts = int(time.time()) if now is None else now
+    snapshot = _codex_rate_snapshot()
+    rows: list[dict[str, Any]] = []
+    if snapshot is not None:
+        for minutes, window in sorted(snapshot.windows.items()):
+            reserve = headroom_reserve_percent(minutes)
+            remaining = 100.0 - window.used_percent
+            reset_fresh = window.resets_at <= now_ts + _HEADROOM_RESET_FRESH_SECONDS
+            rows.append(
+                {
+                    "duration": _format_window_duration(minutes),
+                    "window_minutes": minutes,
+                    "used_percent": window.used_percent,
+                    "remaining_percent": remaining,
+                    "resets_at": window.resets_at,
+                    "resets_in_seconds": window.resets_at - now_ts,
+                    "reserve_percent": reserve,
+                    "reset_fresh": reset_fresh,
+                    "verdict": "allowed" if reset_fresh or remaining >= reserve else "reserve",
+                }
+            )
+
+    state: str
+    reason: str
+    if snapshot is None:
+        state, reason = "unknown", "no usable rate_limits event"
+    elif snapshot.malformed:
+        state, reason = "unknown", "rate_limits event contains a malformed window"
+    elif not rows:
+        state, reason = "unknown", "rate_limits event has no usable windows"
+    elif now_ts - snapshot.captured_at > _HEADROOM_STALE_AFTER_SECONDS:
+        state, reason = "unknown", "newest rate_limits event is older than 6h"
+    elif any(row["verdict"] == "reserve" for row in rows):
+        state, reason = "reserve", "at least one live window is inside its reserve"
+    else:
+        state, reason = "allowed", "every live window has sufficient headroom"
+
+    if state == "unknown":
+        for row in rows:
+            row["verdict"] = "unknown"
+    return {
+        "state": state,
+        "offload_allowed": state == "allowed",
+        "reason": reason,
+        "captured_at": snapshot.captured_at if snapshot is not None else None,
+        "stale_after_seconds": _HEADROOM_STALE_AFTER_SECONDS,
+        "reset_fresh_within_seconds": _HEADROOM_RESET_FRESH_SECONDS,
+        "windows": rows,
+    }
 
 
 def _usage_tier_cap(ceiling: int, now: int | None = None) -> int:
@@ -1141,10 +1302,18 @@ def cmd_usage(args: argparse.Namespace) -> int:
     windows = _codex_usage_windows()
     if args.json:
         payload = {
-            key: ({"used_percent": win[0], "resets_at": win[1]} if win is not None else None)
-            for key, win in (
-                ("five_hour", windows["five_hour"]),
-                ("seven_day", windows["seven_day"]),
+            key: (
+                {
+                    "used_percent": win[0],
+                    "resets_at": win[1],
+                    "window_minutes": minutes,
+                }
+                if win is not None
+                else None
+            )
+            for key, minutes, win in (
+                ("five_hour", _FIVE_HOUR_MINUTES, windows["five_hour"]),
+                ("seven_day", _SEVEN_DAY_MINUTES, windows["seven_day"]),
             )
         }
         print(json.dumps(payload))
@@ -1159,6 +1328,28 @@ def cmd_usage(args: argparse.Namespace) -> int:
         )
     print("codex usage: " + "  ·  ".join(parts))
     return EX_OK
+
+
+def cmd_headroom(args: argparse.Namespace) -> int:
+    """Report whether optional Codex offloads can spend quota beyond the reserve."""
+    decision = codex_headroom()
+    if args.json:
+        print(json.dumps(decision))
+    else:
+        for window in decision["windows"]:
+            print(
+                f"{window['duration']}: {window['used_percent']:.0f}% used, "
+                f"resets {_format_reset(window['resets_at'])}, "
+                f"reserve {window['reserve_percent']:.0f}%, "
+                f"{str(window['verdict']).upper()}"
+            )
+        if decision["state"] == "allowed":
+            print("offload: ALLOWED")
+        elif decision["state"] == "reserve":
+            print(f"offload: DENIED (reserve zone — {decision['reason']})")
+        else:
+            print(f"offload: DENIED (unknown — {decision['reason']})")
+    return {"allowed": 0, "reserve": 1, "unknown": 3}[decision["state"]]
 
 
 def cmd_delegate(args: argparse.Namespace) -> int:
@@ -1362,6 +1553,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  codex-in-claude.py set-model gpt-5.6-sol --for all\n"
             "  codex-in-claude.py get-model --for debate\n"
             "  codex-in-claude.py sync-skills --check      # is /codex… help in sync?\n"
+            "  codex-in-claude.py headroom --json          # optional-offload quota gate\n"
             "  codex-in-claude.py delegate --write -C . 'add retry to fetch()'\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1527,6 +1719,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_usage = sub.add_parser("usage", help="show current Codex rate-limit usage (5h + weekly)")
     p_usage.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
     p_usage.set_defaults(func=cmd_usage)
+
+    p_headroom = sub.add_parser(
+        "headroom",
+        help="check quota reserve before optional Codex offloads",
+        description=(
+            "Check whether every live Codex quota window has enough remaining reserve "
+            "for optional offload work. Missing/stale data fails closed; debates remain "
+            "always allowed and should not use this gate."
+        ),
+    )
+    p_headroom.add_argument("-j", "--json", action="store_true", help="machine-readable JSON")
+    p_headroom.set_defaults(func=cmd_headroom)
 
     p_runs = sub.add_parser(
         "runs", help="list in-flight delegate runs (elapsed/idle/last output, one line each)"
