@@ -1,0 +1,7 @@
+not-json
+{"ts":1999999900,"purpose":"debate","model":"m","effort":"high","before":{},"after":{"300":{"used_percent":2.0,"resets_at":2000100000}}}
+{"ts":1999999901,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":"bad","resets_at":2000100000}},"after":{"300":{"used_percent":2.0,"resets_at":2000100000}}}
+{"ts":1999999902,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":80.0,"resets_at":2000100000}},"after":{"300":{"used_percent":85.0,"resets_at":2000200000}}}
+{"ts":1999999903,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":80.0,"resets_at":2000100000}},"after":{"300":{"used_percent":2.0,"resets_at":2000100000}}}
+{"ts":1999999904,"purpose":"review","model":"m","effort":"high","before":{"300":{"used_percent":1.0,"resets_at":2000100000}},"after":{"300":{"used_percent":50.0,"resets_at":2000100000}}}
+{"ts":1999999905,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":1.0,"resets_at":2000100000}},"after":{"300":{"used_percent":2.5,"resets_at":2000100000}}}

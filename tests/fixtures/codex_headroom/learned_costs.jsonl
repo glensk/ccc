@@ -1,0 +1,10 @@
+{"ts":1999999901,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":10.0,"resets_at":2000100000}},"after":{"300":{"used_percent":11.0,"resets_at":2000100000}}}
+{"ts":1999999902,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":11.0,"resets_at":2000100000}},"after":{"300":{"used_percent":12.0,"resets_at":2000100000}}}
+{"ts":1999999903,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":12.0,"resets_at":2000100000}},"after":{"300":{"used_percent":13.0,"resets_at":2000100000}}}
+{"ts":1999999904,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":13.0,"resets_at":2000100000}},"after":{"300":{"used_percent":14.0,"resets_at":2000100000}}}
+{"ts":1999999905,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":14.0,"resets_at":2000100000}},"after":{"300":{"used_percent":15.0,"resets_at":2000100000}}}
+{"ts":1999999906,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":15.0,"resets_at":2000100000}},"after":{"300":{"used_percent":16.0,"resets_at":2000100000}}}
+{"ts":1999999907,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":16.0,"resets_at":2000100000}},"after":{"300":{"used_percent":17.0,"resets_at":2000100000}}}
+{"ts":1999999908,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":17.0,"resets_at":2000100000}},"after":{"300":{"used_percent":18.0,"resets_at":2000100000}}}
+{"ts":1999999909,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":18.0,"resets_at":2000100000}},"after":{"300":{"used_percent":19.0,"resets_at":2000100000}}}
+{"ts":1999999910,"purpose":"debate","model":"m","effort":"high","before":{"300":{"used_percent":19.0,"resets_at":2000100000}},"after":{"300":{"used_percent":23.0,"resets_at":2000100000}}}

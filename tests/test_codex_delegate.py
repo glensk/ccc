@@ -111,6 +111,19 @@ def _install_headroom_fixture(
     rollout.write_text((_HEADROOM_FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8")
 
 
+def _install_cost_fixture(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> Path:
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    path.write_text((_HEADROOM_FIXTURES / name).read_text(encoding="utf-8"), encoding="utf-8")
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    return path
+
+
 @pytest.mark.parametrize(
     ("fixture_name", "state", "allowed", "durations"),
     [
@@ -214,6 +227,88 @@ def test_headroom_help_says_unknown_is_offload_only(cic: ModuleType) -> None:
     assert "debates remain always allowed" in normalized
 
 
+def test_learned_reserve_p95_and_exact_ten_sample_switchover(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _install_cost_fixture(cic, tmp_path, monkeypatch, "learned_costs.jsonl")
+    lines = path.read_text(encoding="utf-8").splitlines()
+    path.write_text("\n".join(lines[:9]) + "\n", encoding="utf-8")
+    assert cic.headroom_reserve_percent(300) == 35.0
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # nearest-rank P95 of ten values is the maximum (4); 3 * 4 * 1.10 = 13.2
+    assert cic.headroom_reserve_percent(300) == pytest.approx(13.2)
+    assert cic._headroom_reserve(300)[1] == "learned"
+    assert cic._headroom_reserve(10080) == (35.0, "bootstrap")
+
+
+@pytest.mark.parametrize(("delta", "expected"), [(0.1, 5.0), (30.0, 60.0)])
+def test_learned_reserve_clamps_both_ends(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    delta: float,
+    expected: float,
+) -> None:
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    rows = [
+        {
+            "ts": _HEADROOM_NOW - i,
+            "purpose": "debate",
+            "model": "m",
+            "effort": "high",
+            "before": {"300": {"used_percent": 10.0, "resets_at": _HEADROOM_NOW + 5000}},
+            "after": {"300": {"used_percent": 10.0 + delta, "resets_at": _HEADROOM_NOW + 5000}},
+        }
+        for i in range(10)
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    assert cic.headroom_reserve_percent(300) == expected
+
+
+def test_cost_history_ignores_corrupt_partial_non_debate_and_reset_samples(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _install_cost_fixture(cic, tmp_path, monkeypatch, "mixed_costs.jsonl")
+    assert cic._debate_cost_deltas(300) == [1.5]
+    assert cic.headroom_reserve_percent(300) == 35.0
+
+
+def test_cost_history_prunes_rows_older_than_ninety_days_on_write(
+    cic: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = _HEADROOM_NOW
+    path = tmp_path / "cost-history.jsonl"
+    monkeypatch.setenv("CODEX_IN_CLAUDE_COST_LOG", str(path))
+    old = {"ts": now - cic._COST_HISTORY_SECONDS - 1, "purpose": "debate"}
+    boundary = {"ts": now - cic._COST_HISTORY_SECONDS, "purpose": "debate"}
+    path.write_text(
+        json.dumps(old) + "\n" + "corrupt\n" + json.dumps(boundary) + "\n",
+        encoding="utf-8",
+    )
+    assert cic.record_codex_run(
+        purpose="delegate", model="m", effort="high", before={}, after={}, ts=now
+    )
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [row["ts"] for row in rows] == [boundary["ts"], now]
+
+
+def test_headroom_surfaces_reserve_source_in_json_and_human_output(
+    cic: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _install_headroom_fixture(cic, tmp_path, monkeypatch, "one_window.jsonl")
+    monkeypatch.setattr(cic.time, "time", lambda: float(_HEADROOM_NOW))
+    decision = cic.codex_headroom(now=_HEADROOM_NOW)
+    assert decision["windows"][0]["reserve_source"] == "bootstrap"
+    cic.cmd_headroom(argparse.Namespace(json=False))
+    assert "reserve_source bootstrap" in capsys.readouterr().out
+
+
 # --------------------------- delegate prompt contract --------------------------- #
 def test_patch_contract_demands_diff(cic: ModuleType) -> None:
     prompt = cic._build_delegate_prompt("add x", write=False, feedback=None, round_no=1)
@@ -265,6 +360,48 @@ def test_delegate_prints_model_first_and_assembles_cmd(
     assert captured["cmd"][:3] == ["codex", "exec", "-s"]
     assert "read-only" in captured["cmd"] and "-m" in captured["cmd"]
     assert "gpt-5.6-sol" in captured["cmd"]
+
+
+def test_delegate_records_cost_snapshots_and_purpose_without_stdout_preamble(
+    cic: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    snapshots = iter(
+        [
+            {"300": {"used_percent": 10.0, "resets_at": 2_000_100_000}},
+            {"300": {"used_percent": 11.5, "resets_at": 2_000_100_000}},
+        ]
+    )
+
+    def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        Path(cmd[cmd.index("-o") + 1]).write_text("ok", encoding="utf-8")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(cic, "codex_cost_snapshot", lambda: next(snapshots))
+    monkeypatch.setattr(cic, "_exec_codex", fake_run)
+    assert cic.cmd_delegate(_ns(purpose="debate")) == cic.EX_OK
+    assert capsys.readouterr().out.splitlines()[0] == "model: gpt-5.6-sol (effort xhigh)"
+    rows = [
+        json.loads(line)
+        for line in cic.codex_cost_history_path().read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows == [
+        {
+            "ts": rows[0]["ts"],
+            "purpose": "debate",
+            "model": "gpt-5.6-sol",
+            "effort": "xhigh",
+            "before": {"300": {"used_percent": 10.0, "resets_at": 2_000_100_000}},
+            "after": {"300": {"used_percent": 11.5, "resets_at": 2_000_100_000}},
+        }
+    ]
+
+
+def test_delegate_parser_purpose_defaults_and_override(cic: ModuleType) -> None:
+    parser = cic.build_parser()
+    assert parser.parse_args(["delegate", "x"]).purpose == "delegate"
+    assert parser.parse_args(["delegate", "--purpose", "review", "x"]).purpose == "review"
 
 
 def test_delegate_write_mode_uses_workspace_write(

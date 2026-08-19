@@ -46,6 +46,7 @@ codex-in-claude.py get-model --for debate
 codex-in-claude.py set-effort high                           # low|medium|high|xhigh|default
 codex-in-claude.py sync-skills [--check]                     # re-stamp the model into the help
 codex-in-claude.py usage [--json]                            # Codex 5h + weekly quota
+codex-in-claude.py headroom [--json]                         # learned optional-offload reserve
 codex-in-claude.py delegate [--write] [--scout] -C <repo> "<task>"  # one round; prints model first
 ```
 
@@ -69,6 +70,13 @@ runs with a cross-process semaphore (tapered from live quota), and preflights th
 a run that would start ≥100% used exits with a distinct code and the reset time, *without*
 launching Codex. Environment kill-switches: `CCC_NO_CODEX=1` disables all Codex use for
 the session/shell.
+
+Every launched delegate writes one before/after quota snapshot to
+`~/.config/codex-in-claude/cost-history.jsonl` and prunes entries older than 90 days.
+`delegate --purpose debate` labels debate rounds; after 10 valid rounds for a quota-window
+duration, `headroom` reserves `3 × P95` of their measured cost plus a 10% margin (bounded
+to 5–60%) instead of the 35% bootstrap. An external debate runner can use the same
+`codex_cost_snapshot()` and `record_codex_run()` Python functions around its `codex exec`.
 
 Configuration lives in `~/.config/codex-in-claude/config.json` (override with
 `$CODEX_IN_CLAUDE_CONFIG`). Resolution is per-command → `default` → the latest Codex model;

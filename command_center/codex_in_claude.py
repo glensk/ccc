@@ -70,6 +70,7 @@ import argparse
 import contextlib
 import fcntl
 import json
+import math
 import os
 import re
 import signal
@@ -373,8 +374,12 @@ _CODEX_SCAN_LIMIT = (
 # below deliberately owns this bootstrap value so a learned reserve (3 x P95 debate-round
 # cost + 10% margin) can replace it without changing the decision/output machinery.
 _HEADROOM_BOOTSTRAP_RESERVE_PERCENT = 35.0
+_HEADROOM_MIN_SAMPLES = 10
+_HEADROOM_MIN_RESERVE_PERCENT = 5.0
+_HEADROOM_MAX_RESERVE_PERCENT = 60.0
 _HEADROOM_STALE_AFTER_SECONDS = 6 * 3600
 _HEADROOM_RESET_FRESH_SECONDS = 10 * 60
+_COST_HISTORY_SECONDS = 90 * 24 * 3600
 _FIVE_HOUR_MINUTES = 5 * 60
 _SEVEN_DAY_MINUTES = 7 * 24 * 60
 
@@ -1039,6 +1044,151 @@ def _codex_rate_snapshot() -> _CodexRateSnapshot | None:
     return max(snapshots, key=lambda item: item.captured_at, default=None)
 
 
+def codex_cost_history_path() -> Path:
+    """Per-run Codex cost log, beside this tool's existing config by default."""
+    override = os.environ.get("CODEX_IN_CLAUDE_COST_LOG")
+    if override:
+        return Path(override).expanduser()
+    return config_path().with_name("cost-history.jsonl")
+
+
+def codex_cost_snapshot() -> dict[str, dict[str, float | int]]:
+    """Serializable duration-keyed quota snapshot for cost instrumentation.
+
+    This public seam lets an external debate helper capture ``before`` and ``after``
+    around its own ``codex exec`` and pass both to :func:`record_codex_run`.
+    """
+    snapshot = _codex_rate_snapshot()
+    if snapshot is None:
+        return {}
+    return {
+        str(minutes): {
+            "used_percent": window.used_percent,
+            "resets_at": window.resets_at,
+        }
+        for minutes, window in sorted(snapshot.windows.items())
+    }
+
+
+def _history_row_timestamp(row: object) -> float | None:
+    """Finite epoch timestamp from one cost-history row, or None."""
+    if not isinstance(row, dict):
+        return None
+    try:
+        value = float(row["ts"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def record_codex_run(
+    *,
+    purpose: str,
+    model: str,
+    effort: str,
+    before: dict[str, dict[str, float | int]],
+    after: dict[str, dict[str, float | int]],
+    ts: int | None = None,
+    path: Path | None = None,
+) -> bool:
+    """Record one Codex run and prune history older than 90 days.
+
+    Writes are serialized across processes and are deliberately best-effort: cost
+    telemetry must never change a delegate run's result or stdout contract.
+    """
+    now = int(time.time()) if ts is None else ts
+    target = path or codex_cost_history_path()
+    lock_path = target.with_suffix(target.suffix + ".lock")
+    row = {
+        "ts": now,
+        "purpose": purpose,
+        "model": model,
+        "effort": effort,
+        "before": before,
+        "after": after,
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("w", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            retained: list[str] = []
+            cutoff = now - _COST_HISTORY_SECONDS
+            try:
+                old_lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            except FileNotFoundError:
+                old_lines = []
+            for line in old_lines:
+                try:
+                    old_row = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                old_ts = _history_row_timestamp(old_row)
+                if old_ts is not None and old_ts >= cutoff:
+                    retained.append(json.dumps(old_row, separators=(",", ":")))
+            retained.append(json.dumps(row, separators=(",", ":")))
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=str(target.parent),
+                prefix=f".{target.name}.",
+                suffix=".tmp",
+                delete=False,
+                encoding="utf-8",
+            ) as handle:
+                handle.write("\n".join(retained) + "\n")
+                tmp = Path(handle.name)
+            tmp.replace(target)
+        return True
+    except OSError:
+        return False
+
+
+def _debate_cost_deltas(window_minutes: int, *, now: int | None = None) -> list[float]:
+    """Valid debate-run usage deltas for one duration from the retained history."""
+    now_ts = int(time.time()) if now is None else now
+    try:
+        lines = codex_cost_history_path().read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    key = str(window_minutes)
+    deltas: list[float] = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        row_ts = _history_row_timestamp(row)
+        if (
+            not isinstance(row, dict)
+            or row.get("purpose") != "debate"
+            or row_ts is None
+            or row_ts < now_ts - _COST_HISTORY_SECONDS
+        ):
+            continue
+        before = row.get("before")
+        after = row.get("after")
+        if not isinstance(before, dict) or not isinstance(after, dict):
+            continue
+        before_window = before.get(key)
+        after_window = after.get(key)
+        if not isinstance(before_window, dict) or not isinstance(after_window, dict):
+            continue
+        try:
+            before_pct = float(before_window["used_percent"])
+            after_pct = float(after_window["used_percent"])
+            before_reset = int(before_window["resets_at"])
+            after_reset = int(after_window["resets_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in (before_pct, after_pct)):
+            continue
+        # A changed reset boundary means the run crossed a reset, even if the new
+        # window happened to climb back above the old used percentage.
+        if after_reset != before_reset or after_pct < before_pct:
+            continue
+        deltas.append(after_pct - before_pct)
+    return deltas
+
+
 def _codex_usage_windows(now: int | None = None) -> dict[str, tuple[float, int] | None]:
     """Live 5h/weekly windows from the newest usable rollout block.
 
@@ -1088,14 +1238,23 @@ def _format_reset(resets_at: int, now: int | None = None) -> str:
     return "in " + " ".join(parts)
 
 
-def headroom_reserve_percent(window_minutes: int) -> float:
-    """Quota to hold back in one window; seam for a future learned reserve.
+def _headroom_reserve(window_minutes: int) -> tuple[float, str]:
+    """Reserve percentage and its source for one duration."""
+    deltas = sorted(_debate_cost_deltas(window_minutes))
+    if len(deltas) < _HEADROOM_MIN_SAMPLES:
+        return (_HEADROOM_BOOTSTRAP_RESERVE_PERCENT, "bootstrap")
+    # Nearest-rank P95: the smallest observed value at or above the 95th percentile.
+    p95 = deltas[math.ceil(0.95 * len(deltas)) - 1]
+    learned = 3.0 * p95 * 1.10
+    return (
+        min(_HEADROOM_MAX_RESERVE_PERCENT, max(_HEADROOM_MIN_RESERVE_PERCENT, learned)),
+        "learned",
+    )
 
-    The planned learned policy is ``3 x P95 debate-round cost + 10% margin``. Until
-    enough cost history exists, every duration uses the judged 35% bootstrap reserve.
-    """
-    del window_minutes
-    return _HEADROOM_BOOTSTRAP_RESERVE_PERCENT
+
+def headroom_reserve_percent(window_minutes: int) -> float:
+    """Quota to hold back: learned debate cost after 10 samples, else 35%."""
+    return _headroom_reserve(window_minutes)[0]
 
 
 def _format_window_duration(window_minutes: int) -> str:
@@ -1118,7 +1277,7 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     if snapshot is not None:
         for minutes, window in sorted(snapshot.windows.items()):
-            reserve = headroom_reserve_percent(minutes)
+            reserve, reserve_source = _headroom_reserve(minutes)
             remaining = 100.0 - window.used_percent
             reset_fresh = window.resets_at <= now_ts + _HEADROOM_RESET_FRESH_SECONDS
             rows.append(
@@ -1130,6 +1289,7 @@ def codex_headroom(now: int | None = None) -> dict[str, Any]:
                     "resets_at": window.resets_at,
                     "resets_in_seconds": window.resets_at - now_ts,
                     "reserve_percent": reserve,
+                    "reserve_source": reserve_source,
                     "reset_fresh": reset_fresh,
                     "verdict": "allowed" if reset_fresh or remaining >= reserve else "reserve",
                 }
@@ -1340,7 +1500,8 @@ def cmd_headroom(args: argparse.Namespace) -> int:
             print(
                 f"{window['duration']}: {window['used_percent']:.0f}% used, "
                 f"resets {_format_reset(window['resets_at'])}, "
-                f"reserve {window['reserve_percent']:.0f}%, "
+                f"reserve {window['reserve_percent']:.0f}% "
+                f"(reserve_source {window['reserve_source']}), "
                 f"{str(window['verdict']).upper()}"
             )
         if decision["state"] == "allowed":
@@ -1458,20 +1619,31 @@ def cmd_delegate(args: argparse.Namespace) -> int:
         "repo": args.cwd or os.getcwd(),
         "write": write,
     }
+    purpose = getattr(args, "purpose", "delegate")
     try:
         # Take one concurrency slot before launching codex; the rest of a fan-out waits.
         with _concurrency_slot(_max_concurrent(args.max_concurrent)):
             # When Codex may write, snapshot the worktree so the caller reviews ONLY its diff.
             before = _git_status(args.cwd) if write else None
+            cost_before = codex_cost_snapshot()
             try:
-                proc = _exec_codex(
-                    cmd,
-                    env=env,
-                    timeout=wall_timeout,
-                    idle_timeout=idle_timeout,
-                    heartbeat_path=heartbeat,
-                    heartbeat_meta=heartbeat_meta,
-                )
+                try:
+                    proc = _exec_codex(
+                        cmd,
+                        env=env,
+                        timeout=wall_timeout,
+                        idle_timeout=idle_timeout,
+                        heartbeat_path=heartbeat,
+                        heartbeat_meta=heartbeat_meta,
+                    )
+                finally:
+                    record_codex_run(
+                        purpose=purpose,
+                        model=model,
+                        effort=shown_effort,
+                        before=cost_before,
+                        after=codex_cost_snapshot(),
+                    )
             except FileNotFoundError:
                 print("ERROR: `codex` CLI not found on PATH.", file=sys.stderr)
                 return EX_NO_CODEX
@@ -1644,6 +1816,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_del.add_argument(
         "-m", "--model", default=None, help="override model (else resolved from config)"
+    )
+    p_del.add_argument(
+        "-p",
+        "--purpose",
+        default="delegate",
+        help="cost-instrumentation purpose label (default: delegate; e.g. debate, review)",
     )
     p_del.add_argument(
         "-e",
