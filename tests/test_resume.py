@@ -14,8 +14,10 @@ import os
 from pathlib import Path
 
 from command_center.config import Config
-from command_center.models import LiveSession
+from command_center.models import LiveSession, now_ms
 from command_center.resume import (
+    _BACKOFF_BASE_MS,
+    _BACKOFF_CAP_MS,
     Action,
     Entry,
     Observation,
@@ -26,10 +28,13 @@ from command_center.resume import (
     _state_path,
     apply_actions,
     candidates,
+    has_work,
     load_state,
     plan,
+    reconcile_failed_entries,
     repo_of,
     save_state,
+    tick,
     will_auto_resume,
 )
 from command_center.store import Store
@@ -57,6 +62,8 @@ def _obs(
     cwd: str = "/r1",
     repo: str = "/r1",
     account: str = ACCT,
+    progressed: bool = False,
+    reset_hint: int = 0,
 ) -> Observation:
     return Observation(
         alive=alive,
@@ -66,6 +73,8 @@ def _obs(
         cwd=cwd,
         repo=repo,
         account=account,
+        progressed=progressed,
+        reset_hint_ms=reset_hint,
     )
 
 
@@ -216,16 +225,23 @@ def test_parked_after_progress_counts_as_finished() -> None:
 def test_rehalt_requeues_and_clears_reset() -> None:
     entries = {"A": Entry("A", repo="/r1", cwd="/r1", state="running", baseline_offset=100)}
     base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, entries=entries)
-    observed = {"A": _obs(alive=True, raw="busy", halted=True, size=150)}  # 429'd again
+    observed = {"A": _obs(alive=True, raw="busy", halted=True, size=150)}  # 429'd again, barren
     state, actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
-    assert state.entries["A"].state == "queued"
-    assert state.entries["A"].attempts == 1
+    entry = state.entries["A"]
+    assert entry.state == "queued"
+    assert entry.attempts == 1
+    assert entry.retry_not_before == NOW + _BACKOFF_BASE_MS * 2  # fallback: 15min·2^1
     assert not state.reset_confirmed_at  # that account's limit is back → re-gate it
     assert "ensure_reset_wait" in _kinds(actions)
     assert "launch_resume" not in _kinds(actions)
 
 
-def test_rehalt_at_attempt_cap_fails() -> None:
+def test_barren_rehalt_backs_off_instead_of_failing() -> None:
+    """A rate-limit re-halt can NEVER become terminal `failed` (Codex O1).
+
+    Pre-redesign this scenario (attempts at the cap) permanently stranded the session
+    — the 5 live tombstones of 2026-07/08. Now it backs off and stays retryable.
+    """
     entries = {
         "A": Entry("A", repo="/r1", cwd="/r1", state="running", baseline_offset=100, attempts=2)
     }
@@ -234,8 +250,63 @@ def test_rehalt_at_attempt_cap_fails() -> None:
     state, actions = plan(
         observed, {"A"}, base, NOW, _cfg(resume_max_attempts=3), reset_signals=set()
     )
-    assert state.entries["A"].state == "failed"
-    assert any(a.kind == "notify" and "failed" in a.detail for a in actions)
+    entry = state.entries["A"]
+    assert entry.state == "queued"  # never "failed" for a rate-limit re-halt
+    assert entry.attempts == 3
+    assert entry.retry_not_before == NOW + min(_BACKOFF_CAP_MS, _BACKOFF_BASE_MS * 2**3)
+    assert not any(a.kind == "notify" and "failed" in a.detail for a in actions)
+
+
+def test_productive_rehalt_resets_attempts() -> None:
+    """Hours of real work then the NEXT window's limit = a fresh halt, not a failure."""
+    entries = {
+        "A": Entry(
+            "A",
+            repo="/r1",
+            cwd="/r1",
+            state="running",
+            baseline_offset=100,
+            attempts=2,
+            retry_not_before=NOW - 5,
+            fail_reason="re-halted on the limit",
+        )
+    }
+    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, entries=entries)
+    observed = {"A": _obs(alive=True, raw="busy", halted=True, size=900_000, progressed=True)}
+    state, actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
+    entry = state.entries["A"]
+    assert entry.state == "queued"
+    assert entry.attempts == 0  # full reset — the resume worked
+    assert entry.retry_not_before == 0
+    assert entry.fail_reason == ""
+    assert ACCT not in state.reset_confirmed_at  # the account still re-gates
+    assert "launch_resume" not in _kinds(actions)
+
+
+def test_barren_rehalt_uses_transcripts_reset_hint() -> None:
+    """The halting error's OWN reset time (e.g. a weekly Opus cap) wins over fallback."""
+    hint = NOW + 7_200_000  # the error says "resets in 2h"
+    entries = {"A": Entry("A", repo="/r1", cwd="/r1", state="running", baseline_offset=100)}
+    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, entries=entries)
+    observed = {"A": _obs(halted=True, size=150, reset_hint=hint)}
+    state, _actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
+    assert state.entries["A"].retry_not_before == hint
+    # A hint in the past is useless → the escalating fallback applies instead.
+    entries2 = {"B": Entry("B", repo="/r2", cwd="/r2", state="running", baseline_offset=100)}
+    base2 = QueueState(reset_confirmed_at={ACCT: NOW - 1}, entries=entries2)
+    observed2 = {"B": _obs(halted=True, size=150, cwd="/r2", repo="/r2", reset_hint=NOW - 1)}
+    state2, _actions2 = plan(observed2, {"B"}, base2, NOW, _cfg(), reset_signals=set())
+    assert state2.entries["B"].retry_not_before == NOW + _BACKOFF_BASE_MS * 2
+
+
+def test_backoff_entry_not_dispatched_until_due() -> None:
+    entries = {"A": Entry("A", repo="/r1", cwd="/r1", retry_not_before=NOW + 60_000)}
+    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=0, entries=entries)
+    observed = {"A": _obs(halted=True)}
+    _state, actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
+    assert "launch_resume" not in _kinds(actions)  # its own limit has not reset yet
+    _state2, actions2 = plan(observed, {"A"}, base, NOW + 61_000, _cfg(), reset_signals=set())
+    assert _launch_ids(actions2) == ["A"]  # due → dispatched
 
 
 def test_launch_timeout_when_dead_requeues() -> None:
@@ -385,6 +456,174 @@ def test_is_drained() -> None:
     assert _is_drained(QueueState(entries={"x": Entry("x", "/r", "/r", state="failed")}))
     assert not _is_drained(QueueState(entries={"x": Entry("x", "/r", "/r", state="queued")}))
     assert not _is_drained(QueueState(entries={"x": Entry("x", "/r", "/r", state="running")}))
+    # A queued entry in a future backoff does NOT keep the watcher alive — it exits
+    # and the daemon respawns it once the retry is due (has_work).
+    backoff = QueueState(
+        entries={"x": Entry("x", "/r", "/r", state="queued", retry_not_before=NOW + 10_000)}
+    )
+    assert _is_drained(backoff, NOW)
+    assert not _is_drained(backoff, NOW + 10_000)
+
+
+# --------------------------------------------------------------------------- #
+# failed-entry maintenance: prune finished tombstones, revive legacy rate-limit
+# --------------------------------------------------------------------------- #
+def test_reconcile_failed_entries_prunes_and_revives(tmp_path: Path) -> None:
+    store = Store(tmp_path / "s.db")
+    store.ensure("done_s")
+    store.update_fields("done_s", done=True)
+    store.ensure("open_rate")
+    store.ensure("open_timeout")
+    state = QueueState(
+        entries={
+            "done_s": Entry(
+                "done_s",
+                "/r",
+                "/r",
+                state="failed",
+                fail_reason="re-halted on the limit",
+                attempts=3,
+            ),
+            "ghost": Entry("ghost", "/r", "/r", state="failed", fail_reason="whatever"),
+            "open_rate": Entry(
+                "open_rate",
+                "/r",
+                "/r",
+                state="failed",
+                fail_reason="re-halted on the limit",
+                attempts=3,
+                retry_not_before=5,
+            ),
+            "open_timeout": Entry(
+                "open_timeout",
+                "/r",
+                "/r",
+                state="failed",
+                fail_reason="no resume progress before timeout",
+            ),
+        }
+    )
+    rows = reconcile_failed_entries(store, state)
+    assert "done_s" not in state.entries  # finished session → tombstone pruned
+    assert "ghost" not in state.entries  # session gone from the store → pruned
+    revived = state.entries["open_rate"]
+    assert revived.state == "queued"  # legacy rate-limit failure → recoverable again
+    assert revived.retry_not_before == 0
+    assert state.entries["open_timeout"].state == "failed"  # infra fault stays terminal
+    assert {r[0] for r in rows} == {"pruned-failed", "revived-legacy-failed"}
+
+
+def test_has_work_gates_daemon_spawn(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    assert not has_work()  # empty world
+    save_state(QueueState(entries={"q": Entry("q", "/r", "/r", state="queued")}))
+    assert has_work()  # a due queued entry
+    save_state(
+        QueueState(
+            entries={
+                "q": Entry("q", "/r", "/r", state="queued", retry_not_before=now_ms() + 3_600_000)
+            }
+        )
+    )
+    assert not has_work()  # backoff not due → no idle watcher respawn
+    with Store() as store:
+        store.ensure("f")
+    save_state(
+        QueueState(
+            entries={
+                "f": Entry(
+                    "f", "/r", "/r", state="failed", fail_reason="no resume progress before timeout"
+                )
+            }
+        )
+    )
+    assert not has_work()  # terminal failure of a still-open session: suppressed, no churn
+    with Store() as store:
+        store.update_fields("f", done=True)
+    assert has_work()  # ...but once the session finishes, the tombstone is prunable
+    save_state(
+        QueueState(
+            entries={
+                "g": Entry("g", "/r", "/r", state="failed", fail_reason="re-halted on the limit")
+            }
+        )
+    )
+    assert has_work()  # legacy rate-limit failure → revivable
+
+
+def test_will_auto_resume_honest_about_failed_entries(tmp_path: Path) -> None:
+    """Terminal-failed → bare || (no false promise); backoff/legacy keep the ▶."""
+    store = Store(tmp_path / "s.db")
+    store.ensure("h")
+    store.update_fields("h", cwd=str(tmp_path))
+    session = store.get("h")
+    assert session is not None
+    adapter = _StubAdapter(halted_ids={"h"}, cwd=str(tmp_path))
+    on = _cfg(resume_halted=True)
+    terminal = QueueState(
+        entries={"h": Entry("h", "/r", "/r", state="failed", fail_reason="no resume progress")}
+    )
+    legacy = QueueState(
+        entries={"h": Entry("h", "/r", "/r", state="failed", fail_reason="re-halted on the limit")}
+    )
+    backoff = QueueState(
+        entries={"h": Entry("h", "/r", "/r", state="queued", retry_not_before=NOW)}
+    )
+    assert not will_auto_resume(session, adapter, on, terminal)  # type: ignore[arg-type]
+    assert will_auto_resume(session, adapter, on, legacy)  # type: ignore[arg-type]
+    assert will_auto_resume(session, adapter, on, backoff)  # type: ignore[arg-type]
+
+
+def test_dry_run_touches_neither_queue_nor_log(tmp_path: Path, monkeypatch) -> None:
+    """`ccc resume-halted --dry-run` must leave resume_queue.json AND resume.log alone."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    with Store() as store:
+        store.ensure("dead")
+        store.update_fields("dead", done=True)
+    save_state(
+        QueueState(
+            entries={
+                "dead": Entry(
+                    "dead",
+                    "/r",
+                    "/r",
+                    state="failed",
+                    fail_reason="re-halted on the limit",
+                    attempts=3,
+                )
+            }
+        )
+    )
+    queue_before = _state_path().read_bytes()
+    assert tick(_cfg(resume_halted=True), dry_run=True)
+    assert _state_path().read_bytes() == queue_before
+    assert not (tmp_path / "command-center" / "resume.log").exists()
+
+
+def test_tick_prunes_legacy_failed_done_sessions(tmp_path: Path, monkeypatch) -> None:
+    """The PRODUCTION prune path: one real tick clears a finished tombstone + audits it."""
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    with Store() as store:
+        store.ensure("dead")
+        store.update_fields("dead", done=True)
+    save_state(
+        QueueState(
+            entries={
+                "dead": Entry(
+                    "dead",
+                    "/r",
+                    "/r",
+                    state="failed",
+                    fail_reason="re-halted on the limit",
+                    attempts=3,
+                )
+            }
+        )
+    )
+    assert tick(_cfg(resume_halted=True), dry_run=False)  # drained after the prune
+    assert "dead" not in load_state().entries
+    log_text = (tmp_path / "command-center" / "resume.log").read_text(encoding="utf-8")
+    assert "pruned-failed" in log_text and "dead" in log_text
 
 
 # --------------------------------------------------------------------------- #

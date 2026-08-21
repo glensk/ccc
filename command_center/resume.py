@@ -51,6 +51,11 @@ from .store import Store
 _TERMINAL = ("done", "failed")
 _IN_FLIGHT = ("launching", "running")
 
+# Barren-re-halt backoff when the transcript's own reset time is unparseable:
+# 15 min · 2^attempts, capped at one 5h window.
+_BACKOFF_BASE_MS = 15 * 60 * 1000
+_BACKOFF_CAP_MS = 5 * 3600 * 1000
+
 # Reset-gate account keys. Each Claude account has its own rate-limit window, so the
 # gate (detector process + signal file + confirmed-reset stamp) is keyed per account.
 # ``_DEFAULT_KEY`` ("") is single-account mode — it also keeps the historical signal
@@ -88,6 +93,10 @@ class Observation:
     cwd: str
     repo: str
     account: str = _DEFAULT_KEY  # reset-gate key (see account_key)
+    # Filled ONLY for an in-flight entry observed halted (the re-halt branch is the
+    # sole consumer; computing them costs a transcript scan/parse):
+    progressed: bool = False  # a successful main-chain response landed past the launch baseline
+    reset_hint_ms: int = 0  # reset epoch ms parsed from the halting error itself (0 = unknown)
 
 
 @dataclass
@@ -103,6 +112,7 @@ class Entry:
     attempts: int = 0
     fail_reason: str = ""
     account: str = _DEFAULT_KEY  # which account's reset gates this entry (see account_key)
+    retry_not_before: int = 0  # epoch ms a barren-re-halt backoff blocks dispatch until (0 = none)
 
 
 @dataclass
@@ -259,15 +269,33 @@ def is_resumable(session: Session, adapter: ClaudeAdapter) -> bool:
     return adapter.transcript_path(session.cwd, session.session_id, session.config_dir) is not None
 
 
-def will_auto_resume(session: Session, adapter: ClaudeAdapter, cfg: config.Config) -> bool:
+def will_auto_resume(
+    session: Session,
+    adapter: ClaudeAdapter,
+    cfg: config.Config,
+    queue: QueueState | None = None,
+) -> bool:
     """True when a HALTED *session* will be auto-revived once its rate limit resets.
 
     Precondition: the caller already established the session is halted (its row status
     is ``Status.HALTED``) — this adds the ``resume_halted`` config gate on top of the
     same eligibility the watcher applies. Drives the green ``▶`` suffix on the red
     ``||`` icon, so a bare red ``||`` means "stranded: nothing will revive this".
+
+    A terminal-``failed`` queue entry (launch-infrastructure fault, retries exhausted)
+    downgrades the promise — the watcher will NOT revive that session. Queued/backoff
+    entries, and legacy rate-limit ``failed`` entries (which the next watcher tick
+    revives), keep the ``▶``: they WILL retry. Pass *queue* (one ``load_state()``
+    snapshot per render pass) so the TUI does not re-read the queue file per row;
+    ``None`` falls back to a lazy single load.
     """
-    return cfg.resume_halted and is_resumable(session, adapter)
+    if not (cfg.resume_halted and is_resumable(session, adapter)):
+        return False
+    state = queue if queue is not None else load_state()
+    entry = state.entries.get(session.session_id)
+    if entry is None or entry.state != "failed":
+        return True
+    return entry.fail_reason == "re-halted on the limit"  # legacy → revived next tick
 
 
 def candidates(store: Store, adapter: ClaudeAdapter) -> list[Candidate]:
@@ -308,6 +336,51 @@ def purge_unattributable_entries(store: Store, state: QueueState) -> None:
             )
 
 
+def reconcile_failed_entries(store: Store, state: QueueState) -> list[tuple[str, str, str]]:
+    """Prune finished ``failed`` tombstones; revive legacy rate-limit failures.
+
+    A ``failed`` entry whose session is missing/done/archived is dead weight — the
+    session is over, the tombstone serves nobody; drop it. A ``failed`` entry whose
+    reason is "re-halted on the limit" predates recoverable backoff (rate-limit
+    re-halts can no longer become terminal): revive it to ``queued`` so the normal
+    gate machinery retries it. Terminal launch-infrastructure failures of still-open
+    sessions are kept (visible as a bare ``||``).
+
+    Mutates *state* in memory only and returns ``(event, session_id, detail)`` rows —
+    the caller logs them ONLY on the non-dry-run path, so ``--dry-run`` never touches
+    ``resume_queue.json`` or ``resume.log``.
+    """
+    rows: list[tuple[str, str, str]] = []
+    for session_id in list(state.entries):
+        entry = state.entries[session_id]
+        if entry.state != "failed":
+            continue
+        session = store.get(session_id)
+        if session is None or session.done or session.archived:
+            why = (
+                "session gone"
+                if session is None
+                else "session done"
+                if session.done
+                else "session archived"
+            )
+            del state.entries[session_id]
+            rows.append(("pruned-failed", session_id, f"cwd={entry.cwd} {why}"))
+        elif entry.fail_reason == "re-halted on the limit":
+            entry.state = "queued"
+            entry.launched_at = 0
+            entry.baseline_offset = 0
+            entry.retry_not_before = 0
+            rows.append(
+                (
+                    "revived-legacy-failed",
+                    session_id,
+                    f"cwd={entry.cwd} rate-limit re-halts are recoverable now",
+                )
+            )
+    return rows
+
+
 def _transcript_size(adapter: ClaudeAdapter, cwd: str, session_id: str) -> int:
     path = adapter.transcript_path(cwd, session_id)
     if path is None:
@@ -318,22 +391,42 @@ def _transcript_size(adapter: ClaudeAdapter, cwd: str, session_id: str) -> int:
         return 0
 
 
-def _observe(adapter: ClaudeAdapter, store: Store, ids: set[str]) -> dict[str, Observation]:
-    """Build the per-session :class:`Observation` map the planner consumes."""
+def _observe(
+    adapter: ClaudeAdapter,
+    store: Store,
+    ids: set[str],
+    entries: dict[str, Entry] | None = None,
+) -> dict[str, Observation]:
+    """Build the per-session :class:`Observation` map the planner consumes.
+
+    For an IN-FLIGHT entry observed halted (a re-halt), two extra facts are read so
+    the planner can tell a productive resume from a barren one: whether a successful
+    main-chain response landed past the launch baseline, and the reset time the
+    halting error itself names. Computed only in that case — never per idle poll.
+    """
     live: dict[str, LiveSession] = {ls.session_id: ls for ls in adapter.discover()}
     observed: dict[str, Observation] = {}
     for session_id in ids:
         session = store.get(session_id)
         cwd = session.cwd if session else ""
         live_session = live.get(session_id)
+        halted = adapter.is_halted(cwd, session_id) if cwd else False
+        entry = (entries or {}).get(session_id)
+        rehalt = bool(halted and cwd and entry and entry.state in _IN_FLIGHT)
         observed[session_id] = Observation(
             alive=bool(live_session and live_session.alive),
             raw_status=(live_session.raw_status if live_session else ""),
-            halted=adapter.is_halted(cwd, session_id) if cwd else False,
+            halted=halted,
             transcript_size=_transcript_size(adapter, cwd, session_id) if cwd else 0,
             cwd=cwd,
             repo=repo_of(cwd) if cwd else "",
             account=account_key(session.config_dir if session else ""),
+            progressed=(
+                adapter.successful_response_since(cwd, session_id, entry.baseline_offset)
+                if rehalt and entry is not None
+                else False
+            ),
+            reset_hint_ms=adapter.halt_reset_at_ms(cwd, session_id) if rehalt else 0,
         )
     return observed
 
@@ -346,7 +439,10 @@ def _is_idle(raw_status: str) -> bool:
 
 
 def _fail_or_requeue(entry: Entry, cfg: config.Config, reason: str, actions: list[Action]) -> None:
-    """Bounded retry: requeue until ``resume_max_attempts``, then fail + notify."""
+    """Bounded retry for LAUNCH-INFRASTRUCTURE faults (a resume that never took):
+    requeue until ``resume_max_attempts``, then fail + notify. Rate-limit re-halts
+    never come through here — they back off and retry instead (see the re-halt
+    branch in :func:`plan`)."""
     entry.attempts += 1
     if entry.attempts >= cfg.resume_max_attempts:
         entry.state = "failed"
@@ -444,7 +540,26 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
         resumed = obs.transcript_size > entry.baseline_offset
         if obs.halted:  # THIS account's limit is back → requeue + re-gate that account only
             rehalted.add(entry.account)
-            _fail_or_requeue(entry, cfg, "re-halted on the limit", actions)
+            entry.state = "queued"
+            entry.launched_at = 0
+            entry.baseline_offset = 0
+            if obs.progressed:
+                # The resume WORKED — real model output landed before the next
+                # window's limit. A fresh halt, not a failed attempt: full reset.
+                entry.attempts = 0
+                entry.retry_not_before = 0
+                entry.fail_reason = ""
+            else:
+                # Barren re-halt (e.g. a weekly/Opus cap the haiku probe cannot see):
+                # NEVER terminal — back off until the reset time the halting error
+                # itself names, else an escalating fallback, then retry. `attempts`
+                # keeps counting (telemetry + fallback exponent) but "re-halted on
+                # the limit" cannot reach state="failed".
+                entry.attempts += 1
+                fallback = now + min(_BACKOFF_CAP_MS, _BACKOFF_BASE_MS * 2**entry.attempts)
+                hint = obs.reset_hint_ms
+                entry.retry_not_before = hint if hint > now else fallback
+                entry.fail_reason = "re-halted on the limit"  # informational, not terminal
             continue
         if resumed and (_is_idle(obs.raw_status) or not obs.alive):  # turn completed → free repo
             entry.state = "done"
@@ -489,6 +604,8 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
                 continue
             if not state.reset_confirmed_at.get(entry.account):
                 continue  # this seat is still rate-limited
+            if entry.retry_not_before > now:
+                continue  # barren-re-halt backoff: its own limit has not reset yet
             obs = observed.get(session_id)
             if obs and obs.alive:  # stuck live REPL: kill it before re-resuming
                 actions.append(Action("reap", session_id))
@@ -704,8 +821,20 @@ def apply_actions(
 # ---------------------------------------------------------------------------
 # tick / watch / cli
 # ---------------------------------------------------------------------------
-def _is_drained(state: QueueState) -> bool:
-    return not any(e.state in _IN_FLIGHT or e.state == "queued" for e in state.entries.values())
+def _is_drained(state: QueueState, now: int | None = None) -> bool:
+    """No work the WATCHER should stay alive for.
+
+    A queued entry whose ``retry_not_before`` lies in the future is deliberately NOT
+    counted: the watcher exits instead of poll-looping through an hours-long (or
+    week-long) backoff, and the daemon respawns it once the retry is due
+    (:func:`has_work`).
+    """
+    if now is None:
+        now = now_ms()
+    return not any(
+        e.state in _IN_FLIGHT or (e.state == "queued" and e.retry_not_before <= now)
+        for e in state.entries.values()
+    )
 
 
 def _log_transitions(old: QueueState, new: QueueState) -> None:
@@ -754,24 +883,31 @@ def tick(cfg: config.Config, *, dry_run: bool = False) -> bool:
         # Fail closed BEFORE observe/plan — an entry whose Claude account cannot be
         # attributed must never dispatch against some other seat's reset gate.
         purge_unattributable_entries(store, state)
-        observed = _observe(adapter, store, candidate_ids | set(state.entries))
+        # Prune finished failed tombstones / revive legacy rate-limit failures — in
+        # memory here so the revived entries are observed and planned this same tick;
+        # the log rows are written only on the non-dry-run path below.
+        maintenance_rows = reconcile_failed_entries(store, state)
+        observed = _observe(adapter, store, candidate_ids | set(state.entries), state.entries)
         accounts_in_play = {c.account for c in cands} | {e.account for e in state.entries.values()}
+        now = now_ms()
         new_state, actions = plan(
             observed,
             candidate_ids,
             state,
-            now_ms(),
+            now,
             cfg,
             reset_signals_present(accounts_in_play),
         )
         if dry_run:
             print(f"[dry-run] candidates={len(cands)} {_summary(new_state, actions)}")
             return True
+        for row in maintenance_rows:
+            _log(*row)
         _log_transitions(state, new_state)
         apply_actions(actions, new_state, store, adapter, cfg)
         save_state(new_state)
         print(f"candidates={len(cands)} {_summary(new_state, actions)}")
-        return _is_drained(new_state)
+        return _is_drained(new_state, now)
 
 
 def watch(cfg: config.Config) -> int:
@@ -801,11 +937,39 @@ def watch(cfg: config.Config) -> int:
             lock_file.close()
 
 
-def has_candidates() -> bool:
-    """True if any halted session is eligible for auto-resume (daemon spawn gate)."""
+def has_work() -> bool:
+    """Daemon spawn gate: is there anything a watcher tick would act on?
+
+    True when a halted candidate is not suppressed by a terminal-failed entry, when a
+    ``failed`` entry needs maintenance (prune of a finished session, or revival of a
+    legacy rate-limit failure — see :func:`reconcile_failed_entries`), or when a
+    queued/in-flight entry is live work. A queued entry in backoff counts only once
+    its retry is due, so a week-long backoff never keeps respawning idle watchers.
+
+    Replaces the old candidates-only gate, which (a) never spawned the cleanup tick
+    for finished sessions — their halted transcripts are excluded from
+    ``candidates()`` — and (b) spawn/exit-churned every daemon pass on a still-open
+    failed session (a candidate whose failed-only queue counts as drained).
+    """
     adapter = ClaudeAdapter()
     with Store() as store:
-        return bool(candidates(store, adapter))
+        state = load_state()
+        failed_ids = {sid for sid, e in state.entries.items() if e.state == "failed"}
+        if any(c.session_id not in failed_ids for c in candidates(store, adapter)):
+            return True
+        now = now_ms()
+        for session_id, entry in state.entries.items():
+            if entry.state in _IN_FLIGHT:
+                return True
+            if entry.state == "queued" and entry.retry_not_before <= now:
+                return True
+            if entry.state == "failed":
+                if entry.fail_reason == "re-halted on the limit":
+                    return True  # legacy terminal rate-limit entry → revivable
+                session = store.get(session_id)
+                if session is None or session.done or session.archived:
+                    return True  # prunable tombstone
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +1019,7 @@ def load_state() -> QueueState:
                 attempts=int(raw.get("attempts", 0) or 0),
                 fail_reason=str(raw.get("fail_reason", "")),
                 account=str(raw.get("account", _DEFAULT_KEY)),
+                retry_not_before=int(raw.get("retry_not_before", 0) or 0),
             )
     return QueueState(
         last_launch_at=int(data.get("last_launch_at", 0) or 0),

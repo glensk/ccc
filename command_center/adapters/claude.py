@@ -817,6 +817,85 @@ class ClaudeAdapter:
             return False
         return _RATE_LIMIT_RE.search(_assistant_text(last_assistant)) is not None
 
+    def successful_response_since(self, cwd: str, session_id: str, byte_offset: int) -> bool:
+        """True iff a successful MAIN-CHAIN assistant record landed after *byte_offset*.
+
+        "Successful" = a ``type == "assistant"`` record with ``isApiErrorMessage``
+        falsy — ANY such record proves the resumed session produced real model output
+        (NOT turn completion: one turn can hold many assistant records). Sidechain
+        records and ALL API-error records (rate-limit, overloaded, auth, …) never
+        count, so a resume whose only yield is the injected prompt + an error turn
+        stays "barren". Seeks to *byte_offset* (the transcript size at resume
+        dispatch): the byte before it tells whether we sit on a record boundary; a
+        partial first line is skipped, JSON-decode errors on a possibly-partial tail
+        are ignored, and a file shorter than the offset (truncation/rotation) is a
+        conservative False. Called once per observed re-halt, never per poll.
+        """
+        path = self.transcript_path(cwd, session_id)
+        if path is None or byte_offset < 0:
+            return False
+        try:
+            with path.open("rb") as handle:
+                if byte_offset > 0:
+                    handle.seek(byte_offset - 1)
+                    at_boundary = handle.read(1) == b"\n"
+                else:
+                    at_boundary = True
+                data = handle.read()
+        except OSError:
+            return False
+        if not data:
+            return False
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if not at_boundary and lines:
+            lines = lines[1:]
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict) or record.get("isSidechain"):
+                continue
+            if record.get("type") == "assistant" and not record.get("isApiErrorMessage"):
+                return True
+        return False
+
+    def halt_reset_at_ms(self, cwd: str, session_id: str) -> int:
+        """Epoch ms the halting limit says it resets — 0 when absent/unparseable.
+
+        Reads the same last main-chain assistant error record :meth:`is_halted` keys
+        on and parses its reset phrasing ("resets 7:20pm", "resets in 2h 7m", ISO,
+        epoch) via :func:`session_continue.parse_limit_message`. The session's OWN
+        error names the true gate — e.g. a weekly Opus cap that the haiku
+        ``--wait-only`` probe cannot see — so auto-resume can back off until then
+        instead of relaunching into it every window.
+        """
+        from datetime import datetime
+
+        from ..session_continue import parse_limit_message
+
+        path = self.transcript_path(cwd, session_id)
+        if path is None:
+            return 0
+        last_assistant: dict | None = None
+        for record in self._tail_records(path):
+            if record.get("isSidechain"):
+                continue
+            if record.get("type") == "assistant":
+                last_assistant = record
+        if last_assistant is None or not last_assistant.get("isApiErrorMessage"):
+            return 0
+        target = parse_limit_message(_assistant_text(last_assistant), datetime.now())
+        if target is None:
+            return 0
+        try:
+            return int(target.timestamp() * 1000)
+        except (OverflowError, OSError, ValueError):
+            return 0
+
     def last_activity_ms(self, live: LiveSession) -> int:
         transcript = self.transcript_path(live.cwd, live.session_id)
         if transcript is not None:

@@ -313,8 +313,11 @@ def render(
     halted = [r for r in rows if r.status is Status.HALTED]
     if halted and isinstance(adapter, ClaudeAdapter):
         cfg = config.load_config()
+        queue = resume.load_state()  # one snapshot per listing, not one read per row
         armed = {
-            r.session.session_id for r in halted if resume.will_auto_resume(r.session, adapter, cfg)
+            r.session.session_id
+            for r in halted
+            if resume.will_auto_resume(r.session, adapter, cfg, queue)
         }
     resume_armed_ids = frozenset(armed)
     out: list[str] = []

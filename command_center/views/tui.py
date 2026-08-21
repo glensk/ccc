@@ -2157,6 +2157,13 @@ class CommandCenterApp(App[None]):
         # one .claude.json read, so a drifted login shows the TRUE billing glyph on every row
         # (accounts.effective_home_markers) without re-reading it per session.
         self._account_markers = accounts.effective_home_markers(self._account_dirs)
+        # One resume-queue snapshot per rebuild — drives the halted rows' ||▶-vs-||
+        # icon (will_auto_resume) without a queue-file read per row.
+        self._resume_queue = (
+            resume.load_state()
+            if any(r.status is Status.HALTED for r in rows)
+            else resume.QueueState()
+        )
         # Two open tabs resolving to the SAME id-chip colour (typically the same repo) defeat
         # the colour, so all but one are reassigned an unused one BEFORE the rows are drawn —
         # the row, the tab and the status line then all read the same rewritten cache. A few
@@ -2530,7 +2537,7 @@ class CommandCenterApp(App[None]):
         # A halted session ccc will auto-revive on its account's reset wears a green ▶ after
         # the red || (see models.HALTED_RESUME_ICON) — a bare || means it is stranded.
         resume_armed = row.status is Status.HALTED and resume.will_auto_resume(
-            session, self.adapter, self.cfg
+            session, self.adapter, self.cfg, getattr(self, "_resume_queue", None)
         )
         icon = (
             Text("|", style="bold red")

@@ -251,6 +251,89 @@ def test_is_halted_scans_only_tail_of_large_transcript(tmp_path: Path) -> None:
     assert adapter.is_halted("/repo", "big") is True
 
 
+def test_successful_response_since(tmp_path: Path) -> None:
+    """The auto-resume "was this resume productive?" signal (Codex O4/O5/O6).
+
+    Only a MAIN-CHAIN assistant record with `isApiErrorMessage` falsy counts — the
+    injected prompt + error turn of a barren launch, non-rate API errors, and
+    sidechain chatter must all stay "no progress".
+    """
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    user = _rec(type="user", message={"role": "user", "content": "go"})
+    ok = _rec(
+        type="assistant",
+        message={"role": "assistant", "content": [{"type": "text", "text": "did work"}]},
+    )
+    err = _err("You've hit your session limit · resets 1:10am")
+    sidechain_ok = _rec(
+        type="assistant",
+        isSidechain=True,
+        message={"role": "assistant", "content": [{"type": "text", "text": "subagent"}]},
+    )
+
+    # Productive resume: a successful assistant record lands past the baseline.
+    prefix = user + "\n"
+    (proj / "good.jsonl").write_text(prefix + ok + "\n" + err + "\n", encoding="utf-8")
+    base = len(prefix.encode())
+    assert adapter.successful_response_since("/repo", "good", base) is True
+    assert adapter.successful_response_since("/repo", "good", 0) is True
+
+    # Barren resume: past the baseline only the injected prompt + the error turn.
+    pre = user + "\n" + ok + "\n"
+    (proj / "barren.jsonl").write_text(pre + user + "\n" + err + "\n", encoding="utf-8")
+    assert adapter.successful_response_since("/repo", "barren", len(pre.encode())) is False
+
+    # A NON-rate API error (overloaded/auth/…) is not progress; nor is sidechain output.
+    (proj / "errs.jsonl").write_text(
+        prefix + _err("API Error: Overloaded") + "\n" + sidechain_ok + "\n", encoding="utf-8"
+    )
+    assert adapter.successful_response_since("/repo", "errs", base) is False
+
+    # Offset past EOF (truncation/rotation) → conservative False; missing transcript too.
+    assert adapter.successful_response_since("/repo", "good", 10_000_000) is False
+    assert adapter.successful_response_since("/repo", "missing", 0) is False
+
+    # A partial trailing record (mid-write) is tolerated, not crashed on.
+    (proj / "partial.jsonl").write_text(prefix + ok[: len(ok) // 2], encoding="utf-8")
+    assert adapter.successful_response_since("/repo", "partial", base) is False
+
+    # An offset landing MID-line skips that partial first line, then counts the next.
+    mid = len((user + "\n").encode()) - 3
+    assert adapter.successful_response_since("/repo", "good", mid) is True
+
+
+def test_halt_reset_at_ms(tmp_path: Path) -> None:
+    """The halting error's own reset phrasing becomes the backoff target."""
+    from datetime import datetime, timedelta
+
+    adapter = ClaudeAdapter(claude_home=tmp_path)
+    proj = tmp_path / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    user = _rec(type="user", message={"role": "user", "content": "go"})
+    (proj / "rel.jsonl").write_text(
+        user + "\n" + _err("You've hit your weekly limit · resets in 2h 7m") + "\n",
+        encoding="utf-8",
+    )
+    before = datetime.now()
+    got = adapter.halt_reset_at_ms("/repo", "rel")
+    lo = int((before + timedelta(hours=2, minutes=6)).timestamp() * 1000)
+    hi = int((datetime.now() + timedelta(hours=2, minutes=10)).timestamp() * 1000)
+    assert lo <= got <= hi  # 2h7m + the script's 1-min safety margin
+
+    # No reset phrasing → 0; a healthy transcript (no error) → 0; missing → 0.
+    (proj / "vague.jsonl").write_text(_err("You've hit your weekly limit") + "\n", encoding="utf-8")
+    assert adapter.halt_reset_at_ms("/repo", "vague") == 0
+    ok = _rec(
+        type="assistant",
+        message={"role": "assistant", "content": [{"type": "text", "text": "fine"}]},
+    )
+    (proj / "healthy.jsonl").write_text(user + "\n" + ok + "\n", encoding="utf-8")
+    assert adapter.halt_reset_at_ms("/repo", "healthy") == 0
+    assert adapter.halt_reset_at_ms("/repo", "missing") == 0
+
+
 def test_claude_version(tmp_path: Path) -> None:
     adapter = ClaudeAdapter(claude_home=tmp_path)
     proj = tmp_path / "projects" / "-repo"

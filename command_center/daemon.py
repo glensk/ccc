@@ -390,17 +390,20 @@ def _refresh_claude_usage(
 
 
 def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:
-    """Spawn the resume-halted watcher (detached) when halted candidates exist.
+    """Spawn the resume-halted watcher (detached) when it has work to do.
 
-    No lock precheck (it would be racy): the watcher self-singletons via flock and
-    exits immediately if another holds it, so a redundant spawn is harmless. Skipped
-    when the feature is off or nothing is halted.
+    "Work" (resume.has_work) covers live candidates, due backoff retries, and
+    failed-entry maintenance (prune/revive) — not just halted candidates, so cleanup
+    runs even when every affected session is already finished. No lock precheck (it
+    would be racy): the watcher self-singletons via flock and exits immediately if
+    another holds it, so a redundant spawn is harmless. Skipped when the feature is
+    off or there is nothing to act on.
     """
     from . import resume
 
     if not cfg.resume_halted or dry_run:
         return
-    if not resume.has_candidates():
+    if not resume.has_work():
         return
     from . import spawn
 

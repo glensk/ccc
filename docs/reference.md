@@ -968,9 +968,22 @@ the daemon spawns a singleton watcher (`ccc resume-halted --watch`) that resumes
   re-arms its account's gate and waits for a fresh detector to confirm the reset.
 
 A still-open halted REPL is SIGTERM'd (at its freshly-resolved pid) and relaunched
-in a new tab; a resume that re-hits the limit just re-halts and is requeued
-(bounded by `resume_max_attempts`, default 3). Inspect without acting:
-`ccc resume-halted --dry-run`. Disable with `resume_halted = false`.
+in a new tab. A resume that re-hits the limit is **never terminal**:
+
+- a **productive** re-halt (the resumed session produced real model output before
+  the next window's limit) is a fresh halt — full requeue, attempts reset;
+- a **barren** re-halt (only the injected prompt + an error turn landed — e.g. a
+  weekly/Opus cap the haiku probe cannot see) backs off until the reset time the
+  halting error itself names, else an escalating fallback (15 min · 2^attempts,
+  capped at 5 h), then retries. The watcher exits during a long backoff; the daemon
+  respawns it when the retry is due.
+
+`state="failed"` (bounded by `resume_max_attempts`, default 3) is reserved for
+launch-infrastructure faults — a resume that never took at all. A failed entry whose
+session finishes is pruned automatically; legacy rate-limit `failed` entries from
+older versions are revived into the backoff machinery on the next tick. Inspect
+without acting: `ccc resume-halted --dry-run` (guaranteed to touch neither the queue
+file nor `resume.log`). Disable with `resume_halted = false`.
 
 Every dispatched restart and queue/gate transition is appended to
 `<state dir>/resume.log` (TSV: timestamp, event, session id, detail — e.g.
@@ -1024,7 +1037,11 @@ bring that session back by itself — once **its own** account's limit resets �
 is appended, so the red/green pair answers "do I need to do anything?" at a glance:
 
 - **`||▶`** — leave it. The reset will revive it on the account it was started from.
-- **`||`** — **stranded**: nothing will resume it but you (`r`).
+  Sessions waiting out a barren-re-halt backoff keep the `▶` — they WILL retry.
+- **`||`** — **stranded**: nothing will resume it but you (`r`). Shown for ineligible
+  sessions (unattributable account, no transcript, feature off) and for a session
+  whose auto-resume ended in a terminal launch-infrastructure failure
+  (`resume_max_attempts` exhausted with zero progress).
 
 The `▶` is per-session, not decoration: it appears only when the resume watcher would
 actually act — `resume_halted` is on, the session's Claude account is identifiable, and it
