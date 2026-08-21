@@ -961,11 +961,22 @@ the daemon spawns a singleton watcher (`ccc resume-halted --watch`) that resumes
 - **Serial within a repo** — one resume in flight per git repo; the next in that
   repo starts only after the prior session's turn completes (a finished transcript
   turn, then idle), so two sessions never edit one checkout at once.
+- **A fresh halt invalidates pre-halt reset evidence** — the queue file outlives
+  drained cycles, so a reset confirmation (or leftover signal file) from an earlier
+  limit window would otherwise release a NEW halt immediately, dispatching a
+  premature resume into the still-active limit. A newly-halted session instead
+  re-arms its account's gate and waits for a fresh detector to confirm the reset.
 
 A still-open halted REPL is SIGTERM'd (at its freshly-resolved pid) and relaunched
 in a new tab; a resume that re-hits the limit just re-halts and is requeued
 (bounded by `resume_max_attempts`, default 3). Inspect without acting:
 `ccc resume-halted --dry-run`. Disable with `resume_halted = false`.
+
+Every dispatched restart and queue/gate transition is appended to
+`<state dir>/resume.log` (TSV: timestamp, event, session id, detail — e.g.
+`launch <id> cwd=… account=… ok=True`), so "which sessions did ccc restart, and
+when?" is a `grep launch` away even though the detached watcher's stdout is
+discarded.
 
 The one thing auto-resume still **refuses** is a session whose account it cannot
 identify (no stamped `config_dir` while several accounts are configured): reviving it

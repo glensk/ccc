@@ -16,6 +16,15 @@ state + the persisted queue to a list of effect-free :class:`Action`s and the ne
 Reset detection is explicit, not transcript-inferred: a single headless
 ``claude-session-continue.py --wait-only --signal-file <f>`` reuses the script's
 verified probe/verify, then touches ``<f>``; that file is the reset gate.
+
+Reset evidence is only valid for halts that PRECEDE it: a fresh halt proves the
+account's limit is active right now, so it invalidates a confirmation persisted by
+an earlier resume cycle (and a leftover signal file) instead of dispatching an
+immediate — premature — resume into the still-active limit.
+
+Every dispatched resume and queue/gate transition is appended to
+``app_home()/resume.log`` (TSV: timestamp, event, session id, detail), so "which
+sessions did ccc restart, and when?" is a grep.
 """
 
 from __future__ import annotations
@@ -118,11 +127,13 @@ class QueueState:
 class Action:
     """A side effect the executor performs (effect-free in the planner)."""
 
-    kind: str  # reap | launch_resume | ensure_reset_wait | confirm_reset | notify
+    kind: (
+        str  # reap | launch_resume | ensure_reset_wait | confirm_reset | invalidate_reset | notify
+    )
     session_id: str = ""
     cwd: str = ""
     detail: str = ""
-    account: str = _DEFAULT_KEY  # which account's gate ensure_reset_wait/confirm_reset acts on
+    account: str = _DEFAULT_KEY  # which account's gate the reset-wait/confirm/invalidate acts on
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +157,27 @@ def _signal_path(account: str = _DEFAULT_KEY) -> Path:
 
 def _lock_path() -> Path:
     return config.app_home() / "resume_watch.lock"
+
+
+def _resume_log_path() -> Path:
+    return config.app_home() / "resume.log"
+
+
+def _log(event: str, session_id: str = "", detail: str = "") -> None:
+    """Append one TSV line to ``app_home()/resume.log`` — the restart audit trail.
+
+    Records every dispatched resume plus the queue/gate transitions around it, so a
+    premature or missing restart can be reconstructed after the fact (the watcher's
+    stdout is discarded by the detached daemon spawn). Append-only; never raises.
+    """
+    try:
+        path = _resume_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(f"{stamp}\t{event}\t{session_id}\t{detail}\n")
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +376,10 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
     actions: list[Action] = []
 
     # 1. Enqueue new candidates. A previously-done session that halted AGAIN in a
-    #    later window is re-queued fresh; failed entries stay suppressed.
+    #    later window is re-queued fresh; failed entries stay suppressed. Accounts
+    #    gaining a FRESH halt this tick are tracked: that halt proves the account's
+    #    limit is active right now.
+    fresh_halts: set[str] = set()
     for session_id in candidate_ids:
         entry = state.entries.get(session_id)
         obs = observed.get(session_id)
@@ -355,6 +390,7 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
                 cwd=obs.cwd if obs else "",
                 account=obs.account if obs else _DEFAULT_KEY,
             )
+            fresh_halts.add(obs.account if obs else _DEFAULT_KEY)
             continue
         # Re-stamp the account from the live observation every tick. This backfills entries
         # persisted BEFORE the gate was per-account (they carry the default key regardless of
@@ -367,6 +403,25 @@ def plan(  # pylint: disable=too-many-branches,too-many-locals,too-many-statemen
             entry.attempts = 0
             entry.launched_at = 0
             entry.baseline_offset = 0
+            fresh_halts.add(entry.account)
+
+    # 1b. A fresh halt invalidates that account's PRE-halt reset evidence — both a
+    #    confirmation persisted by an earlier resume cycle (the queue file outlives
+    #    drained cycles) and a leftover signal file. Without this, the stale gate
+    #    dispatched an immediate premature resume into the still-active limit (seen
+    #    live 2026-08-21: halted 17:00, "resumed" 17:03 against a 19:20 reset). The
+    #    detector ensured in step 3 re-verifies; a genuinely-reset account simply
+    #    re-confirms one probe later.
+    reset_signals = reset_signals - fresh_halts
+    for account in sorted(fresh_halts):
+        state.reset_confirmed_at.pop(account, None)
+        actions.append(
+            Action(
+                "invalidate_reset",
+                account=account,
+                detail="fresh halt invalidates pre-halt reset evidence",
+            )
+        )
 
     # 2. Reconcile + classify. A queued entry the user already resumed (alive, not
     #    halted) is adopted as in-flight rather than relaunched (no double resume).
@@ -538,6 +593,23 @@ def _consume_reset_signal(state: QueueState, account: str) -> None:
     state.reset_wait_pid.pop(account, None)
 
 
+def _invalidate_reset(state: QueueState, account: str) -> None:
+    """A fresh halt proved *account*'s limit is active NOW — drop pre-halt evidence.
+
+    Removes a leftover signal file and forgets a dead detector so step 3 spawns a
+    fresh one. A LIVE detector is left alone: it has not fired yet, so it is still
+    validly waiting for the real reset (killing it would only re-bill a probe).
+    """
+    pid = state.reset_wait_pid.get(account, 0)
+    if pid and _pid_alive(pid):
+        return
+    try:
+        _signal_path(account).unlink(missing_ok=True)
+    except OSError:
+        pass
+    state.reset_wait_pid.pop(account, None)
+
+
 def _ensure_reset_wait(state: QueueState, cfg: config.Config, account: str) -> None:
     """Make sure exactly one ``--wait-only`` reset detector runs FOR *account*.
 
@@ -575,6 +647,7 @@ def _ensure_reset_wait(state: QueueState, cfg: config.Config, account: str) -> N
             env=accounts.launch_env(_config_dir_for_key(account)),
         )
         state.reset_wait_pid[account] = proc.pid
+        _log("detector-spawned", detail=f"account={account or 'default'} pid={proc.pid}")
     except OSError:
         state.reset_wait_pid.pop(account, None)
 
@@ -595,13 +668,20 @@ def apply_actions(
     for action in actions:
         if action.kind == "reap":
             _reap_fresh(adapter, store, action.session_id)
+            _log("reap", action.session_id, "killed stuck REPL before relaunch")
         elif action.kind == "launch_resume":
             # Revive on the SAME seat the session was started from: the stored config_dir
             # is prefixed onto the resume command (terminal.launch_env_prefix), so a work
             # session comes back on work and a private one on private.
             resumed = store.get(action.session_id)
             config_dir = resumed.config_dir if resumed else _config_dir_for_key(action.account)
-            if not _launch_resume(action.session_id, action.cwd, cfg, config_dir):
+            launched = _launch_resume(action.session_id, action.cwd, cfg, config_dir)
+            _log(
+                "launch",
+                action.session_id,
+                f"cwd={action.cwd} account={action.account or 'default'} ok={launched}",
+            )
+            if not launched:
                 _notify_once(
                     cfg, "cannot open a terminal to resume — is iTerm/osascript available?"
                 )
@@ -609,8 +689,16 @@ def apply_actions(
             _ensure_reset_wait(state, cfg, action.account)
         elif action.kind == "confirm_reset":
             _consume_reset_signal(state, action.account)
+            _log("reset-confirmed", detail=f"account={action.account or 'default'}")
+        elif action.kind == "invalidate_reset":
+            _invalidate_reset(state, action.account)
+            _log(
+                "reset-invalidated",
+                detail=f"account={action.account or 'default'} — {action.detail}",
+            )
         elif action.kind == "notify":
             notify("ccc resume-halted", action.detail, cfg.notify)
+            _log("notify", action.session_id, action.detail)
 
 
 # ---------------------------------------------------------------------------
@@ -618,6 +706,22 @@ def apply_actions(
 # ---------------------------------------------------------------------------
 def _is_drained(state: QueueState) -> bool:
     return not any(e.state in _IN_FLIGHT or e.state == "queued" for e in state.entries.values())
+
+
+def _log_transitions(old: QueueState, new: QueueState) -> None:
+    """Append per-session queue transitions (enqueue, requeue, fail, done) to the log."""
+    for sid, entry in new.entries.items():
+        before = old.entries.get(sid)
+        if before is None:
+            _log("queued", sid, f"cwd={entry.cwd} account={entry.account or 'default'}")
+        elif before.state != entry.state:
+            detail = f"{before.state}->{entry.state} attempts={entry.attempts}"
+            if entry.fail_reason:
+                detail += f" reason={entry.fail_reason}"
+            _log("state", sid, detail)
+    for sid, before in old.entries.items():
+        if sid not in new.entries:  # done entries are pruned the tick they finish
+            _log("finished", sid, f"cwd={before.cwd} resumed turn completed")
 
 
 def _summary(state: QueueState, actions: list[Action]) -> str:
@@ -663,6 +767,7 @@ def tick(cfg: config.Config, *, dry_run: bool = False) -> bool:
         if dry_run:
             print(f"[dry-run] candidates={len(cands)} {_summary(new_state, actions)}")
             return True
+        _log_transitions(state, new_state)
         apply_actions(actions, new_state, store, adapter, cfg)
         save_state(new_state)
         print(f"candidates={len(cands)} {_summary(new_state, actions)}")

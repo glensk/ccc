@@ -590,9 +590,16 @@ def test_work_halt_does_not_gate_private_resume(two_accounts: dict[str, Path]) -
         ),
     }
     now = 1_000_000_000_000
-    # Only PRIVATE's limit has reset; work's detector has not fired.
+    # Both entries were queued on an earlier tick; only PRIVATE's limit has reset since
+    # (a signal predating the halt itself would be invalidated as stale evidence).
+    base = resume.QueueState(
+        entries={
+            "p": resume.Entry("p", repo="/repo/p", cwd="/repo/p", account="private"),
+            "w": resume.Entry("w", repo="/repo/w", cwd="/repo/w", account="work"),
+        }
+    )
     state, actions = resume.plan(
-        observed, {"p", "w"}, resume.QueueState(), now, config.Config(), reset_signals={"private"}
+        observed, {"p", "w"}, base, now, config.Config(), reset_signals={"private"}
     )
     assert state.reset_confirmed_at == {"private": now}  # work's gate stays shut
     launched = [a.session_id for a in actions if a.kind == "launch_resume"]

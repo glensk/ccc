@@ -10,16 +10,21 @@ bounded requeue/fail ladder, manual-resume adoption, and done-pruning.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from command_center.config import Config
 from command_center.models import LiveSession
 from command_center.resume import (
+    Action,
     Entry,
     Observation,
     QueueState,
+    _invalidate_reset,
     _is_drained,
+    _signal_path,
     _state_path,
+    apply_actions,
     candidates,
     load_state,
     plan,
@@ -100,8 +105,13 @@ def test_legacy_entry_account_is_backfilled_from_observation() -> None:
 
 
 def test_reset_signal_confirms_then_dispatches() -> None:
+    # The entry was queued on an EARLIER tick (a same-tick signal would be pre-halt
+    # evidence and is invalidated instead — see the stale-evidence tests below).
+    entries = {"a": Entry("a", repo="/r1", cwd="/r1")}
     observed = {"a": _obs(halted=True)}
-    state, actions = plan(observed, {"a"}, QueueState(), NOW, _cfg(), reset_signals={ACCT})
+    state, actions = plan(
+        observed, {"a"}, QueueState(entries=entries), NOW, _cfg(), reset_signals={ACCT}
+    )
     assert "confirm_reset" in _kinds(actions)
     assert state.reset_confirmed_at[ACCT] == NOW
     # confirmation + a free repo + open stagger gate → one resume dispatched same tick
@@ -117,7 +127,11 @@ def test_global_stagger_one_launch_per_tick() -> None:
         "a": _obs(halted=True, cwd="/r1", repo="/r1"),
         "b": _obs(halted=True, cwd="/r2", repo="/r2"),
     }
-    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=0)
+    entries = {
+        "a": Entry("a", repo="/r1", cwd="/r1"),
+        "b": Entry("b", repo="/r2", cwd="/r2"),
+    }
+    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=0, entries=entries)
     state, actions = plan(observed, {"a", "b"}, base, NOW, _cfg(), reset_signals=set())
     assert len(_launch_ids(actions)) == 1  # only one resume per tick, regardless of repo count
     launched = _launch_ids(actions)[0]
@@ -129,8 +143,10 @@ def test_global_stagger_one_launch_per_tick() -> None:
 def test_stagger_gate_closed_blocks_launch() -> None:
     observed = {"a": _obs(halted=True)}
     base = QueueState(
-        reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=NOW - 1000
-    )  # 1s ago < 120s
+        reset_confirmed_at={ACCT: NOW - 1},
+        last_launch_at=NOW - 1000,  # 1s ago < 120s
+        entries={"a": Entry("a", repo="/r1", cwd="/r1")},
+    )
     state, actions = plan(
         observed, {"a"}, base, NOW, _cfg(resume_stagger_sec=120), reset_signals=set()
     )
@@ -140,7 +156,11 @@ def test_stagger_gate_closed_blocks_launch() -> None:
 
 def test_per_repo_serial_holds_sibling_launches_other_repo() -> None:
     # /r1 already has a running resume; its queued sibling waits, /r2's head goes.
-    entries = {"A": Entry("A", repo="/r1", cwd="/r1", state="running", baseline_offset=100)}
+    entries = {
+        "A": Entry("A", repo="/r1", cwd="/r1", state="running", baseline_offset=100),
+        "B": Entry("B", repo="/r1", cwd="/r1"),
+        "C": Entry("C", repo="/r2", cwd="/r2"),
+    }
     base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=0, entries=entries)
     observed = {
         "A": _obs(
@@ -157,7 +177,11 @@ def test_per_repo_serial_holds_sibling_launches_other_repo() -> None:
 
 def test_alive_halted_head_is_reaped_before_relaunch() -> None:
     observed = {"a": _obs(alive=True, raw="busy", halted=True)}  # stuck live HALTED REPL
-    base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, last_launch_at=0)
+    base = QueueState(
+        reset_confirmed_at={ACCT: NOW - 1},
+        last_launch_at=0,
+        entries={"a": Entry("a", repo="/r1", cwd="/r1")},
+    )
     _state, actions = plan(observed, {"a"}, base, NOW, _cfg(), reset_signals=set())
     kinds = _kinds(actions)
     assert "reap" in kinds and "launch_resume" in kinds
@@ -261,8 +285,99 @@ def test_previously_done_session_requeues_when_halted_again() -> None:
     entries = {"A": Entry("A", repo="/r1", cwd="/r1", state="done")}
     base = QueueState(reset_confirmed_at={ACCT: NOW - 1}, entries=entries)
     observed = {"A": _obs(halted=True)}  # hit the limit again in a later window
-    state, _actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
-    assert state.entries["A"].state in ("queued", "launching")  # revived, not stuck done
+    state, actions = plan(observed, {"A"}, base, NOW, _cfg(), reset_signals=set())
+    # Revived, not stuck done — but NOT dispatched: the re-halt is a fresh halt, so the
+    # earlier window's confirmation is stale evidence and the gate re-arms.
+    assert state.entries["A"].state == "queued"
+    assert ACCT not in state.reset_confirmed_at
+    assert "launch_resume" not in _kinds(actions)
+    assert "ensure_reset_wait" in _kinds(actions)
+
+
+# --------------------------------------------------------------------------- #
+# stale reset evidence from a previous cycle (the 2026-08-21 premature resume)
+# --------------------------------------------------------------------------- #
+def test_fresh_halt_invalidates_stale_confirmation() -> None:
+    """A confirmation persisted by an EARLIER resume cycle must not release a new halt.
+
+    Live incident 2026-08-21: ``reset_confirmed_at`` survived the drained queue, so
+    the next session-limit halt was "resumed" ~2 minutes later — 2h17m before the
+    actual reset — burning an attempt against the still-active limit.
+    """
+    base = QueueState(reset_confirmed_at={ACCT: NOW - 86_400_000})  # yesterday's cycle
+    observed = {"a": _obs(halted=True)}
+    state, actions = plan(observed, {"a"}, base, NOW, _cfg(), reset_signals=set())
+    assert "launch_resume" not in _kinds(actions)
+    assert ACCT not in state.reset_confirmed_at  # stale gate torn down
+    assert "invalidate_reset" in _kinds(actions)
+    assert "ensure_reset_wait" in _kinds(actions)  # re-verify via a fresh detector
+    assert state.entries["a"].state == "queued"
+
+
+def test_fresh_halt_ignores_stale_signal_file() -> None:
+    """A leftover signal file from a previous window must not confirm a new halt."""
+    observed = {"a": _obs(halted=True)}
+    state, actions = plan(observed, {"a"}, QueueState(), NOW, _cfg(), reset_signals={ACCT})
+    assert "confirm_reset" not in _kinds(actions)
+    assert "launch_resume" not in _kinds(actions)
+    assert not state.reset_confirmed_at
+    assert "invalidate_reset" in _kinds(actions)
+    assert state.entries["a"].state == "queued"
+
+
+def test_confirmation_after_enqueue_still_dispatches() -> None:
+    """The normal two-tick flow keeps working: enqueue, then a LATER tick confirms."""
+    observed = {"a": _obs(halted=True)}
+    state1, actions1 = plan(observed, {"a"}, QueueState(), NOW, _cfg(), reset_signals=set())
+    assert "launch_resume" not in _kinds(actions1)
+    state2, actions2 = plan(observed, {"a"}, state1, NOW + 60_000, _cfg(), reset_signals={ACCT})
+    assert "confirm_reset" in _kinds(actions2)
+    assert _launch_ids(actions2) == ["a"]
+    assert state2.entries["a"].state == "launching"
+
+
+def test_invalidate_reset_unlinks_signal_and_forgets_dead_detector(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    signal = _signal_path(ACCT)
+    signal.parent.mkdir(parents=True, exist_ok=True)
+    signal.write_text("stale", encoding="utf-8")
+    state = QueueState(reset_wait_pid={ACCT: 99_999_999})  # long-dead detector pid
+    _invalidate_reset(state, ACCT)
+    assert not signal.exists()
+    assert ACCT not in state.reset_wait_pid
+
+
+def test_invalidate_reset_leaves_live_detector_alone(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    signal = _signal_path(ACCT)
+    signal.parent.mkdir(parents=True, exist_ok=True)
+    signal.write_text("pending", encoding="utf-8")
+    state = QueueState(reset_wait_pid={ACCT: os.getpid()})  # "detector" is alive
+    _invalidate_reset(state, ACCT)
+    assert signal.exists()  # a live detector's pending work is not clobbered
+    assert state.reset_wait_pid == {ACCT: os.getpid()}
+
+
+def test_resume_log_records_launch(tmp_path: Path, monkeypatch) -> None:
+    """Every dispatched restart lands in resume.log with session id + path + account."""
+    import command_center.resume as resume_mod
+
+    monkeypatch.setenv("CLAUDE_HOME", str(tmp_path))
+    monkeypatch.setattr(resume_mod, "_launch_resume", lambda *a, **k: True)
+    store = Store(tmp_path / "s.db")
+    store.ensure("abc-123")
+    actions = [Action("launch_resume", "abc-123", cwd="/repo/x", account=ACCT)]
+    apply_actions(
+        actions,
+        QueueState(),
+        store,
+        _StubAdapter(set(), str(tmp_path)),  # type: ignore[arg-type]
+        _cfg(),
+    )
+    text = (tmp_path / "command-center" / "resume.log").read_text(encoding="utf-8")
+    assert "launch" in text and "abc-123" in text and "cwd=/repo/x" in text
 
 
 def test_is_drained() -> None:
