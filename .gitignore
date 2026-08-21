@@ -60,3 +60,4 @@ CLAUDE.local.md
 # Private session/planning artifacts (owner-side; must never ship)
 .claude-code-sessions
 PLAN*.md
+BUGS_FOUND.md
