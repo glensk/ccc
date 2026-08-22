@@ -159,42 +159,107 @@ def prompt_size_error(prompt: str) -> str | None:
 # ---- prompt acquisition -----------------------------------------------------
 
 
-def _resolve_prompt(  # pylint: disable=too-many-return-statements  # one per source
-    args: argparse.Namespace,
-) -> tuple[str | None, str | None]:
-    """The prompt text from (in precedence order) argv, clipboard, piped stdin, $EDITOR.
-
-    Returns ``(prompt, error)`` — exactly one is set.
-    """
-    if getattr(args, "prompt", None):
-        return str(args.prompt), None
-    if getattr(args, "clipboard", False):
-        try:
-            out = subprocess.run(["pbpaste"], capture_output=True, check=True, timeout=10)
-        except (OSError, subprocess.SubprocessError) as exc:
-            return None, f"error: could not read the clipboard (pbpaste): {exc}"
-        text = out.stdout.decode("utf-8", errors="replace").strip()
-        return (text, None) if text else (None, "error: clipboard is empty")
-    if not sys.stdin.isatty():
-        text = sys.stdin.read().strip()
-        return (text, None) if text else (None, "error: empty prompt on stdin")
-    editor = os.environ.get("EDITOR") or "vi"
-    fd, path = tempfile.mkstemp(prefix="ccc-park-", suffix=".md")
-    os.close(fd)
+def _clipboard_text() -> tuple[str | None, str | None]:
+    """The clipboard content via pbpaste — ``(text, error)``, exactly one set."""
     try:
-        code = subprocess.call([*shlex.split(editor), path])
+        out = subprocess.run(["pbpaste"], capture_output=True, check=True, timeout=10)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return None, f"error: could not read the clipboard (pbpaste): {exc}"
+    text = out.stdout.decode("utf-8", errors="replace").strip()
+    return (text, None) if text else (None, "error: clipboard is empty")
+
+
+def _pick_editor() -> tuple[list[str] | None, str | None]:
+    """A runnable editor argv: ``$EDITOR`` → ``$VISUAL`` → vim → vi → nano.
+
+    Returns ``(argv, note)``: *note* is a stderr warning when the configured
+    editor's binary is missing (the ``EDITOR='code -w'`` with no ``code`` on PATH
+    failure), or the final error message when nothing at all is runnable.
+    """
+    import shutil
+
+    configured = (os.environ.get("EDITOR") or os.environ.get("VISUAL") or "").strip()
+    candidates = ([configured] if configured else []) + ["vim", "vi", "nano"]
+    tried: list[str] = []
+    for index, candidate in enumerate(candidates):
+        argv = shlex.split(candidate)
+        if argv and shutil.which(argv[0]):
+            note = None
+            if configured and index > 0:
+                note = f"warning: configured editor {configured!r} not found — using {argv[0]}"
+            return argv, note
+        tried.append(argv[0] if argv else candidate)
+    return None, f"error: no usable editor (tried: {', '.join(tried)})"
+
+
+def _editor_prompt(initial: str = "") -> tuple[str | None, str | None]:
+    """Capture the prompt via a text editor on a temp file — ``(text, error)``."""
+    argv, note = _pick_editor()
+    if argv is None:
+        return None, note
+    if note:
+        print(note, file=sys.stderr)
+    fd, path = tempfile.mkstemp(prefix="ccc-park-", suffix=".md")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(initial)
+        code = subprocess.call([*argv, path])
         if code != 0:
             return None, f"error: editor exited {code} — nothing parked"
         with open(path, encoding="utf-8", errors="replace") as handle:
             text = handle.read().strip()
     except OSError as exc:
-        return None, f"error: could not run $EDITOR ({editor}): {exc}"
+        return None, f"error: could not run the editor ({' '.join(argv)}): {exc}"
     finally:
         try:
             os.unlink(path)
         except OSError:
             pass
     return (text, None) if text else (None, "error: empty prompt — nothing parked")
+
+
+def _capture_interactive(
+    header: str, initial: str, *, force_editor: bool
+) -> tuple[str | None, str | None]:
+    """Interactive prompt capture: the floating park panel, editor as the fallback.
+
+    The panel (:mod:`command_center.parkpanel`) is the default surface — the same
+    habit as the s+p peek panel, but editable. ``-e/--editor`` (or a non-macOS /
+    AppKit-less environment) routes to the editor chain instead. Returns
+    ``(text, error)``; a cancelled panel is ``(None, None)`` — the caller reports
+    "nothing parked" without an error.
+    """
+    if not force_editor and sys.platform == "darwin":
+        try:
+            from . import parkpanel
+
+            return parkpanel.capture_prompt(header, initial), None
+        except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-exception-caught  # AppKit failures are wild; degrade, never die
+            print(f"note: park panel unavailable ({exc}) — using the editor", file=sys.stderr)
+    return _editor_prompt(initial)
+
+
+def _resolve_prompt(args: argparse.Namespace, header: str) -> tuple[str | None, str | None]:
+    """The prompt from (in precedence order) argv, piped stdin, panel/editor.
+
+    ``-c/--clipboard`` prefills the interactive surface for review/editing; it is
+    used verbatim only when stdin is not a TTY (no UI can be shown there). Returns
+    ``(prompt, error)``; ``(None, None)`` means the user cancelled.
+    """
+    if getattr(args, "prompt", None):
+        return str(args.prompt), None
+    initial = ""
+    if getattr(args, "clipboard", False):
+        clip, err = _clipboard_text()
+        if err:
+            return None, err
+        initial = clip or ""
+    if not sys.stdin.isatty():
+        if initial:
+            return initial, None  # no TTY to review on — the clipboard is used verbatim
+        text = sys.stdin.read().strip()
+        return (text, None) if text else (None, "error: empty prompt on stdin")
+    return _capture_interactive(header, initial, force_editor=getattr(args, "editor", False))
 
 
 # ---- the waiter --------------------------------------------------------------
@@ -299,34 +364,50 @@ def _wait_until_fire(  # pylint: disable=too-many-locals  # one countdown loop, 
 # ---- the command --------------------------------------------------------------
 
 
+def _compute_fire(
+    label: str, window: str, now: int, buffer_sec: int
+) -> tuple[int | None, usage.Usage | None]:
+    """``(fire_at, snapshot)`` for *label*'s *window* — ``(None, …)`` when unusable.
+
+    Window boundaries don't move, so a cached ``resets_at`` still in the future is
+    usable as-is; one OAuth fetch is attempted only when the cache yields nothing.
+    """
+    snapshot = usage.read_usage(label)
+    fire_at = fire_time(snapshot, window, now, buffer_sec)
+    if fire_at is None:
+        snapshot = usage.fetch_claude_usage(label) or snapshot
+        fire_at = fire_time(snapshot, window, now, buffer_sec)
+    return fire_at, snapshot
+
+
+def _derive_aim(args: argparse.Namespace, prompt: str) -> str:
+    aim = (getattr(args, "aim", None) or "").strip()
+    if aim:
+        return aim
+    first = next((line.strip() for line in prompt.splitlines() if line.strip()), "parked prompt")
+    return first[:80]
+
+
 def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements,too-many-locals
     """``ccc park`` — register a parked prompt, wait in this tab, launch at reset."""
+    if getattr(args, "grab", False):
+        return _run_grab(args)
+    from .colors import short_folder
     from .models import short_id
-
-    prompt, err = _resolve_prompt(args)
-    if err or prompt is None:
-        print(err or "error: no prompt", file=sys.stderr)
-        return 1
-    size_err = prompt_size_error(prompt)
-    if size_err:
-        print(size_err, file=sys.stderr)
-        return 1
 
     now = int(time.time())
     window = getattr(args, "window", "five_hour")
     buffer_sec = int(getattr(args, "buffer", DEFAULT_BUFFER_SEC))
     config_dir = accounts.env_config_dir()
     label = accounts.effective_account_label(config_dir)
+    cwd = os.getcwd()
 
+    # Fire time FIRST (cheap): the capture surface shows it, and an unusable reset
+    # must refuse before any typing effort is invested.
     fire_at = 0
+    snapshot: usage.Usage | None = None
     if not getattr(args, "now", False):
-        # Window boundaries don't move, so a cached resets_at that is still in the
-        # future is usable as-is; fetch only when the cache yields nothing.
-        snapshot = usage.read_usage(label)
-        fire_at_opt = fire_time(snapshot, window, now, buffer_sec)
-        if fire_at_opt is None:
-            snapshot = usage.fetch_claude_usage(label) or snapshot
-            fire_at_opt = fire_time(snapshot, window, now, buffer_sec)
+        fire_at_opt, snapshot = _compute_fire(label, window, now, buffer_sec)
         if fire_at_opt is None:
             print(
                 f"error: no usable {window} reset time for account '{label}' — run one "
@@ -336,6 +417,23 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
             )
             return 1
         fire_at = fire_at_opt
+
+    header = f"{short_folder(cwd)}  ·  {label}  ·  " + (
+        format_fire(fire_at, now) if fire_at else "launches immediately"
+    )
+    prompt, err = _resolve_prompt(args, header)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    if prompt is None:
+        print("cancelled — nothing parked")
+        return 130
+    size_err = prompt_size_error(prompt)
+    if size_err:
+        print(size_err, file=sys.stderr)
+        return 1
+
+    if fire_at:
         win = _window(snapshot, window)
         used = f"{win.used_percentage:.0f}%" if win is not None else "?"
         print(f"{window} window at {used} for '{label}' — {format_fire(fire_at, now)}")
@@ -353,13 +451,7 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
     import uuid
 
     session_id = str(uuid.uuid4())
-    aim = (getattr(args, "aim", None) or "").strip()
-    if not aim:
-        first = next(
-            (line.strip() for line in prompt.splitlines() if line.strip()), "parked prompt"
-        )
-        aim = first[:80]
-    cwd = os.getcwd()
+    aim = _derive_aim(args, prompt)
     with Store() as store:
         store.create_draft(
             session_id,
@@ -384,8 +476,6 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
         if outcome == "cancel":
             with Store() as store:
                 store.update_fields(session_id, fire_at=0)
-            from .colors import short_folder
-
             terminal.set_tab(short_folder(cwd), None)
             print(
                 f"cancelled — kept as future job {short_id(session_id)} (auto-fire off); "
@@ -405,3 +495,97 @@ def run_park(args: argparse.Namespace) -> int:  # pylint: disable=too-many-retur
         file=sys.stderr,
     )
     return rc
+
+
+def _run_grab(args: argparse.Namespace) -> int:  # pylint: disable=too-many-locals,too-many-return-statements,too-many-statements
+    """Global-chord mode (``ccc park -g``, the Karabiner q+p): panel over any tab.
+
+    There is no shell process to count down in — the prompt is captured in the park
+    panel and registered as an ARMED job for the **frontmost iTerm tab's** repo and
+    account (resolved like the peek panel: tracked session first, tab cwd fallback);
+    the daemon dispatches it in a new tab at the reset. ``-N`` launches it in a new
+    tab immediately instead. Feedback goes through notify — Karabiner gives this
+    process no terminal.
+    """
+    from . import peek
+    from .colors import short_folder
+    from .models import short_id
+    from .notify import notify
+
+    cfg = config.load_config()
+    now = int(time.time())
+    window = getattr(args, "window", "five_hour")
+    buffer_sec = int(getattr(args, "buffer", DEFAULT_BUFFER_SEC))
+
+    session = None
+    tab_uuid = peek.frontmost_iterm_uuid()
+    if tab_uuid:
+        with Store() as store:
+            session = peek._session_for_uuid(store, tab_uuid)  # pylint: disable=protected-access
+    cwd = session.cwd if session is not None and os.path.isdir(session.cwd or "") else ""
+    if not cwd:
+        cwd = peek.frontmost_iterm_cwd() or os.getcwd()
+    config_dir = (session.config_dir if session is not None else "") or accounts.env_config_dir()
+    label = accounts.effective_account_label(config_dir)
+
+    fire_at = 0
+    if not getattr(args, "now", False):
+        fire_at_opt, _snapshot = _compute_fire(label, window, now, buffer_sec)
+        if fire_at_opt is None:
+            message = f"no usable {window} reset time for account '{label}' — nothing parked"
+            notify("⏳ park failed", message, cfg.notify)
+            print(f"error: {message}", file=sys.stderr)
+            return 1
+        fire_at = fire_at_opt
+
+    initial = ""
+    if getattr(args, "clipboard", False):
+        initial = _clipboard_text()[0] or ""
+    tail = "launches now in a new tab" if not fire_at else "daemon fires it in a new tab"
+    header = (
+        f"{short_folder(cwd)}  ·  {label}  ·  "
+        + (format_fire(fire_at, now) if fire_at else "immediately")
+        + f"  ·  {tail}"
+    )
+    from . import parkpanel
+
+    prompt = parkpanel.capture_prompt(header, initial)
+    if not prompt:
+        return 130  # cancelled — the panel was the whole interaction, stay silent
+    size_err = prompt_size_error(prompt)
+    if size_err:
+        notify("⏳ park failed", size_err, cfg.notify)
+        print(size_err, file=sys.stderr)
+        return 1
+
+    import uuid
+
+    session_id = str(uuid.uuid4())
+    with Store() as store:
+        store.create_draft(
+            session_id,
+            cwd,
+            _derive_aim(args, prompt),
+            prompt=prompt,
+            config_dir=config_dir,
+            fire_at=fire_at,
+            fire_window=(window if fire_at else ""),
+        )
+    if cfg.future_files:
+        from .spawn import spawn_ccc
+
+        spawn_ccc(["sync-future"])  # mirror the row; deliberately NO score-aim spawn
+    if not fire_at:
+        launched = terminal.start_job_in_new_tab(session_id, auto=True)
+        outcome = "launched in a new tab" if launched else "saved — start it with ccc start-job"
+        notify(
+            "⏳ prompt parked",
+            f"{short_id(session_id)} {short_folder(cwd)} — {outcome}",
+            cfg.notify,
+        )
+        print(f"parked {short_id(session_id)} ({cwd}) — {outcome}")
+        return 0
+    done = f"{short_id(session_id)} {short_folder(cwd)} — {format_fire(fire_at, now)}"
+    notify("⏳ prompt parked", done, cfg.notify)
+    print(f"parked: {done}")
+    return 0

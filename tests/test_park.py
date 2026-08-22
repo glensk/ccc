@@ -109,13 +109,82 @@ def test_resolve_prompt_positional_wins_and_empty_stdin_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     args = argparse.Namespace(prompt="do the thing", clipboard=False)
-    assert park._resolve_prompt(args) == ("do the thing", None)  # pylint: disable=protected-access
+    assert park._resolve_prompt(args, "hdr") == (  # pylint: disable=protected-access
+        "do the thing",
+        None,
+    )
     empty = io.StringIO("")
     monkeypatch.setattr("sys.stdin", empty)
     text, err = park._resolve_prompt(  # pylint: disable=protected-access
-        argparse.Namespace(prompt=None, clipboard=False)
+        argparse.Namespace(prompt=None, clipboard=False), "hdr"
     )
     assert text is None and err is not None
+
+
+def test_pick_editor_falls_back_when_configured_binary_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+
+    monkeypatch.setenv("EDITOR", "code -w")  # the observed real-world failure
+    monkeypatch.delenv("VISUAL", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/bin/vim" if name == "vim" else None)
+    argv, note = park._pick_editor()  # pylint: disable=protected-access
+    assert argv == ["vim"]
+    assert note is not None and "code -w" in note
+    # Nothing runnable at all → a final error, not a crash.
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    argv, note = park._pick_editor()  # pylint: disable=protected-access
+    assert argv is None and note is not None and note.startswith("error:")
+
+
+def test_pick_editor_uses_configured_editor_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import shutil
+
+    monkeypatch.setenv("EDITOR", "code -w")
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/code")
+    argv, note = park._pick_editor()  # pylint: disable=protected-access
+    assert argv == ["code", "-w"] and note is None
+
+
+# ---- grab mode (the q+p chord panel) --------------------------------------------
+
+
+def _grab_setup(monkeypatch: pytest.MonkeyPatch, panel_text: str | None) -> list[str]:
+    from command_center import parkpanel, peek
+
+    notified: list[str] = []
+    monkeypatch.setattr(peek, "frontmost_iterm_uuid", lambda: None)
+    monkeypatch.setattr(peek, "frontmost_iterm_cwd", lambda: "/tmp")
+    monkeypatch.setattr(parkpanel, "capture_prompt", lambda header, initial="": panel_text)
+    monkeypatch.setattr(
+        "command_center.notify.notify", lambda title, msg, channels: notified.append(title)
+    )
+    snap = _snapshot(five_hour=usage.Window(used_percentage=100.0, resets_at=NOW + 1200))
+    monkeypatch.setattr(usage, "read_usage", lambda label: snap)
+    monkeypatch.setattr(usage, "fetch_claude_usage", lambda label, now=None: None)
+    monkeypatch.setattr(time, "time", lambda: NOW)
+    return notified
+
+
+def test_grab_registers_armed_job_for_frontmost_tab(monkeypatch: pytest.MonkeyPatch) -> None:
+    notified = _grab_setup(monkeypatch, "panel prompt\nsecond line")
+    assert cli.main(["park", "-g"]) == 0
+    with Store() as store:
+        job = next(s for s in store.list_sessions() if s.draft)
+        assert job.cwd == "/tmp" and job.prompt == "panel prompt\nsecond line"
+        assert job.fire_at == NOW + 1200 + park.DEFAULT_BUFFER_SEC
+        assert job.fire_window == "five_hour" and job.aim == "panel prompt"
+    assert notified == ["⏳ prompt parked"]
+
+
+def test_grab_cancel_registers_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _grab_setup(monkeypatch, None)
+    assert cli.main(["park", "-g"]) == 130
+    with Store() as store:
+        assert not [s for s in store.list_sessions() if s.draft]
 
 
 # ---- store: columns, index, claim, summary ------------------------------------

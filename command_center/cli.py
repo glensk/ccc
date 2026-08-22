@@ -3174,6 +3174,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_park.add_argument(
         "-a", "--aim", default=None, help="AIM for the job (default: first line of the prompt)"
     )
+    p_park.add_argument(
+        "-e",
+        "--editor",
+        action="store_true",
+        help="capture the prompt in $EDITOR instead of the floating park panel",
+    )
+    p_park.add_argument(
+        "-g",
+        "--grab",
+        action="store_true",
+        help="global-chord mode (Karabiner q+p): park panel over the frontmost iTerm "
+        "tab; the armed job fires in a NEW tab via the daemon (no in-tab countdown)",
+    )
     p_park.set_defaults(func=cmd_park)
 
     p_newjob = sub.add_parser(

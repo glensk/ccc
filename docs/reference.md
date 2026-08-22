@@ -610,13 +610,25 @@ Two front-ends, one persistent mechanism — every parked prompt is a normal fut
 draft row armed with a fire time (`fire_at`, epoch seconds) and the window that produced
 it (`fire_window`):
 
-- **`ccc park [PROMPT] [-c] [-N] [-n] [-w WINDOW] [-b SEC] [-a AIM]`** — same-tab flow.
-  The prompt comes from the argument, `-c/--clipboard`, piped stdin, or `$EDITOR`; the
-  job is registered FIRST (Ctrl-C, a closed tab, or a reboot never loses it), then the
-  command waits in the tab with a live countdown (tab title `⏳42m → auto`), and at the
-  reset execs the job right there via the canonical `ccc start-job` path. Enter fires
-  early; Ctrl-C keeps the job but disarms auto-fire; `-n/--no-auto` rings instead of
-  launching; `-N/--now` skips the wait. Shell alias suggestion: `alias qp="ccc park"`.
+- **`ccc park [PROMPT] [-c] [-N] [-n] [-w WINDOW] [-b SEC] [-a AIM] [-e]`** — same-tab
+  flow. With no prompt argument and no piped stdin, the **floating "ccc park panel"**
+  opens (the editable sibling of the s+p peek panel): a dark panel with the target
+  repo · account · fire time in the header and a multi-line editor — **⌘↵ parks, ⎋
+  cancels**, plain Return is a newline. `-c/--clipboard` prefills the panel for
+  review; `-e/--editor` uses `$EDITOR` instead (with a fallback chain
+  `$EDITOR → $VISUAL → vim → vi → nano` when the configured binary is missing).
+  The job is registered FIRST (Ctrl-C, a closed tab, or a reboot never loses it),
+  then the command waits in the tab with a live countdown (tab title `⏳42m → auto`)
+  and at the reset execs the job right there via the canonical `ccc start-job` path.
+  Enter fires early; Ctrl-C keeps the job but disarms auto-fire; `-n/--no-auto` rings
+  instead of launching; `-N/--now` skips the wait. Shell alias: `alias qp="ccc park"`.
+- **`ccc park -g/--grab`** — the **global q+p chord** (Karabiner: hold `q`, tap `p`
+  while iTerm2 is frontmost, mirroring the s+p peek chord): the park panel pops over
+  whatever tab you are looking at, resolves that tab's repo + account (tracked
+  session first, tab cwd fallback — the same resolution peek uses), and on ⌘↵
+  registers the ARMED job; the **daemon** fires it in a new tab at the reset (`-N`
+  launches it in a new tab immediately). Feedback arrives via notify — there is no
+  terminal attached to a chord launch.
 - **`ccc new-job -R/--at-reset [-W WINDOW]`** — headless flow: the job is armed and the
   **daemon** fires it in a new tab within ~5 minutes after the reset (it warns at
   registration when the daemon service is not installed).
