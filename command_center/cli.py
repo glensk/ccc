@@ -1115,6 +1115,18 @@ def _account_config_dir(label: str | None) -> tuple[str, str | None]:
     return str(path), None
 
 
+def cmd_park(args: argparse.Namespace) -> int:
+    """``ccc park`` — register a ready prompt NOW, auto-launch it in THIS tab at reset.
+
+    Thin dispatcher over :func:`park.run_park` (prompt capture, deterministic fire-time
+    from the account's usage snapshot, persistent draft row, same-tab countdown waiter,
+    launch through :func:`cmd_start_job`). See ``command_center/park.py``.
+    """
+    from . import park
+
+    return park.run_park(args)
+
+
 def cmd_new_job(args: argparse.Namespace) -> int:
     """Register a FUTURE job — a saved AIM + prompt, launched later with ``ccc start-job``.
 
@@ -1141,6 +1153,38 @@ def cmd_new_job(args: argparse.Namespace) -> int:
         return 1
     cwd = args.cwd or os.getcwd()
     session_id = str(uuid.uuid4())
+    # --at-reset: arm the job to auto-fire when the selected rate-limit window resets.
+    # Deterministic (the window's resets_at + buffer, utilization is not an input) and
+    # fail-loud: no usable reset time is a registration ERROR, never "fire now".
+    fire_at = 0
+    fire_window = ""
+    if getattr(args, "at_reset", False):
+        import time as _time
+
+        from . import accounts as _accounts
+        from . import park, usage
+
+        size_err = park.prompt_size_error((args.prompt or aim).strip())
+        if size_err:
+            print(size_err, file=sys.stderr)
+            return 1
+        now = int(_time.time())
+        window = getattr(args, "fire_window", None) or "five_hour"
+        label = _accounts.effective_account_label(config_dir)
+        snapshot = usage.read_usage(label)
+        fire_opt = park.fire_time(snapshot, window, now)
+        if fire_opt is None:
+            snapshot = usage.fetch_claude_usage(label) or snapshot
+            fire_opt = park.fire_time(snapshot, window, now)
+        if fire_opt is None:
+            print(
+                f"error: --at-reset needs a usable {window} reset time for account "
+                f"'{label}' — run one Claude turn there (the statusline captures usage) "
+                "or check `ccc doctor`",
+                file=sys.stderr,
+            )
+            return 1
+        fire_at, fire_window = fire_opt, window
     with Store() as store:
         # Resolve the optional dependency (full UUID or a unique prefix / 4-hex hash).
         depends_on: str | None = None
@@ -1172,10 +1216,22 @@ def cmd_new_job(args: argparse.Namespace) -> int:
             llm_overseer=getattr(args, "overseer", None) or DEFAULT_LLM,
             llm_exec=getattr(args, "executor", None) or DEFAULT_LLM,
             config_dir=config_dir,
+            fire_at=fire_at,
+            fire_window=fire_window,
         )
     print(f"future job created: {session_id}  ({cwd})")
     print(f"start it with:  ccc start-job {session_id}")
     cfg = config.load_config()
+    if fire_at:
+        from . import park, service
+
+        print(f"armed: {park.format_fire(fire_at)} — the daemon dispatches within ~5 min after")
+        if not service.is_installed(cfg):
+            print(
+                "warning: the ccc daemon service is not installed — the job will NOT "
+                "auto-fire; run `ccc daemon --install`",
+                file=sys.stderr,
+            )
     from .spawn import spawn_ccc
 
     if cfg.aim_score_on_set:
@@ -1329,6 +1385,16 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
         # already asked it passes --force so the question is never asked twice.
         early = days_until_start(session)
         if early is not None and not getattr(args, "force", False):
+            if getattr(args, "auto", False):
+                # Unattended dispatch (daemon/park) NEVER bypasses the guard and never
+                # loops a dead-tab retry: disarm the auto-fire, keep the draft intact.
+                store.update_fields(args.session_id, fire_at=0)
+                print(
+                    f"error: auto-fire blocked — start date {session.start_date} not "
+                    "reached; job disarmed (kept as draft), start it manually or re-arm",
+                    file=sys.stderr,
+                )
+                return 1
             from datetime import date as _date
 
             plural = "s" if early != 1 else ""
@@ -1358,6 +1424,14 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
 
         blocker = deps.launch_blocker(store, session)
         if blocker is not None and not getattr(args, "force", False):
+            if getattr(args, "auto", False):
+                store.update_fields(args.session_id, fire_at=0)
+                print(
+                    f"error: auto-fire blocked — depends on {blocker.parent_hash} "
+                    f"({blocker.state}); job disarmed (kept as draft)",
+                    file=sys.stderr,
+                )
+                return 1
             aim = (blocker.parent_aim or "?").strip()
             print(f'⚠ depends on {blocker.parent_hash} "{aim}" — {blocker.state}.')
             if not sys.stdin.isatty():
@@ -1385,6 +1459,8 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
         from . import accounts
 
         if not config_dir and accounts.is_multi_account():
+            if getattr(args, "auto", False):
+                store.update_fields(args.session_id, fire_at=0)  # disarm, keep the draft
             print(
                 f"error: job {args.session_id} has no recorded Claude account (config_dir) "
                 "and several are configured — refusing to launch rather than risk billing "
@@ -1400,7 +1476,15 @@ def cmd_start_job(  # pylint: disable=too-many-locals,too-many-branches
         # (decision 14) Resume-aware: check ONLY the exact project dir derived from the
         # job's CURRENT cwd (the adapter munged-path convention) — not the glob fallback.
         resume = _cwd_transcript_exists(cwd, args.session_id, config_dir)
-        store.clear_draft(args.session_id)  # (b) promote: drop the draft flag as we launch
+        # (b) promote ATOMICALLY: with several possible launchers (the park waiter, a
+        # daemon dispatch tab, a manual start-job) exactly one may pass this line.
+        if not store.claim_draft(args.session_id):
+            print(
+                f"error: job {args.session_id} was already claimed by another launcher — "
+                "not starting it twice",
+                file=sys.stderr,
+            )
+            return 1
         if had_file:  # (c) file leaves the live scan with a terminal status
             futuresync.archive_file(store, cfg, session, "launched")
     if cwd and os.path.isdir(cwd):
@@ -1642,7 +1726,9 @@ def cmd_restore_job(args: argparse.Namespace) -> int:
             print(f"error: {session_id} is already a live future job", file=sys.stderr)
             return 1
         if session is not None and session.draft:
-            store.update_fields(session_id, archived=False, done=False, done_at=0)
+            # fire_at=0: a restored job must never inherit a stale armed fire time —
+            # an overdue one would silently auto-launch on the next daemon pass.
+            store.update_fields(session_id, archived=False, done=False, done_at=0, fire_at=0)
             refreshed = store.get(session_id)
             assert refreshed is not None
             futuresync.unarchive_file(store, cfg, refreshed)
@@ -1748,7 +1834,7 @@ def cmd_open_job(args: argparse.Namespace) -> int:
 
 def cmd_jobs(args: argparse.Namespace) -> int:
     """List registered future jobs (drafts), newest first."""
-    from . import accounts, colors
+    from . import accounts, colors, park
     from .models import short_id
 
     multi = accounts.is_multi_account()
@@ -1764,6 +1850,8 @@ def cmd_jobs(args: argparse.Namespace) -> int:
         if multi and not accounts.is_default_config_dir(session.config_dir or ""):
             tag += f"  [{accounts.account_label(session.config_dir or '')}]"
         when = f"  [starts {session.start_date}]" if session.start_date else ""
+        if session.fire_at:
+            when += f"  [⏳ {park.format_fire(session.fire_at)}]"
         print(f"  {short_id(session.session_id)}  {folder:<30}  {session.aim or '—'}{tag}{when}")
     return 0
 
@@ -2043,7 +2131,9 @@ def unlaunch_job(
             session_id,
             future_file=futuresync._vault_relpath(cfg, archived_file),  # pylint: disable=protected-access
         )
-    store.update_fields(session_id, draft=True, status=Status.PARKED.value)
+    # fire_at=0 defensively: an unlaunched job must be re-armed explicitly, never
+    # auto-fire off a leftover timestamp.
+    store.update_fields(session_id, draft=True, status=Status.PARKED.value, fire_at=0)
     refreshed = store.get(session_id)
     if refreshed is not None:
         futuresync.unarchive_file(store, cfg, refreshed)  # archive → live (fresh export if gone)
@@ -2466,6 +2556,7 @@ def cmd_statusline(args: argparse.Namespace) -> int:
         # Running index of the current AIM (1 = first ever defined). A set-but-unrecorded
         # AIM (predates history tracking) has no rows yet, so it is the first → 1.
         aim_index = store.count_aim_history(sid) or (1 if session.aim else 0)
+        armed = store.armed_draft_summary()
 
     # Prefer the live status (fresher than the stored value) when discoverable.
     status_value = session.status
@@ -2501,6 +2592,17 @@ def cmd_statusline(args: argparse.Namespace) -> int:
     # Live TodoWrite list as a single line: left counter + each item's box & short label.
     if todos:
         print(_render_todos_line(todos, green, dim, reset, status_color))
+
+    # Armed parked prompt(s): one chip in EVERY session's statusline — the soonest fire
+    # time, overdue-aware (red once both dispatchers should have fired; see park.py).
+    if armed:
+        from . import park
+
+        earliest, count = armed
+        fire_text = park.format_fire(earliest)
+        more = f"  +{count - 1} more" if count > 1 else ""
+        chip_color = status_color["failed"] if fire_text.startswith("overdue") else dim
+        print(f"{chip_color}⏳ parked prompt {fire_text}{more}  (ccc jobs){reset}")
     return 0
 
 
@@ -3033,6 +3135,47 @@ def build_parser() -> argparse.ArgumentParser:
     p_resume.add_argument("session_id")
     p_resume.set_defaults(func=cmd_resume)
 
+    p_park = sub.add_parser(
+        "park",
+        help="park a ready prompt in THIS tab and auto-launch it when the rate limit resets",
+    )
+    p_park.add_argument(
+        "prompt", nargs="?", default=None, help="the prompt (or use -c / piped stdin / $EDITOR)"
+    )
+    p_park.add_argument(
+        "-c",
+        "--clipboard",
+        action="store_true",
+        help="take the prompt from the clipboard (pbpaste)",
+    )
+    p_park.add_argument(
+        "-N", "--now", action="store_true", help="skip the wait — launch immediately"
+    )
+    p_park.add_argument(
+        "-n",
+        "--no-auto",
+        action="store_true",
+        help="count down, then ring and wait for Enter instead of auto-launching",
+    )
+    p_park.add_argument(
+        "-w",
+        "--window",
+        choices=("five_hour", "seven_day", "fable_week"),  # keep in sync: park.WINDOW_CHOICES
+        default="five_hour",
+        help="rate-limit window whose reset fires the launch (default: five_hour)",
+    )
+    p_park.add_argument(
+        "-b",
+        "--buffer",
+        type=int,
+        default=90,
+        help="seconds past the reset before firing (default: 90)",
+    )
+    p_park.add_argument(
+        "-a", "--aim", default=None, help="AIM for the job (default: first line of the prompt)"
+    )
+    p_park.set_defaults(func=cmd_park)
+
     p_newjob = sub.add_parser(
         "new-job", help="register a future job (saved AIM + prompt) to start later"
     )
@@ -3088,6 +3231,19 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Claude account label to launch (bill) under (default: the default account)",
     )
+    p_newjob.add_argument(
+        "-R",
+        "--at-reset",
+        action="store_true",
+        help="arm the job to auto-fire (daemon, new tab) when the rate-limit window resets",
+    )
+    p_newjob.add_argument(
+        "-W",
+        "--fire-window",
+        choices=("five_hour", "seven_day", "fable_week"),  # keep in sync: park.WINDOW_CHOICES
+        default="five_hour",
+        help="which window's reset fires an --at-reset job (default: five_hour)",
+    )
     p_newjob.set_defaults(func=cmd_new_job)
 
     p_newprompt = sub.add_parser(
@@ -3111,6 +3267,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="skip the premature-start confirmation (fixed start date not yet reached)",
+    )
+    p_startjob.add_argument(
+        "-u",
+        "--auto",
+        action="store_true",
+        help="internal: unattended dispatch (daemon/park) — a tripped guard disarms "
+        "the job's auto-fire instead of asking",
     )
     p_startjob.set_defaults(func=cmd_start_job)
 

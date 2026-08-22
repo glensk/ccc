@@ -34,6 +34,11 @@ around session/rate limits: describe now, run when there's capacity.
 *A parked future job in Obsidian — ▶ starts it in a new terminal tab.*
 
 A job can also declare it **depends on** another job finishing first
+A ready prompt you would otherwise leave unsent until the usage limit resets can be
+**parked** (`ccc park`, or `ccc new-job --at-reset`): it is stored as a future job and
+auto-launches the moment the rate-limit window resets — countdown in the tab title,
+daemon fallback if the tab dies (see `docs/reference.md` § Parked prompts). Jobs can
+also depend on each other
 (`ccc new-job -d <id-or-hash>`, or the `/depends-on` row in the TUI `e` editor). A row
 whose dependency isn't done yet wears a red `|-->` marker and, when its dependency is
 visible, hoists directly under it in the TUI and `ccc ls`; every launch path (CLI, TUI,

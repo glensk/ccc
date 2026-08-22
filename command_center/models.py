@@ -382,6 +382,12 @@ class Session:
     # machine-readable: it sinks the job into the SCHEDULED bucket (below FINISHED) and
     # makes `ccc start-job` warn + ask before launching ahead of the date.
     start_date: str | None = None
+    # Parked-prompt auto-fire (see park.py): epoch SECONDS the armed draft dispatches at
+    # (0 = not armed) and the rate-limit window that produced that timestamp
+    # ('five_hour' | 'seven_day' | 'fable_week'; '' = none). Consumed atomically by
+    # Store.claim_draft on launch; not mirrored into the Obsidian job file.
+    fire_at: int = 0
+    fire_window: str = ""
     # The full session UUID of another job this one depends on finishing first (NULL/'' =
     # none; a single dependency). Drives the red |--> marker + hoisting (see deps.py) and
     # the launch guard; round-trips through the future-job file + all three mirrors.

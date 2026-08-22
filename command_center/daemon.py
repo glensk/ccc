@@ -50,6 +50,8 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
     scored: list[str] = field(default_factory=list)
     short_aimed: list[str] = field(default_factory=list)
     assessed: list[str] = field(default_factory=list)  # AIM-met self-assessments this pass
+    reset_fired: list[str] = field(default_factory=list)  # armed parked prompts dispatched
+    reset_postponed: list[str] = field(default_factory=list)  # armed jobs pushed to a later reset
     copilot_refreshed: bool = False  # routine; deliberately excluded from is_empty()
     claude_refreshed: bool = False  # routine Claude /usage OAuth fetch; excluded from is_empty()
     resume_spawned: bool = False  # spawned the resume-halted watcher; excluded from is_empty()
@@ -65,6 +67,8 @@ class DaemonReport:  # pylint: disable=too-many-instance-attributes  # pure per-
             or self.scored
             or self.short_aimed
             or self.assessed
+            or self.reset_fired
+            or self.reset_postponed
         )
 
 
@@ -130,7 +134,7 @@ def _save_alert_state(state: dict[str, str]) -> None:
         pass
 
 
-def run_once(
+def run_once(  # pylint: disable=too-many-locals,too-many-statements  # linear pass, one step per concern
     *,
     dry_run: bool = False,
     do_reap: bool = True,
@@ -222,6 +226,9 @@ def run_once(
         # Keep each Claude account's usage card in step with `claude`'s own /usage via the
         # OAuth usage endpoint (throttled per account; adds the Fable weekly window).
         _refresh_claude_usage(store, cfg, report, dry_run)
+
+        # Dispatch armed parked-prompt jobs whose fire time has passed (see park.py).
+        _fire_reset_jobs(store, cfg, report, dry_run)
 
         # Auto-resume session-limit-halted sessions: spawn the watcher when work exists.
         _spawn_resume_watcher(cfg, report, dry_run)
@@ -387,6 +394,50 @@ def _refresh_claude_usage(
         if usage.claude_usage_stale(label, throttle):
             if usage.fetch_claude_usage(label) is not None:
                 report.claude_refreshed = True
+
+
+def _fire_reset_jobs(store: Store, cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:
+    """Dispatch armed parked-prompt jobs (``fire_at`` reached) in new tabs.
+
+    Fallback dispatcher behind the foreground ``ccc park`` waiter: only jobs at least
+    :data:`park.FIRE_GRACE_SEC` past their fire time qualify, so a live waiter (which
+    fires exactly on time in its own tab) always wins its job. Per job, the job's OWN
+    window may postpone when a fresh snapshot still shows it exhausted
+    (:func:`park.postpone_until` — `_refresh_claude_usage` just ran, so the snapshot
+    is as fresh as it gets). Otherwise RE-ARM FORWARD (``fire_at = now + retry``)
+    BEFORE dispatching — a single-column lease: the launched ``start-job --auto``
+    consumes it via the atomic claim; a crash mid-dispatch or a tab that never ran
+    simply retries one lease later. Never a config key: the per-job ``--at-reset`` /
+    ``ccc park`` arming is the opt-in (inert on a fresh install — no armed jobs).
+    """
+    from . import accounts, park, terminal, usage
+
+    now = int(time.time())
+    due = [
+        s
+        for s in store.list_sessions()
+        if s.draft and not s.archived and 0 < s.fire_at <= now - park.FIRE_GRACE_SEC
+    ]
+    for job in due:
+        label = accounts.effective_account_label(job.config_dir or "")
+        postponed = park.postpone_until(usage.read_usage(label), job.fire_window, now)
+        if postponed is not None and postponed > job.fire_at:
+            report.reset_postponed.append(job.session_id)
+            if not dry_run:
+                store.update_fields(job.session_id, fire_at=postponed)
+                notify(
+                    "⏳ parked prompt postponed",
+                    f"{_label(job)} — {job.fire_window} still exhausted; "
+                    + park.format_fire(postponed, now),
+                    cfg.notify,
+                )
+            continue
+        report.reset_fired.append(job.session_id)
+        if dry_run:
+            continue
+        store.update_fields(job.session_id, fire_at=now + park.FIRE_RETRY_SEC)
+        terminal.start_job_in_new_tab(job.session_id, auto=True)
+        notify("⏳ parked prompt fired", _label(job), cfg.notify)
 
 
 def _spawn_resume_watcher(cfg: config.Config, report: DaemonReport, dry_run: bool) -> None:

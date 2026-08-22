@@ -598,6 +598,47 @@ any account (so a real session whose transcript was merely deleted, which keeps 
 then the live session running in the current directory. In a Claude Code
 session, use the slash commands `/aim` `/next-step` `/done` `/block` `/deadline`.
 
+### Parked prompts — auto-fire at the token reset (`ccc park`, `new-job --at-reset`)
+
+A ready-made prompt you would otherwise leave sitting unsent in a Claude Code composer
+until the usage limit resets can be **parked** instead — registered now, launched
+automatically the moment the rate-limit window resets. (The composer draft itself lives
+only in process memory and can never be captured; parking replaces that habit rather
+than reading it.)
+
+Two front-ends, one persistent mechanism — every parked prompt is a normal future-job
+draft row armed with a fire time (`fire_at`, epoch seconds) and the window that produced
+it (`fire_window`):
+
+- **`ccc park [PROMPT] [-c] [-N] [-n] [-w WINDOW] [-b SEC] [-a AIM]`** — same-tab flow.
+  The prompt comes from the argument, `-c/--clipboard`, piped stdin, or `$EDITOR`; the
+  job is registered FIRST (Ctrl-C, a closed tab, or a reboot never loses it), then the
+  command waits in the tab with a live countdown (tab title `⏳42m → auto`), and at the
+  reset execs the job right there via the canonical `ccc start-job` path. Enter fires
+  early; Ctrl-C keeps the job but disarms auto-fire; `-n/--no-auto` rings instead of
+  launching; `-N/--now` skips the wait. Shell alias suggestion: `alias qp="ccc park"`.
+- **`ccc new-job -R/--at-reset [-W WINDOW]`** — headless flow: the job is armed and the
+  **daemon** fires it in a new tab within ~5 minutes after the reset (it warns at
+  registration when the daemon service is not installed).
+
+Scheduling is **deterministic**: the fire time is the selected window's `resets_at`
+plus a small buffer (`-b`, default 90 s) — utilization never decides the schedule, and
+missing/stale usage data is a loud registration error, never "start now". The window
+is `five_hour` by default; `seven_day` / `fable_week` only on explicit selection.
+
+Dispatch correctness: the daemon only touches jobs ≥ 2 min past their fire time (a
+live `ccc park` waiter always wins its own tab), re-arms the fire time 15 min forward
+BEFORE dispatching (a crash or a tab that never ran simply retries — nothing is lost),
+and launches with `start-job --auto`, which **never bypasses** the start-date /
+dependency / account guards — a tripped guard disarms the job and keeps it as a draft.
+The actual promotion is a one-shot atomic claim, so two racing launchers can never
+start the same job twice. If a fresh usage snapshot shows the job's OWN window still
+exhausted at fire time, the fire is postponed to that window's next reset (other
+windows never hold a job back). Markers: the park tab title, `ccc jobs`
+(`[⏳ fires 14:03 (in 37m)]`, overdue-aware), and a `⏳ parked prompt fires …` chip in
+every session's statusline rows. `restore-job`/`unlaunch` clear a stale fire time —
+a restored job never silently auto-launches.
+
 ### Delegate a task to Codex (`/codex-implement-task-and-claude-review`)
 
 Hand the **implementation** of a task to OpenAI Codex and have Claude only *oversee* it — so

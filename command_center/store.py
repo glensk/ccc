@@ -99,6 +99,8 @@ _SESSION_COLUMNS = (
     "prompt",
     "start_when",
     "start_date",
+    "fire_at",
+    "fire_window",
     "depends_on",
     "job_type",
     "llm_overseer",
@@ -182,6 +184,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     prompt            TEXT,
     start_when        TEXT,
     start_date        TEXT,
+    fire_at           INTEGER NOT NULL DEFAULT 0,
+    fire_window       TEXT    NOT NULL DEFAULT '',
     depends_on        TEXT,
     job_type          TEXT    NOT NULL DEFAULT 'claude',
     llm_overseer      TEXT    NOT NULL DEFAULT 'fable-5',
@@ -289,6 +293,12 @@ class Store:  # pylint: disable=too-many-public-methods
         "prompt": "TEXT",
         "start_when": "TEXT",
         "start_date": "TEXT",
+        # Parked-prompt auto-fire: epoch seconds a draft dispatches at (0 = not armed)
+        # and the rate-limit window that timestamp came from ('' = none). Deliberately
+        # NOT mirrored into the Obsidian job file (futuresync's targeted imports never
+        # touch them) — arming is a CLI/daemon concern, not a file-editable field.
+        "fire_at": "INTEGER NOT NULL DEFAULT 0",
+        "fire_window": "TEXT NOT NULL DEFAULT ''",
         "depends_on": "TEXT",
         "job_type": "TEXT NOT NULL DEFAULT 'claude'",
         "llm_overseer": "TEXT NOT NULL DEFAULT 'fable-5'",
@@ -349,6 +359,13 @@ class Store:  # pylint: disable=too-many-public-methods
         for column, decl in self._ADDED_AIM_HISTORY_COLUMNS.items():
             if column not in ah_existing:
                 self.conn.execute(f"ALTER TABLE aim_history ADD COLUMN {column} {decl}")
+        # Partial index for the armed-draft scan (statusline chip + daemon dispatch).
+        # Created HERE, not in _SCHEMA: an old DB only gains fire_at via the ALTER
+        # loop above, and an index referencing a missing column would fail the open.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_armed_fire ON sessions(fire_at) "
+            "WHERE draft = 1 AND archived = 0 AND fire_at > 0"
+        )
         self.conn.commit()
 
     def _backfill_config_dir(self) -> None:
@@ -468,7 +485,7 @@ class Store:  # pylint: disable=too-many-public-methods
         assert got is not None
         return got
 
-    def create_draft(
+    def create_draft(  # pylint: disable=too-many-arguments,too-many-positional-arguments,too-many-locals
         self,
         session_id: str,
         cwd: str,
@@ -482,6 +499,8 @@ class Store:  # pylint: disable=too-many-public-methods
         llm_overseer: str = DEFAULT_LLM,
         llm_exec: str = DEFAULT_LLM,
         config_dir: str = "",
+        fire_at: int = 0,
+        fire_window: str = "",
     ) -> Session:
         """Register a *future job*: a draft row holding an AIM + prompt, launched on demand.
 
@@ -499,6 +518,8 @@ class Store:  # pylint: disable=too-many-public-methods
         *depends_on* is the full session UUID of another job this one must wait for
         (NULL when blank — see :mod:`command_center.deps`). Routing the AIM through
         :meth:`set_aim` records its history + lexical score.
+        *fire_at*/*fire_window* arm the parked-prompt auto-fire: the epoch second the
+        job dispatches at and the rate-limit window that produced it (see park.py).
         """
         self.ensure(session_id, cwd=cwd)
         self.update_fields(
@@ -513,6 +534,8 @@ class Store:  # pylint: disable=too-many-public-methods
             job_type=(job_type if job_type in _JOB_TYPES else "claude"),
             llm_overseer=_llm_or_default(llm_overseer),
             llm_exec=_llm_or_default(llm_exec),
+            fire_at=max(0, int(fire_at)),
+            fire_window=fire_window.strip(),
             status=Status.PARKED.value,
         )
         self.set_aim(session_id, aim)
@@ -523,6 +546,40 @@ class Store:  # pylint: disable=too-many-public-methods
     def clear_draft(self, session_id: str) -> None:
         """Promote a draft to a real session: drop the draft flag as it launches."""
         self.update_fields(session_id, draft=False, status=Status.IDLE.value)
+
+    def claim_draft(self, session_id: str) -> bool:
+        """One-shot atomic launch claim of a draft: ``True`` for exactly one claimant.
+
+        The conditional ``UPDATE ... WHERE draft = 1`` is the claim itself (same
+        pattern as :meth:`claim_close_request`): with several concurrent launchers —
+        the foreground ``ccc park`` waiter, a daemon dispatch tab, a manual
+        ``ccc start-job`` — SQLite serializes the writes and only the first sees
+        ``rowcount == 1``; everyone else finds the draft flag already gone and must
+        not launch. Claiming also consumes any armed auto-fire (``fire_at = 0``).
+        """
+        cur = self.conn.execute(
+            "UPDATE sessions SET draft = 0, fire_at = 0, status = ?, updated_at = ? "
+            "WHERE session_id = ? AND draft = 1",
+            (Status.IDLE.value, now_ms(), session_id),
+        )
+        self.conn.commit()
+        return cur.rowcount == 1
+
+    def armed_draft_summary(self, now: int | None = None) -> tuple[int, int] | None:
+        """``(earliest fire_at, count)`` over armed drafts, or ``None`` when none.
+
+        One aggregate over the ``idx_sessions_armed_fire`` partial index — cheap
+        enough for the per-second statusline chip. *now* is unused for filtering on
+        purpose (an overdue job must stay visible, not vanish from the summary).
+        """
+        del now  # kept for signature stability; overdue rows must remain included
+        row = self.conn.execute(
+            "SELECT MIN(fire_at) AS earliest, COUNT(*) AS n FROM sessions "
+            "WHERE draft = 1 AND archived = 0 AND fire_at > 0"
+        ).fetchone()
+        if not row or not row["n"]:
+            return None
+        return int(row["earliest"]), int(row["n"])
 
     def update_fields(self, session_id: str, **fields: Any) -> None:
         """Update an explicit whitelist of columns on one session."""

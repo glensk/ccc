@@ -452,16 +452,18 @@ def resume_halted_in_new_tab(
     return _iterm(command) or _iterm_api_tab(command) or _terminal_app(command)
 
 
-def start_job_in_new_tab(session_id: str, force: bool = False) -> bool:
+def start_job_in_new_tab(session_id: str, force: bool = False, auto: bool = False) -> bool:
     """Open a new terminal tab that launches a parked future job via ``ccc start-job``.
 
     ``ccc start-job`` reads the draft's cwd + prompt from the store, clears the draft
     flag, then execs ``claude --session-id <id> "<prompt>"`` in that repo — so the
     prompt never has to survive shell/AppleScript quoting (it is passed via env).
     *force* passes ``--force`` through, skipping the premature-start confirmation
-    (used by the TUI after its own ConfirmScreen already asked).
+    (used by the TUI after its own ConfirmScreen already asked). *auto* passes
+    ``--auto`` (unattended dispatch, e.g. the daemon's parked-prompt fire): guards
+    are never bypassed — a tripped one disarms the job instead of asking.
     """
-    flag = " --force" if force else ""
+    flag = (" --force" if force else "") + (" --auto" if auto else "")
     command = f"ccc start-job{flag} {shlex.quote(session_id)}"
     if _launcher_mode() == "tmux":
         return _tmux_window(command)
